@@ -136,7 +136,7 @@ func (s *Session) InitMuxClose() error {
 		ackCh := s.closeAckedCh
 		s.mu.Unlock()
 		<-ackCh
-		return nil
+		return s.Err()
 	}
 	s.closeInitiated = true
 	s.mu.Unlock()
@@ -151,7 +151,7 @@ func (s *Session) InitMuxClose() error {
 	}
 	select {
 	case <-s.closeAckedCh:
-		return nil
+		return s.Err()
 	case <-s.doneCh:
 		return s.Err()
 	}
@@ -192,7 +192,7 @@ func (s *Session) PeerClosed() <-chan struct{} { return s.peerClosedCh }
 // closed or read error).
 func (s *Session) Done() <-chan struct{} { return s.doneCh }
 
-// Err returns the first read-loop error (nil on clean EOF / Close()).
+// Err returns the first transport/protocol error, including frame write errors.
 func (s *Session) Err() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -224,17 +224,33 @@ func (s *Session) setErr(err error) {
 
 func (s *Session) writeFrame(f Frame) error {
 	s.wmu.Lock()
-	defer s.wmu.Unlock()
 	if s.retired.Load() || (s.sealed && f.Type != FrameMuxCloseAck) {
+		s.wmu.Unlock()
 		return ErrClosed
 	}
 	if f.Type == FrameData && s.refuseWrites() {
+		s.wmu.Unlock()
 		return ErrClosed
 	}
 	if f.Type == FrameMuxClose || f.Type == FrameMuxCloseAck {
 		s.sealed = true
 	}
-	return WriteFrame(s.conn, f)
+	err := WriteFrame(s.conn, f)
+	if err != nil && !errors.Is(err, ErrFrameTooLarge) {
+		// A short header/payload is not a frame boundary. Record the first
+		// error and retire under the existing barrier so no late EOF, ACK or
+		// WINDOW_UPDATE can be appended to the incomplete frame.
+		s.setErr(err)
+		s.retired.Store(true)
+		s.wmu.Unlock()
+		// Public Close also joins wmu: never call it from that critical section.
+		// Closing the transport releases readLoop, which wakes stream/credit
+		// and graceful-close waiters before publishing Done.
+		_ = s.Close()
+		return err
+	}
+	s.wmu.Unlock()
+	return err
 }
 
 // writeData sends b as DATA frames on stream st, each ≤ DataChunk and

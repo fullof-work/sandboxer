@@ -1,6 +1,7 @@
 package mux
 
 import (
+	"errors"
 	"io"
 	"sync"
 )
@@ -129,8 +130,18 @@ func (st *Stream) Read(p []byte) (int, error) {
 	}
 	st.mu.Unlock()
 	if update > 0 {
-		// Best-effort: if the conn is dying, the read loop surfaces it.
-		_ = st.s.writeFrame(Frame{Stream: st.id, Type: FrameWindowUpdate, Payload: encodeUint32(uint32(update))})
+		// Return already consumed bytes together with the terminal error. A
+		// lost update can strand the peer without credit; writeFrame retires
+		// the session and no control frame may follow the incomplete update.
+		if err := st.s.writeFrame(Frame{Stream: st.id, Type: FrameWindowUpdate, Payload: encodeUint32(uint32(update))}); err != nil {
+			// Graceful retirement forbids control writes while still permitting
+			// the caller to drain already received bytes. Preserve that contract;
+			// an actual transport failure is recorded before retirement.
+			if errors.Is(err, ErrClosed) && st.s.Err() == nil {
+				return n, nil
+			}
+			return n, err
+		}
 	}
 	return n, nil
 }
