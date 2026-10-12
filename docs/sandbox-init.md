@@ -1149,6 +1149,25 @@ writers. Raw vsock Close rejects new I/O and socket-option changes, shuts down
 in-flight reads/writes, then joins their fd ownership before releasing the
 descriptor; usage I/O and EINTR retries share this ownership rule.
 
+An unrecoverable header, payload or WINDOW_UPDATE write failure records the
+first error and retires the whole session under the writer barrier. Transport
+close happens after unlocking that barrier, so it cannot recursively wait on
+itself. No EOF or control frame may follow an incomplete frame. Read, credit and
+graceful-close waiters wake; repeated close callers observe the recorded error.
+A failed credit update returns already consumed bytes together with its error;
+normal graceful retirement still permits buffered data to drain.
+
+Raw vsock I/O retries ENOMEM only without positive byte progress. The initial
+policy is eight attempts with seven exponential waits of 1–64 ms: 127 ms of
+planned delay, not a bound on syscall wall time. Usage-channel I/O applies this
+policy within its existing absolute deadline; EINTR and ENOMEM do not renew it.
+Each attempt rechecks descriptor
+ownership. Backoff holds no admitted-I/O reference and wakes on Close; shutdown
+can join syscalls without waiting on itself. Positive partial results are never
+replayed. The current MUX suite, retirement regressions and init FD tests run
+together with the partial-frame, credit-update and closing-retry regressions
+under `go test -race ./pkg/mux ./cmd/sandbox-init`.
+
 **Why both close and linger matter:** a guest-only virtio-vsock close can leave
 an 8 s deferred-removal state waiting for peer reset or timeout. Host close
 after ACK supplies the peer teardown; guest SO_LINGER waits up to its configured

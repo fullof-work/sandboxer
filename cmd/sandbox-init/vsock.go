@@ -34,6 +34,7 @@ type vsockConn struct {
 	closeErr  error
 	fdMu      sync.Mutex
 	closed    bool
+	closedCh  chan struct{}  // created under fdMu only when a retry needs a wakeup
 	ioWG      sync.WaitGroup // admitted syscalls; Add is serialized with Close by fdMu
 }
 
@@ -68,9 +69,49 @@ func (c *vsockConn) rawIO(op fdIOFunc, b []byte) (int, error) {
 }
 
 func (c *vsockConn) io(op fdIOFunc, b []byte) (int, error) {
-	return retryInterruptedIO(func(_ int, b []byte) (int, error) {
-		return c.rawIO(op, b) // recheck ownership on every EINTR retry
-	}, c.fd, b)
+	return retryMemoryIO(func() (int, error) {
+		return retryInterruptedIO(func(_ int, b []byte) (int, error) {
+			return c.rawIO(op, b) // recheck ownership after EINTR and ENOMEM
+		}, c.fd, b)
+	}, c.waitMemoryRetry)
+}
+
+// Eight no-progress ENOMEM attempts allow seven waits of 1..64 ms (127 ms
+// planned delay). This bounds retry delay, not blocking syscall wall time.
+// Positive partial results must be returned unchanged, never replayed.
+func retryMemoryIO(op func() (int, error), wait func(time.Duration) error) (int, error) {
+	for attempt := 0; ; attempt++ {
+		n, err := op()
+		if n > 0 || !errors.Is(err, syscall.ENOMEM) || attempt == 7 {
+			return n, err
+		}
+		if err := wait(time.Millisecond << attempt); err != nil {
+			return 0, err
+		}
+	}
+}
+
+func (c *vsockConn) waitMemoryRetry(delay time.Duration) error {
+	c.fdMu.Lock()
+	if c.closed {
+		c.fdMu.Unlock()
+		return net.ErrClosed
+	}
+	if c.closedCh == nil {
+		c.closedCh = make(chan struct{})
+	}
+	done := c.closedCh
+	c.fdMu.Unlock()
+	// rawIO has released ioWG before this wait. Close can shutdown, join
+	// admitted syscalls and close the fd without waiting on this retry itself.
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return net.ErrClosed
+	case <-timer.C:
+		return nil
+	}
 }
 
 func (c *vsockConn) Read(b []byte) (int, error) {
@@ -84,6 +125,9 @@ func (c *vsockConn) Close() error {
 	c.closeOnce.Do(func() {
 		c.fdMu.Lock()
 		c.closed = true
+		if c.closedCh != nil {
+			close(c.closedCh)
+		}
 		_ = unix.Shutdown(c.fd, unix.SHUT_RDWR)
 		c.fdMu.Unlock()
 		c.ioWG.Wait()

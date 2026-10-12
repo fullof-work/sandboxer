@@ -936,6 +936,20 @@ transport I/O，再等待 writer 退出。原始 vsock Close 拒绝新的 I/O �
 选项修改，shutdown 正在进行的读写，等待其 fd 所有权释放后才关闭描述符；
 usage I/O 和 EINTR 重试也遵守同一所有权规则。
 
+帧头、payload 或 WINDOW_UPDATE 出现不可恢复的写入错误时，在 writer barrier 下
+记录首错并终止整个会话；解锁后才关闭 transport，避免递归等待自身。
+不完整帧后不能追加 EOF 或控制帧。read、credit 和 graceful-close 等待者都会被
+唤醒，重复 close 调用可见记录的错误。信用更新失败时，Read 返回已经消费的字节
+及错误；正常 graceful retirement 仍允许读完已有缓冲数据。
+
+原始 vsock I/O 仅在没有正数字节进展时重试 ENOMEM。初始策略为 8 次尝试、
+7 次 1–64 ms 的指数等待，共 127 ms 计划等待时间；这不是 syscall 墙钟时间上限。
+usage 通道沿用同一策略，但受现有绝对 deadline 约束；EINTR 和 ENOMEM 都不会延长期限。
+每次尝试重新检查描述符所有权。退避期间不持有已入场 I/O 引用，Close 会唤醒等待，
+shutdown 可等待 syscall 而不会自等；正数部分结果绝不重放。当前完整 MUX suite、
+retirement 回归和 init FD 测试与部分帧、信用更新、关闭中重试回归共同通过
+`go test -race ./pkg/mux ./cmd/sandbox-init` 执行。
+
 **为什么两端 close 与 linger 都重要**：guest 单方 virtio-vsock close 可能保留 8 s deferred-removal，等待 peer reset 或超时。
 Host 回 ACK 后 close 提供 peer teardown；guest SO_LINGER 最多等 2 s，设置失败会 log。
 Primary MUX ACK 最多等 5 s，失败/超时强制关；exec MUX 使用同样有界机制，完整 session drain 在 quiesced 前完成。
