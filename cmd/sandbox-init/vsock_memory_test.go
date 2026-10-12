@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"net"
 	"sync/atomic"
@@ -115,5 +116,65 @@ func TestVsockMemoryRetryWaitWakesOnClose(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("backoff blocked Close")
+	}
+}
+
+func TestUsageMemoryRetryPreservesAbsoluteDeadline(t *testing.T) {
+	for _, tc := range []string{"eventual-success", "partial", "deadline", "expired", "close"} {
+		t.Run(tc, func(t *testing.T) {
+			fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer unix.Close(fds[1])
+			conn := &vsockConn{fd: fds[0]}
+			defer conn.Close()
+			end := time.Now().Add(time.Second)
+			if tc == "deadline" {
+				end = time.Now().Add(10 * time.Millisecond)
+			}
+			if tc == "expired" {
+				end = time.Now().Add(-time.Second)
+			}
+			var calls atomic.Int32
+			first := make(chan struct{})
+			if tc == "close" {
+				go func() { <-first; conn.Close() }()
+			}
+			n, err := (usageIO{conn: conn, end: end}).io(func(int, []byte) (int, error) {
+				count := calls.Add(1)
+				if count == 1 {
+					close(first)
+				}
+				if tc == "partial" {
+					return 2, syscall.ENOMEM
+				}
+				if tc == "eventual-success" && count == 3 {
+					return 4, nil
+				}
+				return -1, syscall.ENOMEM
+			}, []byte("data"))
+			switch tc {
+			case "eventual-success":
+				if n != 4 || err != nil || calls.Load() != 3 {
+					t.Fatalf("%d %v calls=%d", n, err, calls.Load())
+				}
+			case "partial":
+				if n != 2 || !errors.Is(err, syscall.ENOMEM) || calls.Load() != 1 {
+					t.Fatalf("positive progress replayed: %d %v calls=%d", n, err, calls.Load())
+				}
+			case "deadline", "expired":
+				if !errors.Is(err, context.DeadlineExceeded) {
+					t.Fatal(err)
+				}
+				if calls.Load() >= 8 || tc == "expired" && calls.Load() != 0 {
+					t.Fatalf("deadline renewed, calls=%d", calls.Load())
+				}
+			case "close":
+				if !errors.Is(err, net.ErrClosed) {
+					t.Fatal(err)
+				}
+			}
+		})
 	}
 }

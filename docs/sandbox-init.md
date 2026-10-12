@@ -1159,7 +1159,9 @@ normal graceful retirement still permits buffered data to drain.
 
 Raw vsock I/O retries ENOMEM only without positive byte progress. The initial
 policy is eight attempts with seven exponential waits of 1–64 ms: 127 ms of
-planned delay, not a bound on syscall wall time. Each attempt rechecks descriptor
+planned delay, not a bound on syscall wall time. Usage-channel I/O applies this
+policy within its existing absolute deadline; EINTR and ENOMEM do not renew it.
+Each attempt rechecks descriptor
 ownership. Backoff holds no admitted-I/O reference and wakes on Close; shutdown
 can join syscalls without waiting on itself. Positive partial results are never
 replayed. The current MUX suite, retirement regressions and init FD tests run

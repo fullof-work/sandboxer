@@ -944,6 +944,7 @@ usage I/O 和 EINTR 重试也遵守同一所有权规则。
 
 原始 vsock I/O 仅在没有正数字节进展时重试 ENOMEM。初始策略为 8 次尝试、
 7 次 1–64 ms 的指数等待，共 127 ms 计划等待时间；这不是 syscall 墙钟时间上限。
+usage 通道沿用同一策略，但受现有绝对 deadline 约束；EINTR 和 ENOMEM 都不会延长期限。
 每次尝试重新检查描述符所有权。退避期间不持有已入场 I/O 引用，Close 会唤醒等待，
 shutdown 可等待 syscall 而不会自等；正数部分结果绝不重放。当前完整 MUX suite、
 retirement 回归和 init FD 测试与部分帧、信用更新、关闭中重试回归共同通过

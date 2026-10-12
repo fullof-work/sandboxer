@@ -190,7 +190,7 @@ func (s *usageService) collect(req proto.UsageRequest, cancel <-chan struct{}) p
 	return r
 }
 
-// usageIO enforces an absolute deadline across partial reads/writes and EINTR.
+// usageIO enforces an absolute deadline across partial I/O, EINTR and ENOMEM.
 // SO_RCVTIMEO/SO_SNDTIMEO alone renew their budget on each raw syscall. Idle
 // usage connections have no timer; the single connection slot and lifecycle
 // shutdown bound their ownership. Each complete request supplies a new budget.
@@ -200,6 +200,25 @@ type usageIO struct {
 }
 
 func (c usageIO) io(op fdIOFunc, b []byte) (int, error) {
+	return retryMemoryIO(func() (int, error) { return c.interruptedIO(op, b) }, func(delay time.Duration) error {
+		if !c.end.IsZero() {
+			remaining := time.Until(c.end)
+			if remaining <= 0 {
+				return context.DeadlineExceeded
+			}
+			delay = min(delay, remaining)
+		}
+		if err := c.conn.waitMemoryRetry(delay); err != nil {
+			return err
+		}
+		if !c.end.IsZero() && !time.Now().Before(c.end) {
+			return context.DeadlineExceeded
+		}
+		return nil
+	})
+}
+
+func (c usageIO) interruptedIO(op fdIOFunc, b []byte) (int, error) {
 	for {
 		if !c.end.IsZero() && !time.Now().Before(c.end) {
 			return 0, context.DeadlineExceeded
