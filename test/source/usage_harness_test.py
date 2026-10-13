@@ -55,6 +55,8 @@ class ReadRecoveryFatalCauseTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             key = "abcdef0123456789" * 4
             error = "snapshot: drain pinger before quiesce: launchclient: read response: EOF"
+            Path(directory, "seed.snapshot.log").write_text("snapshot: seed capture failed\n")
+            Path(directory, "seed.log").write_text("seed capture reached\n")
             Path(directory, "recovered.snapshot.log").write_text(error + "\n")
             Path(directory, "recovered.log").write_text(
                 "old log\n" * 10000 + "source manifest://" + key + "\n" + error + "\n")
@@ -63,6 +65,8 @@ class ReadRecoveryFatalCauseTests(unittest.TestCase):
                                     text=True, capture_output=True)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn(error, result.stderr)
+            self.assertIn("snapshot: seed capture failed", result.stderr)
+            self.assertIn("seed capture reached", result.stderr)
             self.assertIn("<redacted>", result.stderr)
             self.assertNotIn(key, result.stderr)
             self.assertNotIn("must-not-read-config", result.stderr)
@@ -433,6 +437,71 @@ class SourceFaultTests(unittest.TestCase):
 
 
 class SourceCleanupTests(unittest.TestCase):
+    def test_restore_failure_diagnostics_are_bounded_and_redacted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            key = "abcdef0123456789" * 4
+            (root / "run.log").write_text("old log\n" * 10000 + "manifest://" + key + "\nexec stalled\n")
+            (root / "trace-start.json").write_text('{"owner_pid": 42}\n')
+            (root / "config.yaml").write_text("must-not-read-config")
+            output = io.StringIO()
+            with patch.object(usage_sources.sys, "stderr", output):
+                usage_sources.dump_restore_failure("source-trace-detach", SimpleNamespace(dir=root), None)
+            text = output.getvalue()
+            self.assertIn("phase=source-trace-detach", text)
+            self.assertIn("exec stalled", text)
+            self.assertIn('"owner_pid": 42', text)
+            self.assertIn("<redacted>", text)
+            self.assertNotIn(key, text)
+            self.assertNotIn("must-not-read-config", text)
+            self.assertIn("trace-done.json: unavailable", text)
+            self.assertLess(len(text), 26000)
+
+    def test_restore_cleanup_failure_keeps_evidence_and_cleans_both_owners(self):
+        for origin in ("child", "source"):
+            with self.subTest(origin=origin):
+                sb, child, release, relay = (unittest.mock.Mock() for _ in range(4))
+                fault = RuntimeError(origin + " cleanup failed")
+
+                def cleanup(owner, **kwargs):
+                    if owner is (child if origin == "child" else sb):
+                        raise fault
+
+                with patch.object(usage_sources, "cleanup_sources", side_effect=cleanup) as cleanup_call, \
+                     patch.object(usage_sources, "dump_restore_failure") as diagnostic:
+                    with self.assertRaises(RuntimeError) as caught:
+                        usage_sources.cleanup_restore_sources(sb, child, release, relay, None, True)
+                self.assertIs(caught.exception, fault)
+                diagnostic.assert_called_once_with(origin + "-cleanup", sb, child)
+                self.assertEqual(cleanup_call.call_count, 2)
+                self.assertIs(cleanup_call.call_args_list[0].args[0], child)
+                self.assertIs(cleanup_call.call_args_list[1].args[0], sb)
+                self.assertIs(cleanup_call.call_args_list[1].kwargs["failure"], fault if origin == "child" else None)
+                self.assertTrue(cleanup_call.call_args_list[1].kwargs["owned_trace"])
+
+    def test_restore_cleanup_preserves_existing_failure_without_duplicate_diagnostics(self):
+        for failure in (None, RuntimeError("case body failed")):
+            with self.subTest(failure=failure):
+                sb, child, release, relay = (unittest.mock.Mock() for _ in range(4))
+                with patch.object(usage_sources, "cleanup_sources") as cleanup, \
+                     patch.object(usage_sources, "dump_restore_failure") as diagnostic:
+                    usage_sources.cleanup_restore_sources(sb, child, release, relay, failure, False)
+                self.assertEqual(cleanup.call_count, 2)
+                for call in cleanup.call_args_list:
+                    self.assertIs(call.kwargs["failure"], failure)
+                self.assertFalse(cleanup.call_args.kwargs["owned_trace"])
+                diagnostic.assert_not_called()
+
+    def test_restore_source_cleanup_failure_before_child_exists_keeps_evidence(self):
+        sb, fault = unittest.mock.Mock(), RuntimeError("source cleanup failed")
+        with patch.object(usage_sources, "cleanup_sources", side_effect=fault) as cleanup, \
+             patch.object(usage_sources, "dump_restore_failure") as diagnostic:
+            with self.assertRaises(RuntimeError) as caught:
+                usage_sources.cleanup_restore_sources(sb, None, None, None, None, False)
+        self.assertIs(caught.exception, fault)
+        cleanup.assert_called_once_with(sb, failure=None, owned_trace=False)
+        diagnostic.assert_called_once_with("source-cleanup", sb, None)
+
     def test_capture_unmounts_and_preserves_primary_failure(self):
         for fault in (RuntimeError("capture failed"), subprocess.TimeoutExpired("snapshot", 60)):
             with self.subTest(fault=fault), tempfile.TemporaryDirectory() as tmp:

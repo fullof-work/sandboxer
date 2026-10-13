@@ -609,10 +609,55 @@ def validate_old_epoch(requests, old_epoch, new_epoch):
             assert disk["status"] == "busy", "restore or reconnect created a replacement worker"
 
 
+def dump_restore_failure(phase, *sandboxes):
+    """Keep bounded owned logs in Actions even when the ephemeral case is removed."""
+    print(f"usage restore failure: phase={phase}", file=sys.stderr)
+    for sb in sandboxes:
+        if sb is None:
+            continue
+        for name in ("run.log", "capture-failure.log", "snapshot.log",
+                     "trace-start.json", "trace-after-failure.json", "trace-done.json"):
+            path = sb.dir / name
+            try:
+                with path.open("rb") as source:
+                    source.seek(0, 2)
+                    size = source.tell()
+                    offset = max(0, size - 4096)
+                    source.seek(offset)
+                    tail = source.read(4096).decode(errors="replace")
+                if offset:
+                    tail = tail.partition("\n")[2]
+                tail = re.sub(r"(?i)[0-9a-f]{64}", "<redacted>", tail)
+                print(f"usage restore diagnostic {sb.dir.name}/{name} bytes={size}", file=sys.stderr)
+                print("\n".join(tail.splitlines()[-20:]), file=sys.stderr)
+            except OSError:
+                print(f"usage restore diagnostic {sb.dir.name}/{name}: unavailable", file=sys.stderr)
+
+
+def cleanup_restore_sources(sb, child, release, relay, failure, launched):
+    """Retain evidence when cleanup, rather than the case body, first fails."""
+    try:
+        if child is not None:
+            cleanup_sources(child, processes=(release,), relay=relay, failure=failure, owned_trace=True)
+    except BaseException as error:
+        if failure is None:
+            failure = error
+            dump_restore_failure("child-cleanup", sb, child)
+        raise
+    finally:
+        try:
+            cleanup_sources(sb, failure=failure, owned_trace=launched)
+        except BaseException:
+            if failure is None:
+                dump_restore_failure("source-cleanup", sb, child)
+            raise
+
+
 def restore_case(work, ref):
     config = filesystem_config(work, "restore-source", ref)
     sb = Sandbox(work, "restore-original", config, sandbox_id="restore-source")
     child, relay, release, failure, launched = None, None, None, None, False
+    phase = "source-ready"
     try:
         sb.ready()
         guest = json.loads(sb.cli("exec", "--", "/probe", "inspect"))
@@ -638,6 +683,7 @@ def restore_case(work, ref):
         baseline = metric(before["live"], "gauges", "filesystem.disk-0")
         validate_preserved_slot(baseline, before)
         sb.cli("exec", "--", "/probe", "write", "/data/after-read", "8")
+        phase = "capture-rollback"
         capture_enospc(sb, work)
         # Recovery must reopen the Guest and retain the occupied source, not
         # recreate a worker after the failed capture. The usage path is on a
@@ -661,6 +707,7 @@ def restore_case(work, ref):
             assert int(latest["covered_total_ns"]) > int(first["covered_total_ns"]), name
         output = sb.dir / "snapshot"
         output.mkdir()
+        phase = "source-snapshot"
         capture = sb.cli("snapshot", "--output", output, "--resume", "--drop-caches=false", "--merge-ref=false", timeout=60)
         (sb.dir / "snapshot.log").write_text(capture)
         snapshot = output / "restore-source.snapshot"
@@ -671,6 +718,7 @@ def restore_case(work, ref):
         write_json(sb.dir / "resumed.json", resumed)
         assert resumed["live"]["run_epoch"] == before["live"]["run_epoch"]
         validate_preserved_slot(baseline, resumed)
+        phase = "source-trace-detach"
         write_json(sb.dir / "trace-done.json", finish_owned_trace(sb))
         sb.stop()
         parent = sb.view()
@@ -684,6 +732,7 @@ def restore_case(work, ref):
         # CH restore reads the socket from private run-state config, not from
         # --vsock. The wrapper relays that socket without editing the snapshot.
         relay = UsageRelay(child.runroot / "instance/vsock.sock", old_epoch=old_epoch)
+        phase = "child-restore"
         child.ready()
         assert digest(snapshot) == snapshot_hash
         restored_guest = json.loads(child.cli("exec", "--", "/probe", "inspect"))
@@ -709,6 +758,7 @@ def restore_case(work, ref):
         baseline = metric(child.view()["live"], "gauges", "filesystem.disk-0")
         assert baseline["status"] == "busy" and expected > int(baseline["last_value_bytes"])
         start_id = last = int(baseline["last_request_id"])
+        phase = "child-trace-detach"
         with (child.dir / "release.log").open("w") as log:
             release = subprocess.Popen([str(BIN / "sandbox-ctl"), "exec", "--sandbox-id", child.name,
                 "--path-id", "instance", "--run-root", str(child.runroot), "--", "/probe", "trace-stop"],
@@ -733,17 +783,10 @@ def restore_case(work, ref):
         print("PASS usage-sources/restore (occupied slot across failed capture rollback/quiesce/lazy restore; old epoch rejected; fresh recovery)", flush=True)
     except BaseException as error:
         failure = error
+        dump_restore_failure(phase, sb, child)
         raise
     finally:
-        try:
-            if child is not None:
-                cleanup_sources(child, processes=(release,), relay=relay, failure=failure, owned_trace=True)
-        except BaseException as error:
-            if failure is None:
-                failure = error
-            raise
-        finally:
-            cleanup_sources(sb, failure=failure, owned_trace=launched)
+        cleanup_restore_sources(sb, child, release, relay, failure, launched)
 
 
 def validate_ch_recovery(samples, baseline):
