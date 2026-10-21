@@ -3050,6 +3050,9 @@ go run ./test/perf/diffstore --directory /path/to/new-owned-directory \
 python3 test/perf/checkpoint_cow.py --tmpdir /path/to/native-ext4/scratch \
   --output /path/to/results --rounds 3 --operations 32768 \
   --modes 'raw|v1|v2-no-version|v2-shared|v2-private|v2-xts-no-version|v2-xts-shared|v2-xts-private'
+
+python3 test/perf/checkpoint_template.py --tmpdir /path/to/native-ext4/scratch \
+  --output /path/to/template-results
 ```
 
 The source suite checks independent-process pins and writer handoff, killed-owner
@@ -3069,6 +3072,12 @@ runs and two working-set traversals are required. Compare raw versus plaintext
 v2 and v1 versus encrypted v2 separately, including no-version, protected first
 write and already-private overwrite. These commands describe reproducible checks;
 they do not claim that performance targets or every privileged test passed.
+
+The template driver separately measures three rounds of fresh 64 MiB raw, v1
+XTS, v2 plaintext and v2 XTS initialization. It records Open, Ready,
+Materialized and total time, including initial synchronization and publication,
+then verifies the entire payload SHA256 outside the timing window. Source
+preparation is excluded; process peak RSS still includes that setup.
 
 The scaling driver removes each history before the next size. It reports
 checkpoint registration, control reopen and presence reconstruction separately;

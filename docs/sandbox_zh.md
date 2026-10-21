@@ -2721,6 +2721,9 @@ go run ./test/perf/diffstore --directory /path/to/new-owned-directory \
 python3 test/perf/checkpoint_cow.py --tmpdir /path/to/native-ext4/scratch \
   --output /path/to/results --rounds 3 --operations 32768 \
   --modes 'raw|v1|v2-no-version|v2-shared|v2-private|v2-xts-no-version|v2-xts-shared|v2-xts-private'
+
+python3 test/perf/checkpoint_template.py --tmpdir /path/to/native-ext4/scratch \
+  --output /path/to/template-results
 ```
 
 源码测试覆盖独立进程 pin 和 writer 交接、杀死 owner 后 redo 重开、真实短写、空间
@@ -2735,6 +2738,11 @@ p50/p95/p99、包含最终 Drain 的吞吐、数据/索引/redo/GC 物理字节�
 4 MiB。至少运行三轮，每轮覆盖两次工作集。plaintext v2 与 raw、encrypted v2 与
 v1 分别比较，并区分无版本、共享首写、已私有覆盖。这些命令提供复现方法，不代表
 性能门槛或全部特权测试已经通过。
+
+模板驱动单独测量三轮全新 64 MiB raw、v1 XTS、v2 明文与 v2 XTS 初始化。
+它记录 Open、Ready、Materialized 和总耗时，总耗时包含首次同步及正式发布，
+随后在计时窗口之外验证全量 payload SHA256。来源准备不计入耗时；进程峰值
+RSS 仍包含这部分准备阶段。
 
 规模 driver 在进入下一档前删除上一档历史，分别报告 checkpoint 注册、control 重开
 和 presence 重建。完整 resume 包含重建位图，耗时会随映射页数增长。vhost helper
