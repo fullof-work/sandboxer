@@ -436,6 +436,173 @@ class SourceFaultTests(unittest.TestCase):
                 usage_sources.validate_old_epoch(changed, "old", "new")
 
 
+class SourceFaultFilesystemRecoveryBoundaryTests(unittest.TestCase):
+    """Drive filesystem_case's real assertions without a VM or wall-clock waits."""
+
+    def run_case(self, work, delay=3.2, fault=None):
+        state = SimpleNamespace(now=0.0, held_at=None, statfs_done=False,
+                                release_at=None, records={}, anchor_reads=0,
+                                used=100, other_used=100, held_value=None)
+        clock = SimpleNamespace(
+            monotonic=lambda: state.now,
+            sleep=lambda seconds: setattr(state, "now", state.now + seconds))
+        case_dir = work / "filesystem"
+        case_dir.mkdir()
+        finished = SimpleNamespace(returncode=0, poll=lambda: 0, wait=lambda timeout: None)
+
+        def trace_poll():
+            if fault == "tracer_exited" and state.statfs_done:
+                return 1
+            return None if state.release_at is None else 0
+
+        trace = SimpleNamespace(returncode=0, poll=trace_poll, wait=lambda timeout: None)
+
+        def popen(command, stdout, **kwargs):
+            if "trace-fs" in command:
+                state.held_at, state.held_value = state.now, state.used
+                stdout.write("fstatfs(3</data>, ...) = 0\n")
+                return trace
+            if "init-resources-stream" in command:
+                for _ in range(3):
+                    stdout.write('{"fds": 5}\n')
+                return finished
+            if "trace-stop" in command:
+                state.release_at = state.now
+                return finished
+            raise AssertionError(("unexpected process", command))
+
+        def cli(*args):
+            if args[-1] == "inspect":
+                return json.dumps({"sandbox_init_sha256": "digest",
+                                   "balloon_proc_field": "false",
+                                   "zoneinfo": "pagesets count:"})
+            if "write" in args:
+                field = "used" if args[-2].startswith("/data/") else "other_used"
+                setattr(state, field, getattr(state, field) + 8 * 1024 * 1024)
+                return ""
+            if "statfs" in args:
+                # Real guest exec is synchronous; valid blocked request IDs
+                # keep advancing while this caller cannot observe them.
+                state.now += delay
+                state.statfs_done = True
+                return json.dumps({"Blocks": state.used, "Bfree": 0,
+                                   "Frsize": 1, "Bsize": 1})
+            raise AssertionError(("unexpected CLI call", args))
+
+        def view():
+            tick = int(state.now + 1e-7)
+            request_id = 100 + tick
+            held = state.held_at is not None
+            hold_tick = int(state.held_at + 1e-7) if held else tick
+            disk = dict(name="filesystem.disk-0", last_request_id=str(request_id),
+                        covered_total_ns=str(hold_tick * 1_000_000_000),
+                        integral_total_byte_ns=str(hold_tick * 10_000_000_000),
+                        last_value_bytes=str(state.held_value if held else state.used),
+                        span_total_ns=str(tick * 1_000_000_000),
+                        status=("timeout" if tick == hold_tick else "busy") if held else "ok",
+                        continuous=not held)
+            epoch = "run-1"
+            if state.statfs_done and state.release_at is None:
+                state.anchor_reads += 1
+                if fault in ("covered_total_ns", "integral_total_byte_ns", "last_value_bytes"):
+                    disk[fault] = str(int(disk[fault]) + 1)
+                elif fault == "anchor_ok":
+                    disk["status"] = "ok"
+                elif fault == "anchor_continuous":
+                    disk["continuous"] = True
+                elif fault == "anchor_regression":
+                    disk["last_request_id"] = "1"
+                elif fault == "anchor_epoch":
+                    epoch = "run-2"
+            if state.release_at is not None:
+                step = tick - int(state.release_at + 1e-7)
+                if step >= 1:
+                    if fault != "never_recovers":
+                        disk.update(status="ok", continuous=True,
+                                    last_value_bytes=str(state.used),
+                                    covered_total_ns=str((hold_tick + step - 1) * 1_000_000_000),
+                                    integral_total_byte_ns=str(hold_tick * 10_000_000_000 +
+                                                              (step - 1) * state.used * 1_000_000_000))
+                        if step == 1:
+                            if fault == "late_raw":
+                                disk["last_value_bytes"] = str(state.held_value)
+                            elif fault == "integrates_gap":
+                                disk["covered_total_ns"] = str(int(disk["covered_total_ns"]) + 1)
+                            elif fault == "integrates_area":
+                                disk["integral_total_byte_ns"] = str(int(disk["integral_total_byte_ns"]) + 1)
+                    if fault == "post_release_gap":
+                        disk["last_request_id"] = str(request_id + 1)
+            others = [dict(name=name, status="ok", last_request_id=str(request_id),
+                           covered_total_ns=str(tick * 1_000_000_000),
+                           last_value_bytes=str(state.other_used))
+                      for name in ("guest.memory", "filesystem.root", "filesystem.disk-1",
+                                   "ch.rss_anon", "ch.rss_file",
+                                   "sandbox_ctl.rss_anon", "sandbox_ctl.rss_file")]
+            return {"live": {"run_epoch": epoch, "gauges": [disk, *others]}}
+
+        sandbox = SimpleNamespace(dir=case_dir, runroot=case_dir / "run", name="sample",
+                                  ready=lambda: None, cli=cli, view=view)
+        with patch.object(usage_sources, "Sandbox", return_value=sandbox), \
+             patch.object(usage_sources, "filesystem_config", return_value={}), \
+             patch.object(usage_sources, "digest", return_value="digest"), \
+             patch.object(usage_sources, "runtime_init_digest", return_value="digest"), \
+             patch.object(usage_sources, "resources", return_value={"fds": 5}), \
+             patch.object(usage_sources, "subprocess", SimpleNamespace(Popen=popen, STDOUT=subprocess.STDOUT)), \
+             patch.object(usage_sources, "time", clock), \
+             patch.object(usage_sources, "cleanup_sources"), \
+             patch.object(usage_sources, "write_json",
+                          side_effect=lambda path, value: state.records.__setitem__(
+                              path.name, copy.deepcopy(value))), \
+             patch.object(sys, "stdout", io.StringIO()):
+            usage_sources.filesystem_case(work, "ref", 15)
+        return state
+
+    def test_synchronous_statfs_can_span_blocked_rounds_before_release(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = self.run_case(Path(directory))
+            previous = usage.metric(state.records["during.json"][-1]["live"], "gauges", "filesystem.disk-0")
+            anchor = usage.metric(state.records["recovery-baseline.json"]["live"], "gauges", "filesystem.disk-0")
+            first = usage.metric(state.records["recovered.json"][0]["live"], "gauges", "filesystem.disk-0")
+            self.assertGreater(int(anchor["last_request_id"]), int(previous["last_request_id"]) + 1)
+            self.assertEqual(int(first["last_request_id"]), int(anchor["last_request_id"]) + 1)
+            self.assertEqual(state.anchor_reads, 1)
+
+    def test_no_synchronous_delay_still_passes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.run_case(Path(directory), delay=0.0)
+
+    def test_anchor_requires_live_tracer_and_blocked_noncontinuous_sample(self):
+        for fault, message in (("tracer_exited", "Guest tracer exited before recovery baseline"),
+                               ("anchor_ok", "filesystem recovery baseline is not blocked"),
+                               ("anchor_continuous", "filesystem recovery baseline is not blocked")):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as directory:
+                with self.assertRaisesRegex(AssertionError, message):
+                    self.run_case(Path(directory), fault=fault)
+
+    def test_anchor_rejects_epoch_change_and_request_regression(self):
+        for fault, message in (("anchor_epoch", "filesystem recovery epoch changed"),
+                               ("anchor_regression", "filesystem recovery request regressed")):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as directory:
+                with self.assertRaisesRegex(AssertionError, message):
+                    self.run_case(Path(directory), fault=fault)
+
+    def test_anchor_cannot_change_accounting_or_last_known_value(self):
+        for field in ("covered_total_ns", "integral_total_byte_ns", "last_value_bytes"):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as directory:
+                with self.assertRaisesRegex(AssertionError, "blocked filesystem recovery baseline changed"):
+                    self.run_case(Path(directory), fault=field)
+
+    def test_released_rounds_still_require_complete_fresh_recovery(self):
+        for fault, message in (("post_release_gap", "unobserved recovery round"),
+                               ("late_raw", "late raw buffer was replayed"),
+                               ("integrates_gap", "missing interval was integrated"),
+                               ("integrates_area", "missing interval was integrated"),
+                               ("never_recovers", "fresh sampling did not resume")):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as directory:
+                with self.assertRaisesRegex(AssertionError, message):
+                    self.run_case(Path(directory), fault=fault)
+
+
 class CHRecoveryObservationTests(unittest.TestCase):
     """Drive the shipped ch_case with a virtual clock, never a VM or subprocess."""
 
