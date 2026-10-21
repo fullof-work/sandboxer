@@ -657,6 +657,11 @@ SDK 使用同一契约：`RuntimeSpec.EnableCheckpoint`、`RunOptions.EnableChec
 `ProcessStorage.DeletePublishedDiffCheckpoints(ctx, result)`，独立处理其错误，最后
 关闭 storage。离线元数据管理及固定版本发布都无需打开 BlockCOW。
 
+嵌入调用方可在 `LaunchSpec` 中提供不透明的 `ProcessStorage`；Checkpoint 物化会
+保留它的 manifest fetcher 与本地加密策略。`NewProcessStorageWithLocalAccess`
+可以借用 fetcher，`Borrow` 保留完整存储访问能力。关闭借用对象不会关闭原始
+客户端；所有借用方结束前，资源 owner 必须保持打开。
+
 块层的 `BlockCOW.Checkpoint(ctx, id)`、`ListCheckpoints(ctx)`、
 `DeleteCheckpoint(ctx, id)` 和 `Export(ctx, id)` 使用 `vhost.CheckpointID`。
 命名 `Export` 返回持有 reader pin 的 sparse source 和 closer，用完后必须关闭。

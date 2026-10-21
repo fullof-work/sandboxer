@@ -216,3 +216,101 @@ func TestColdEncryptedCheckpointWithoutManifestConfig(t *testing.T) {
 		})
 	}
 }
+
+type checkpointBorrowedFetcher struct {
+	lifecycleManifestFetcher
+	closes int
+}
+
+func (f *checkpointBorrowedFetcher) Close() error { f.closes++; return nil }
+
+func TestColdCheckpointMaterializationPreservesBorrowedManifestAccess(t *testing.T) {
+	for _, opaque := range []bool{false, true} {
+		t.Run(map[bool]string{false: "explicit-fetcher", true: "opaque-storage"}[opaque], func(t *testing.T) {
+			ctx := context.Background()
+			sourceDir, targetBase := t.TempDir(), t.TempDir()
+			if err := os.MkdirAll(filepath.Join(sourceDir, "diffs"), 0700); err != nil {
+				t.Fatal(err)
+			}
+			lower := bytes.Repeat([]byte{0x23}, 8192)
+			remote := &checkpointBorrowedFetcher{lifecycleManifestFetcher: lifecycleManifestFetcher{body: lower}}
+			c0 := snapshotTestLivePortable(t)
+			c0.Boot.Root.BaseFromRefs = []string{"manifest://" + strings.Repeat("a", 64)}
+			c0, err := c0.Checkpointed("")
+			if err != nil {
+				t.Fatal(err)
+			}
+			store, err := diffstore.Create(filepath.Join(sourceDir, "diffs", "root.diff"), diffstore.Options{DiffID: "root", BaseID: artifact.DiffCheckpointBaseID(c0.Boot.Root), LogicalSize: 8192})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.WriteAt(bytes.Repeat([]byte{0x61}, 4096), 0); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.Checkpoint(ctx, "cp"); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.Close(); err != nil {
+				t.Fatal(err)
+			}
+			cp := &sandboxfile.Checkpoint{Version: 1, CheckpointID: "cp", Root: sandboxfile.CheckpointDisk{DiffID: "root"}, Disks: []sandboxfile.CheckpointNamedDisk{}}
+			source, err := sandboxfile.BuildCheckpointSource(ctx, c0, cp)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ref, path, err := snapshot.NewFileSink(sourceDir, "fixture", nil, false, nil).AbsorbSandbox(ctx, source)
+			if err != nil {
+				t.Fatal(err)
+			}
+			opts := RunOptions{Cfg: &config.SandboxConfig{}, PortableConfig: c0, BaseRoot: targetBase, PathID: "target", SourceBinding: &RunSourceBinding{SandboxRef: ref, RuntimeRef: "file://" + path, RelativeDir: sourceDir, Checkpoint: cp}, Fetcher: remote}
+			var original *artifact.ProcessStorage
+			if opaque {
+				original, err = artifact.NewProcessStorageWithLocalAccess(&config.ManifestConfig{}, func() ([32]byte, error) { return [32]byte{1}, nil }, nil, false, remote)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer original.Close()
+				launch := LaunchSpec{Storage: original}
+				opts.checkpointStorage = opaqueLaunchStorage(launch)
+				opts.Fetcher = launchFetcher(launch)
+				if opts.checkpointStorage != original {
+					t.Fatal("opaque launch storage was not retained")
+				}
+			}
+			opts, release, err := prepareColdCheckpoint(ctx, opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer release()
+			// Portable remote lowers retain their selectors. The converted local
+			// upper must still carry access to that graph into runtime preflight.
+			refs := opts.PortableConfig.Boot.Root.BaseFromRefs
+			if len(refs) != 1 || !strings.HasPrefix(refs[0], "manifest://") {
+				t.Fatalf("manifest lower binding changed: %v", refs)
+			}
+			stream, _, err := OpenLayeredBlockReader(ctx, refs, opts.Fetcher, nil, nil, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := make([]byte, len(lower))
+			if _, err := stream.ReadAt(got, 0); err != nil {
+				t.Fatal(err)
+			}
+			if err := stream.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if remote.opens == 0 {
+				t.Fatal("manifest lower was not read")
+			}
+			if !bytes.Equal(got, lower) {
+				t.Fatal("manifest lower bytes changed after checkpoint materialization")
+			}
+			if err := release(); err != nil {
+				t.Fatal(err)
+			}
+			if remote.closes != 0 {
+				t.Fatal("checkpoint cleanup closed borrowed manifest access")
+			}
+		})
+	}
+}

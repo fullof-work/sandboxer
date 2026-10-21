@@ -31,9 +31,13 @@ func prepareColdCheckpoint(ctx context.Context, opts RunOptions) (_ RunOptions, 
 	var pins *artifact.PinnedDiffCheckpoints
 	var err error
 	if opts.SourceBinding != nil && opts.SourceBinding.Checkpoint != nil {
-		storage, err = artifact.NewProcessStorageWithLocalAccess(opts.ManifestCfg, opts.CustomerKeyFn, opts.LocalCodec, opts.LocalRequired)
-		if err != nil {
-			return opts, release, err
+		if opts.checkpointStorage != nil {
+			storage = opts.checkpointStorage.Borrow()
+		} else {
+			storage, err = artifact.NewProcessStorageWithLocalAccess(opts.ManifestCfg, opts.CustomerKeyFn, opts.LocalCodec, opts.LocalRequired, opts.Fetcher)
+			if err != nil {
+				return opts, release, err
+			}
 		}
 		closes = append(closes, storage.Close)
 		pins, err = storage.PinDiffCheckpoints(ctx, opts.SourceBinding.RelativeDir, opts.SourceBinding.Checkpoint)

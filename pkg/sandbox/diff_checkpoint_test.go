@@ -108,3 +108,59 @@ func TestColdPreflightReadsReopenedV2ThroughTheSharedDiskPlan(t *testing.T) {
 		t.Fatal("legacy preflight implicitly accepted v2 writable diff")
 	}
 }
+
+func TestOnlineCheckpointManagementSkipsRetiredAndMissingDiffs(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "diffs"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	create := func(filename, identity string, retire bool) *diffstore.View {
+		t.Helper()
+		store, err := diffstore.Create(filepath.Join(dir, "diffs", filename+".diff"), diffstore.Options{DiffID: identity, LogicalSize: 4096})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.Checkpoint(ctx, "cp"); err != nil {
+			t.Fatal(err)
+		}
+		var view *diffstore.View
+		if retire {
+			view, err = store.Export(ctx, "cp")
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = view.Close() })
+			if err := store.Retire(ctx); !errors.Is(err, diffstore.ErrBusy) {
+				t.Fatalf("pinned retirement: %v", err)
+			}
+		}
+		if err := store.Close(); err != nil {
+			t.Fatal(err)
+		}
+		return view
+	}
+	create("available", "available", false)
+	pinned := create("retired", "retired", true)
+	handler := &SnapshotHandler{EnableCheckpoint: true, CheckpointDir: dir}
+	refs, err := handler.listDiffCheckpoints(ctx)
+	if err != nil || len(refs) != 1 || refs[0].DiffID != "available" || refs[0].ID != "cp" {
+		t.Fatalf("retired file poisoned live list: %+v %v", refs, err)
+	}
+	for range 2 {
+		err := handler.deleteDiffCheckpoints(ctx, []ctl.DiffCheckpointRef{{DiffID: "retired", ID: "cp"}, {DiffID: "removed", ID: "cp"}})
+		if err != nil {
+			t.Fatalf("exact cleanup was not idempotent: %v", err)
+		}
+	}
+	if _, err := pinned.ReadAt(ctx, make([]byte, 4096), 0); err != nil {
+		t.Fatalf("existing retired pin lost: %v", err)
+	}
+	create("wrong", "different", true)
+	if _, err := handler.listDiffCheckpoints(ctx); err == nil || !strings.Contains(err.Error(), "identity mismatch") {
+		t.Fatalf("retired identity mismatch hidden by list: %v", err)
+	}
+	if err := handler.deleteDiffCheckpoints(ctx, []ctl.DiffCheckpointRef{{DiffID: "wrong", ID: "cp"}}); err == nil || !strings.Contains(err.Error(), "identity mismatch") {
+		t.Fatalf("retired identity mismatch hidden by delete: %v", err)
+	}
+}

@@ -46,13 +46,14 @@ import (
 
 // RunOptions controls a single sandbox-ctl run invocation.
 type RunOptions struct {
-	EnableCheckpoint bool
-	checkpointPlan   *CheckpointDiskPlan
-	checkpointOwner  *diffstore.DirectoryOwner
-	namedCheckpoint  bool
-	checkpointDir    string // runtime-owned checkpoint provenance; never serialized
-	usageSampler     *usage.Sampler
-	Cfg              *config.SandboxConfig
+	EnableCheckpoint  bool
+	checkpointPlan    *CheckpointDiskPlan
+	checkpointStorage *artifact.ProcessStorage
+	checkpointOwner   *diffstore.DirectoryOwner
+	namedCheckpoint   bool
+	checkpointDir     string // runtime-owned checkpoint provenance; never serialized
+	usageSampler      *usage.Sampler
+	Cfg               *config.SandboxConfig
 	// PortableConfig is immutable C0. nil selects projection from an explicit
 	// cold config; non-nil selects a Sandbox source and requires SourceBinding.
 	PortableConfig *config.PortableSandboxConfig

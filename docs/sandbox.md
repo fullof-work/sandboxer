@@ -735,6 +735,12 @@ SDK entry points use the same rules: `RuntimeSpec.EnableCheckpoint`,
 separately before closing storage. No caller needs to open a BlockCOW to manage
 offline metadata or publish a fixed version.
 
+Embedding callers may supply an opaque `ProcessStorage` in `LaunchSpec`;
+Checkpoint materialization preserves its manifest fetcher and local encryption
+policy. `NewProcessStorageWithLocalAccess` can borrow a fetcher, and `Borrow`
+retains the complete storage access capability. Closing a borrower does not
+close the original clients; the owner must remain open until borrowers finish.
+
 At the block layer, `BlockCOW.Checkpoint(ctx, id)`, `ListCheckpoints(ctx)`,
 `DeleteCheckpoint(ctx, id)` and `Export(ctx, id)` use `vhost.CheckpointID`.
 A named `Export` returns a sparse source and closer that owns its reader pin;

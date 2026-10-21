@@ -263,13 +263,15 @@ func captureSandboxAtFreeze(ctx context.Context, sources ExportSources, sink Art
 		if err != nil {
 			return nil, fmt.Errorf("export data disk %d SnapshotView: %w", i-1, err)
 		}
-		var ref,path string
-  if sources.Diffs[i].Export==nil {
-   // Keep legacy sink adapters working while native BlockCOW captures use
-   // the closeable sparse source path.
-   legacy:=view.(*seekerSource)
-   ref,path,err=sink.AbsorbOverlay(ctx,legacy.rs,legacy.holes)
-  }else{ref,path,err=sink.AbsorbOverlaySource(ctx,view)}
+		var ref, path string
+		if sources.Diffs[i].Export == nil {
+			// Keep legacy sink adapters working while native BlockCOW captures use
+			// the closeable sparse source path.
+			legacy := view.(*seekerSource)
+			ref, path, err = sink.AbsorbOverlay(ctx, legacy.rs, legacy.holes)
+		} else {
+			ref, path, err = sink.AbsorbOverlaySource(ctx, view)
+		}
 		cleanupErr := cleanup()
 		if err != nil {
 			return nil, fmt.Errorf("export data disk %d: %w", i-1, errors.Join(err, cleanupErr))

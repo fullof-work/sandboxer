@@ -191,6 +191,11 @@ func (h *SnapshotHandler) listDiffCheckpoints(ctx context.Context) ([]artifact.D
 			return nil, errors.Join(errors.New("checkpoint DIFF filename/header identity mismatch"), meta.Close())
 		}
 		ids, err := meta.ListCheckpoints(ctx)
+		// Retirement withdraws every version immediately, even while an export
+		// pin keeps the old inode present until a later cleanup retry.
+		if errors.Is(err, diffstore.ErrRetired) {
+			err = nil
+		}
 		closeErr := meta.Close()
 		if err = errors.Join(err, closeErr); err != nil {
 			return nil, err
@@ -238,6 +243,9 @@ func (h *SnapshotHandler) deleteDiffCheckpoints(ctx context.Context, refs []ctl.
 			continue
 		}
 		meta, err := diffstore.OpenMetadata(filepath.Join(h.CheckpointDir, "diffs", id+".diff"))
+		if os.IsNotExist(err) {
+			continue
+		}
 		if err != nil {
 			return err
 		}
@@ -245,6 +253,9 @@ func (h *SnapshotHandler) deleteDiffCheckpoints(ctx context.Context, refs []ctl.
 			return errors.Join(errors.New("checkpoint DIFF filename/header identity mismatch"), meta.Close())
 		}
 		err = meta.DeleteCheckpoints(ctx, ids)
+		if errors.Is(err, diffstore.ErrRetired) {
+			err = nil
+		}
 		if err = errors.Join(err, meta.Close()); err != nil {
 			return err
 		}

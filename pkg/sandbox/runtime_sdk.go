@@ -588,7 +588,8 @@ func (r *Runtime) Launch(ctx context.Context, spec LaunchSpec) error {
 	}
 	r.storage = spec.Storage
 	if spec.legacyAccess == nil && (r.spec.EnableCheckpoint || (spec.SourceBinding != nil && spec.SourceBinding.Checkpoint != nil)) {
-		prepared, release, err := prepareColdCheckpoint(ctx, RunOptions{EnableCheckpoint: r.spec.EnableCheckpoint, Cfg: cfg, PortableConfig: spec.PortableConfig, SourceBinding: spec.SourceBinding, ManifestCfg: spec.ManifestConfig, Fetcher: launchFetcher(spec), BundleReader: spec.BundleReader, BundleFetcher: spec.BundleFetcher, RefLocations: spec.RefLocations, CustomerKeyFn: launchKey(spec), LocalCodec: launchCodec(spec), LocalRequired: launchRequired(spec), SandboxID: r.sandboxID, PathID: r.pathID, BaseRoot: r.spec.BaseRoot})
+		checkpointStorage := opaqueLaunchStorage(spec)
+		prepared, release, err := prepareColdCheckpoint(ctx, RunOptions{checkpointStorage: checkpointStorage, EnableCheckpoint: r.spec.EnableCheckpoint, Cfg: cfg, PortableConfig: spec.PortableConfig, SourceBinding: spec.SourceBinding, ManifestCfg: spec.ManifestConfig, Fetcher: launchFetcher(spec), BundleReader: spec.BundleReader, BundleFetcher: spec.BundleFetcher, RefLocations: spec.RefLocations, CustomerKeyFn: launchKey(spec), LocalCodec: launchCodec(spec), LocalRequired: launchRequired(spec), SandboxID: r.sandboxID, PathID: r.pathID, BaseRoot: r.spec.BaseRoot})
 		if err != nil {
 			return fail(err)
 		}
@@ -598,7 +599,11 @@ func (r *Runtime) Launch(ctx context.Context, spec LaunchSpec) error {
 		cfg = prepared.Cfg
 		spec.PortableConfig = prepared.PortableConfig
 		spec.SourceBinding = prepared.SourceBinding
-		spec.Fetcher = prepared.Fetcher
+		if checkpointStorage == nil {
+			spec.Fetcher = prepared.Fetcher
+		}
+		// An opaque Storage remains authoritative for subsequent file/Bundle
+		// access too; introducing a public Fetcher override would discard it.
 		spec.BundleReader = prepared.BundleReader
 		spec.BundleFetcher = prepared.BundleFetcher
 	}
@@ -923,10 +928,17 @@ func openLaunchFile(ctx context.Context, s LaunchSpec, path string, ref manifest
 	// manifest configuration, customer key, codec, and lazy clients. Preserve
 	// that configuration instead of reconstructing it from public LaunchSpec
 	// fields when the caller did not explicitly override access.
-	if s.legacyAccess == nil && s.Storage != nil && s.ManifestConfig == nil && s.Fetcher == nil && s.Credentials == nil {
-		return s.Storage.OpenFileWithLocations(ctx, path, ref, locations)
+	if storage := opaqueLaunchStorage(s); storage != nil {
+		return storage.OpenFileWithLocations(ctx, path, ref, locations)
 	}
 	return artifact.OpenFileWithLocations(ctx, path, ref, s.ManifestConfig, launchKey(s), launchFetcher(s), locations, launchCodec(s), launchRequired(s))
+}
+
+func opaqueLaunchStorage(s LaunchSpec) *artifact.ProcessStorage {
+	if s.legacyAccess == nil && s.Storage != nil && s.ManifestConfig == nil && s.Fetcher == nil && s.Credentials == nil {
+		return s.Storage
+	}
+	return nil
 }
 
 func launchFetcher(s LaunchSpec) fetch.Fetcher {

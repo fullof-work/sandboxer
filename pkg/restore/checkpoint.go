@@ -29,7 +29,7 @@ func prepareRestoreCheckpoint(ctx context.Context, opts Options, source *openedS
 			retErr = errors.Join(retErr, release())
 		}
 	}()
-	storage, err := artifact.NewProcessStorageWithLocalAccess(opts.ManifestCfg, opts.CustomerKeyFn, opts.LocalCodec, opts.LocalRequired)
+	storage, err := artifact.NewProcessStorageWithLocalAccess(opts.ManifestCfg, opts.CustomerKeyFn, opts.LocalCodec, opts.LocalRequired, opts.Fetcher)
 	if err != nil {
 		return opts, source, release, err
 	}
