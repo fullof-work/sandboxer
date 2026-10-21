@@ -60,6 +60,8 @@ class ReadRecoveryFatalCauseTests(unittest.TestCase):
             Path(directory, "recovered.snapshot.log").write_text(error + "\n")
             Path(directory, "recovered.log").write_text(
                 "old log\n" * 10000 + "source manifest://" + key + "\n" + error + "\n")
+            Path(directory, "cow.app.log").write_text(
+                "old app log\n" * 10000 + "manifest://" + key + "\nDISK-READ-BEGIN\n")
             Path(directory, "manifest.yaml").write_text("must-not-read-config")
             result = subprocess.run([sys.executable, "-c", diagnostic, directory],
                                     text=True, capture_output=True)
@@ -67,6 +69,8 @@ class ReadRecoveryFatalCauseTests(unittest.TestCase):
             self.assertIn(error, result.stderr)
             self.assertIn("snapshot: seed capture failed", result.stderr)
             self.assertIn("seed capture reached", result.stderr)
+            self.assertIn("read-recovery diagnostic cow.app.log bytes=", result.stderr)
+            self.assertIn("DISK-READ-BEGIN", result.stderr)
             self.assertIn("<redacted>", result.stderr)
             self.assertNotIn(key, result.stderr)
             self.assertNotIn("must-not-read-config", result.stderr)
@@ -99,6 +103,140 @@ class ReadRecoveryFatalCauseTests(unittest.TestCase):
                         env={**os.environ, "WORK": directory})
                     self.assertEqual(result.returncode, 0 if expected else 1,
                                      result.stdout + result.stderr)
+
+
+
+class ReadRecoveryMarkerTests(unittest.TestCase):
+    @staticmethod
+    def case_source():
+        return (ROOT / "test/e2e/cases/snapshot.read-recovery.sh").read_text()
+
+    @staticmethod
+    def function(source, name):
+        return name + "() {" + source.split(name + "() {", 1)[1].split("\n}\n", 1)[0] + "\n}\n"
+
+    def run_launch(self, payload, probe, *, merged=False, sid="cow", existing=b"",
+                   diagnostic=b"[sandbox-init][T+412ms] exec: session done pid=76 code=0"):
+        source = self.case_source()
+        launch = self.function(source, "launch")
+        if merged:
+            # Negative control: restore the former shared stdout/stderr sink.
+            self.assertIn(' --stdout-to "$app_log"', launch)
+            launch = launch.replace(' --stdout-to "$app_log"', '', 1)
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            app = work / (sid + ".app.log")
+            app.write_bytes(existing)
+            fake = work / "sandbox-ctl"
+            # Match the existing --stdout-to append semantics. A split console
+            # message surrounds the guest payload, deterministically recreating
+            # the ARM CI interleaving without a VM or scheduling assumptions.
+            fake.write_text("#!" + sys.executable + "\n" + r"""
+import os, pathlib, sys, time
+args = sys.argv[1:]
+out = 1
+if '--stdout-to' in args:
+    out = os.open(args[args.index('--stdout-to') + 1], os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+os.write(2, bytes.fromhex(os.environ['FAKE_DIAGNOSTIC']))
+payload = bytes.fromhex(os.environ['FAKE_PAYLOAD'])
+half = len(payload) // 2
+os.write(out, payload[:half])
+os.write(out, payload[half:])
+os.write(2, b'\n')
+if out != 1:
+    os.close(out)
+ready = int(next(arg.split('=', 1)[1] for arg in args if arg.startswith('--ready-fd=')))
+os.write(ready, b'control_ready\nready\n')
+os.close(ready)
+end = time.monotonic() + 5
+while not pathlib.Path(os.environ['WORK'], 'fake.release').exists():
+    if time.monotonic() >= end:
+        sys.exit(3)
+    time.sleep(.01)
+""")
+            fake.chmod(0o755)
+            script = '\n'.join([
+                'set -euo pipefail',
+                'source "$READINESS_HELPER"',
+                'SESSIONS=()',
+                self.function(source, "wait_file"),
+                self.function(source, "wait_file_count"),
+                launch,
+                'e2e_fail() { echo "$*" >&2; return 1; }',
+                'launch "$TEST_SID" --config "$WORK/unused.yaml"',
+                'LAUNCHED_PID=$RUN_PID',
+                """trap 'status=$?; touch "$WORK/fake.release"; wait "$LAUNCHED_PID" || true; exit "$status"' EXIT""",
+                # Negative predicates fail immediately after checking the file;
+                # the production marker expression and comparison are unchanged.
+                'RUN_PID=999999999',
+                probe,
+            ])
+            result = subprocess.run(['bash', '-c', script], text=True, capture_output=True,
+                                    timeout=10, env={**os.environ, 'WORK': directory,
+                                        'BIN': directory, 'TEST_SID': sid,
+                                        'READINESS_HELPER': str(LIB / 'readiness_helpers.sh'),
+                                        'FAKE_PAYLOAD': payload.hex(),
+                                        'FAKE_DIAGNOSTIC': diagnostic.hex()})
+            return result, app.read_bytes(), (work / (sid + '.log')).read_bytes()
+
+    def begin_wait(self):
+        return next(line for line in self.case_source().splitlines()
+                    if line.startswith('wait_file ') and "'^DISK-READ-BEGIN$'" in line)
+
+    def test_console_interleaving_cannot_hide_application_marker(self):
+        result, app, diagnostic = self.run_launch(b'DISK-READ-BEGIN\n', self.begin_wait())
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(app, b'DISK-READ-BEGIN\n')
+        self.assertNotIn(b'DISK-READ-BEGIN', diagnostic)
+
+    def test_merged_stream_negative_control_loses_exact_marker(self):
+        result, app, diagnostic = self.run_launch(
+            b'DISK-READ-BEGIN\n', self.begin_wait().replace('cow.app.log', 'cow.log'), merged=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(app, b'')
+        self.assertIn(b'code=0DISK-READ-BEGIN\n\n', diagnostic)
+
+    def test_marker_must_be_exact_and_from_this_application_run(self):
+        for name, payload, existing in (
+                ('prefix', b'prefixDISK-READ-BEGIN\n', b''),
+                ('suffix', b'DISK-READ-BEGINsuffix\n', b''),
+                ('carriage-return', b'DISK-READ-BEGIN\r\n', b''),
+                ('partial', b'DISK-READ-', b''),
+                ('diagnostic-only', b'', b''),
+                ('stale-file', b'', b'DISK-READ-BEGIN\n')):
+            with self.subTest(name=name):
+                result, app, _ = self.run_launch(payload, self.begin_wait(), existing=existing,
+                                                diagnostic=b'DISK-READ-BEGIN\n')
+                self.assertNotEqual(result.returncode, 0, name)
+                self.assertEqual(app, payload)
+
+    def test_premature_recovery_still_fails_with_interleaved_diagnostics(self):
+        source = self.case_source()
+        for marker in ('COW-RECOVERED', 'DISK-READ-RECOVERED'):
+            with self.subTest(marker=marker):
+                start = "if grep -q '^" + marker + "$'"
+                guard = start + source.split(start, 1)[1].split('\nfi\n', 1)[0] + '\nfi\n'
+                result, app, _ = self.run_launch((marker + '\n').encode(), guard)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('while its', result.stderr)
+                self.assertEqual(app, (marker + '\n').encode())
+
+    def test_idle_wait_requires_a_new_application_occurrence(self):
+        lines = self.case_source().splitlines()
+        baseline = next(line for line in lines if line.startswith('VERIFIED_IDLE_BASE='))
+        waiter = next(line for line in lines if line.startswith('wait_file_count '))
+        probe = '\n'.join([
+            baseline,
+            '[ "$VERIFIED_IDLE_BASE" = 1 ]',
+            'if ' + waiter + '; then e2e_fail "replayed idle marker accepted"; fi',
+            'printf "RECOVERY-IDLE\\n" >>"$WORK/verified.app.log"',
+            waiter,
+        ])
+        result, app, _ = self.run_launch(b'RECOVERY-IDLE\n', probe, sid='verified',
+                                        existing=b'RECOVERY-IDLE\n',
+                                        diagnostic=b'RECOVERY-IDLE\nRECOVERY-IDLE\n')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(app, b'RECOVERY-IDLE\nRECOVERY-IDLE\n')
 
 
 class HarnessProcessTests(unittest.TestCase):

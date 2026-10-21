@@ -37,8 +37,10 @@ import pathlib, re, sys
 work = pathlib.Path(sys.argv[1])
 # Only bounded tails of owned runtime/error logs; never read config or key files.
 # Snapshot/source errors can contain manifest keys, so redact 256-bit hex values.
-for name in ('seed.snapshot.log', 'seed.log', 'recovered.snapshot.log',
-             'recovered.log', 'verified.snapshot.log', 'verified.log', 'proxy.log'):
+for name in ('cow.log', 'cow.app.log', 'seed.snapshot.log', 'seed.log',
+             'seed.app.log', 'recovered.snapshot.log', 'recovered.log',
+             'recovered.app.log', 'verified.snapshot.log', 'verified.log',
+             'verified.app.log', 'proxy.log'):
     try:
         with (work / name).open('rb') as source:
             source.seek(0, 2)
@@ -260,10 +262,13 @@ PY
 launch() {
     local sid=$1
     shift
-    local ready="$WORK/$sid.ready"
+    local ready="$WORK/$sid.ready" app_log="$WORK/$sid.app.log"
+    # Application markers must not share console/diagnostic writes. --stdout-to
+    # appends, so discard any previous run's markers before opening this stream.
+    : >"$app_log"
     readiness_begin_capture "$ready"
     local ready_reader=$READY_READER_PID
-    readiness_exec_in_new_session "$BIN/sandbox-ctl" run --ready-fd="$READY_WRITE_FD" "$@" \
+    readiness_exec_in_new_session "$BIN/sandbox-ctl" run --ready-fd="$READY_WRITE_FD" --stdout-to "$app_log" "$@" \
         --manifest-config "$WORK/manifest.yaml" --ch-binary "$BIN/cloud-hypervisor" \
         --sandbox-id "$sid" --run-root "$WORK/run" --base-root "$WORK/base" \
         --stats-json "$WORK/$sid.stats.json" >"$WORK/$sid.log" 2>&1 &
@@ -319,30 +324,30 @@ launch:
 PY
 
 launch cow --config "$WORK/cow.yaml"
-wait_file "$WORK/cow.log" '^COW-ARMED$' "$RUN_PID"
+wait_file "$WORK/cow.app.log" '^COW-ARMED$' "$RUN_PID"
 "$BIN/sandbox-ctl" exec --sandbox-id cow --run-root "$WORK/run" -- /bin/true
 COW_FAULT_BASE=$(fault_count)
 mode "cow:$(cat "$WORK/cow.keys")"
 "$BIN/sandbox-ctl" exec --sandbox-id cow --run-root "$WORK/run" -- touch /cow.begin
-wait_file "$WORK/cow.log" '^COW-BEGIN$' "$RUN_PID"
+wait_file "$WORK/cow.app.log" '^COW-BEGIN$' "$RUN_PID"
 wait_fault_count "$COW_FAULT_BASE" 4 "$RUN_PID"
 kill -0 "$RUN_PID"
-if grep -q '^COW-RECOVERED$' "$WORK/cow.log"; then
+if grep -q '^COW-RECOVERED$' "$WORK/cow.app.log"; then
     e2e_fail "COW write completed while its base source was unavailable"
 fi
 mode healthy
-wait_file "$WORK/cow.log" '^DISK-READ-ARMED$' "$RUN_PID"
+wait_file "$WORK/cow.app.log" '^DISK-READ-ARMED$' "$RUN_PID"
 DISK_FAULT_BASE=$(fault_count)
 mode "disk-read:$(cat "$WORK/cow.keys")"
 "$BIN/sandbox-ctl" exec --sandbox-id cow --run-root "$WORK/run" -- touch /disk-read.begin
-wait_file "$WORK/cow.log" '^DISK-READ-BEGIN$' "$RUN_PID"
+wait_file "$WORK/cow.app.log" '^DISK-READ-BEGIN$' "$RUN_PID"
 wait_fault_count "$DISK_FAULT_BASE" 4 "$RUN_PID"
 kill -0 "$RUN_PID"
-if grep -q '^DISK-READ-RECOVERED$' "$WORK/cow.log"; then
+if grep -q '^DISK-READ-RECOVERED$' "$WORK/cow.app.log"; then
     e2e_fail "disk read completed while its source was unavailable"
 fi
 mode healthy
-wait_file "$WORK/cow.log" '^DISK-READ-RECOVERED$' "$RUN_PID"
+wait_file "$WORK/cow.app.log" '^DISK-READ-RECOVERED$' "$RUN_PID"
 kill -TERM "$RUN_PID"
 wait "$RUN_PID"
 SESSIONS=()
@@ -362,7 +367,7 @@ assert all(f['key'] in keys for f in faults)
 PY
 
 launch seed --config "$WORK/sandbox.yaml"
-wait_file "$WORK/seed.log" '^RECOVERY-TICK 20$' "$RUN_PID"
+wait_file "$WORK/seed.app.log" '^RECOVERY-TICK 20$' "$RUN_PID"
 SNAP=$("$BIN/sandbox-ctl" snapshot --sandbox-id seed --upload --run-root "$WORK/run" 2>"$WORK/seed.snapshot.log")
 SNAP="${SNAP#manifest://}"
 [ "${#SNAP}" -eq 64 ] || e2e_fail "seed snapshot did not return a manifest key"
@@ -378,10 +383,10 @@ boot:
 YAML
 
 launch recovered --restore "manifest://$SNAP" --config "$WORK/host.yaml"
-wait_file "$WORK/recovered.log" '^RECOVERY-TICK [0-9]+$' "$RUN_PID"
+wait_file "$WORK/recovered.app.log" '^RECOVERY-TICK [0-9]+$' "$RUN_PID"
 "$BIN/sandbox-ctl" exec --sandbox-id recovered --run-root "$WORK/run" -- /bin/true
 "$BIN/sandbox-ctl" exec --sandbox-id recovered --run-root "$WORK/run" -- sh -c 'touch /recovery.idle'
-wait_file "$WORK/recovered.log" '^RECOVERY-IDLE$' "$RUN_PID"
+wait_file "$WORK/recovered.app.log" '^RECOVERY-IDLE$' "$RUN_PID"
 CAPTURE_FAULT_BASE=$(fault_count)
 mode offline
 "$BIN/sandbox-ctl" snapshot --sandbox-id recovered --upload --run-root "$WORK/run" >"$WORK/next.key" 2>"$WORK/recovered.snapshot.log" &
@@ -460,12 +465,12 @@ for _ in $(seq 1 200); do
     sleep .05
 done
 [ "$VERIFIED_READY" = 1 ] || e2e_fail "verified restore never became exec-ready"
-wait_file "$WORK/verified.log" '^RECOVERY-RESUMED$' "$RUN_PID"
-wait_file "$WORK/verified.log" '^RECOVERY-TICK [0-9]+$' "$RUN_PID"
+wait_file "$WORK/verified.app.log" '^RECOVERY-RESUMED$' "$RUN_PID"
+wait_file "$WORK/verified.app.log" '^RECOVERY-TICK [0-9]+$' "$RUN_PID"
 "$BIN/sandbox-ctl" exec --sandbox-id verified --run-root "$WORK/run" -- /bin/true
-VERIFIED_IDLE_BASE=$(grep -cE '^RECOVERY-IDLE$' "$WORK/verified.log" 2>/dev/null || true)
+VERIFIED_IDLE_BASE=$(grep -cE '^RECOVERY-IDLE$' "$WORK/verified.app.log" 2>/dev/null || true)
 "$BIN/sandbox-ctl" exec --sandbox-id verified --run-root "$WORK/run" -- touch /recovery.idle
-wait_file_count "$WORK/verified.log" '^RECOVERY-IDLE$' "$VERIFIED_IDLE_BASE" "$RUN_PID"
+wait_file_count "$WORK/verified.app.log" '^RECOVERY-IDLE$' "$VERIFIED_IDLE_BASE" "$RUN_PID"
 
 FATAL_FAULT_BASE=$(fault_count)
 mode offline
