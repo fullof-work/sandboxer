@@ -1,6 +1,7 @@
 package vhost
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -145,6 +146,9 @@ func (d *diffFile) enableDirectWithFcntl(fcntl func(uintptr, int, int) (int, err
 // published any cache pages and copied out. Caller/guest memory is never a
 // trusted source for clean cache contents. consume must not retain the slice.
 func (d *diffFile) withDirectRead(length int, offset int64, consume func([]byte) error) error {
+	if d.backend != nil {
+		return d.backend.withRead(length, offset, consume)
+	}
 	d.direct.readMu.Lock()
 	defer d.direct.readMu.Unlock()
 	if d.direct.read.bytes == nil {
@@ -217,6 +221,9 @@ func (d *diffFile) directWriteAt(buf []byte, offset int64) (int, error) {
 // encrypted in place or exposed to a syscall; the cache retains every page and
 // its dirty charge until this call and any failure cleanup have completed.
 func (d *diffFile) writeCachePages(pages []*cachePage, offset int64) error {
+	if d.backend != nil {
+		return d.backend.writePages(context.Background(), pages)
+	}
 	if len(pages) == 0 || len(pages) > maxWritebackPages || offset < 0 || offset%cowBlockSize != 0 || offset > d.logicalSize || int64(len(pages)*cowBlockSize) > d.logicalSize-offset {
 		return fmt.Errorf("vhost: invalid bounded cache write")
 	}

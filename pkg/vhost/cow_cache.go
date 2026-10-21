@@ -477,22 +477,62 @@ func (c *COWCache) run() {
 			// Always include the oldest page, then find contiguous dirty neighbours
 			// in the bounded index regardless of arrival order. Unselected FIFO age
 			// is untouched. Scan at most one batch backwards and forwards.
-			first := anchor
-			for lenBack := 1; lenBack < maxWritebackPages && first.key.block > 0; lenBack++ {
-				p := c.pages[cacheKey{anchor.key.cow, first.key.block - 1}]
-				if p == nil || p.state != cacheDirty {
-					break
+			if anchor.key.cow.diff.backend != nil {
+				// Keep the oldest anchor, then fill its same-DIFF transaction
+				// with neighboring runs before unrelated logical pages. The
+				// bounded candidate list preserves batching for dispersed
+				// writes while retaining physical coalescing for mapped pages.
+				var candidates [maxWritebackPages]*cachePage
+				count := 0
+				for p := anchor; p != nil && count < len(candidates); p = p.next {
+					if p.key.cow == anchor.key.cow {
+						candidates[count] = p
+						count++
+					}
 				}
-				first = p
-			}
-			for block := first.key.block; len(batch) < maxWritebackPages; block++ {
-				p := c.pages[cacheKey{anchor.key.cow, block}]
-				if p == nil || p.state != cacheDirty {
-					break
+				for _, candidate := range candidates[:count] {
+					if len(batch) == maxWritebackPages {
+						break
+					}
+					if candidate.state != cacheDirty {
+						continue
+					}
+					first := candidate
+					for n := 1; n < maxWritebackPages-len(batch) && first.key.block > 0; n++ {
+						p := c.pages[cacheKey{anchor.key.cow, first.key.block - 1}]
+						if p == nil || p.state != cacheDirty {
+							break
+						}
+						first = p
+					}
+					for block := first.key.block; len(batch) < maxWritebackPages; block++ {
+						p := c.pages[cacheKey{anchor.key.cow, block}]
+						if p == nil || p.state != cacheDirty {
+							break
+						}
+						c.dirty.remove(p)
+						p.state = cacheWriteback
+						batch = append(batch, p)
+					}
 				}
-				c.dirty.remove(p)
-				p.state = cacheWriteback
-				batch = append(batch, p)
+			} else {
+				first := anchor
+				for lenBack := 1; lenBack < maxWritebackPages && first.key.block > 0; lenBack++ {
+					p := c.pages[cacheKey{anchor.key.cow, first.key.block - 1}]
+					if p == nil || p.state != cacheDirty {
+						break
+					}
+					first = p
+				}
+				for block := first.key.block; len(batch) < maxWritebackPages; block++ {
+					p := c.pages[cacheKey{anchor.key.cow, block}]
+					if p == nil || p.state != cacheDirty {
+						break
+					}
+					c.dirty.remove(p)
+					p.state = cacheWriteback
+					batch = append(batch, p)
+				}
 			}
 		}
 		if len(batch) == 0 {
@@ -516,7 +556,7 @@ func (c *COWCache) run() {
 			// A known failure must be visible before any potentially blocking
 			// rollback. Keep active and the frozen pages until that I/O ends.
 			c.mu.Lock()
-			report := c.failLocked(fmt.Errorf("vhost: diff writeback %s at %d: %w", cow.diff.f.Name(), off, err))
+			report := c.failLocked(fmt.Errorf("vhost: diff writeback %s at %d: %w", cow.diff.name(), off, err))
 			fatal := c.err
 			c.mu.Unlock()
 			if report != nil {
@@ -531,11 +571,7 @@ func (c *COWCache) run() {
 			// Only genuinely new upper blocks can be punched after a partial batch.
 			// Existing upper blocks may already be partially changed; never hole them.
 			if cleanupErr == nil {
-				for _, p := range batch {
-					if p.fresh {
-						cleanupErr = errors.Join(cleanupErr, cow.diff.punchHole(p.key.block*cowBlockSize, cowBlockSize))
-					}
-				}
+				cleanupErr = cow.diff.cleanupWriteFailure(batch)
 			}
 		}
 		c.mu.Lock()
@@ -553,7 +589,7 @@ func (c *COWCache) run() {
 			}
 		}
 		if cleanupErr != nil {
-			c.err = errors.Join(c.err, fmt.Errorf("vhost: diff cleanup %s at %d: %w", cow.diff.f.Name(), off, cleanupErr))
+			c.err = errors.Join(c.err, fmt.Errorf("vhost: diff cleanup %s at %d: %w", cow.diff.name(), off, cleanupErr))
 		}
 		c.signalLocked()
 		c.mu.Unlock()

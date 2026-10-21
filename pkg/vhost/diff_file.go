@@ -18,6 +18,7 @@ import (
 
 	"github.com/kuasar-sandbox/accelerator/pkg/readerr"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
+	"github.com/kuasar-sandbox/sandboxer/internal/diffstore"
 	"github.com/kuasar-sandbox/sandboxer/internal/readretry"
 	"golang.org/x/crypto/xts"
 	"golang.org/x/sys/unix"
@@ -74,6 +75,8 @@ type blockCOWOptions struct {
 	encryptionSet  bool
 	cache          *COWCache
 	discardOnClose bool
+	checkpoint     *checkpointBlockCOWOption
+	checkpointKey  *[32]byte
 }
 
 type diffEncryptionBlockCOWOption struct {
@@ -86,16 +89,18 @@ func (o diffEncryptionBlockCOWOption) applyBlockCOW(options *blockCOWOptions) er
 		return fmt.Errorf("vhost: duplicate WithDiffEncryption option")
 	}
 	encryption, err := newDiffEncryption(o.customerKey)
-	clear(o.customerKey[:])
 	if err != nil {
 		return err
 	}
+	key := o.customerKey
+	options.checkpointKey = &key
 	options.encryption, options.required, options.encryptionSet = encryption, o.required, true
 	return nil
 }
 
-// WithDiffEncryption makes active-diff reads policy-aware and makes every fresh
-// diff an encrypted v1 file using customerKey. required rejects existing
+// WithDiffEncryption makes active-diff reads policy-aware and encrypts every
+// fresh diff using customerKey: v1 by default, or v2 with WithCheckpoint.
+// required rejects existing
 // plaintext active diffs; it does not reject a plaintext template used only as
 // a provisioning input.
 func WithDiffEncryption(customerKey [32]byte, required bool) BlockCOWOption {
@@ -129,6 +134,8 @@ func parseBlockCOWOptions(raw []BlockCOWOption) (blockCOWOptions, error) {
 // encrypted files share the BlockCOW logic; encrypted body offsets are shifted
 // by one fixed header region and transformed in fixed 512-byte XTS units.
 type diffFile struct {
+	backend     diffBackend
+	path        string
 	f           *os.File
 	bodyIO      diffBodyIO
 	encrypted   bool
@@ -548,6 +555,9 @@ func validateDiffLogicalSize(size int64) error {
 }
 
 func (d *diffFile) ReadAt(buf []byte, offset int64) (int, error) {
+	if d.backend != nil {
+		return d.backend.ReadAt(buf, offset)
+	}
 	if len(buf) == 0 {
 		if offset < 0 || offset > d.logicalSize {
 			return 0, io.EOF
@@ -598,6 +608,9 @@ func (d *diffFile) ReadAt(buf []byte, offset int64) (int, error) {
 }
 
 func (d *diffFile) WriteAt(buf []byte, offset int64) (int, error) {
+	if d.backend != nil {
+		return d.backend.WriteAt(buf, offset)
+	}
 	if offset < 0 || offset > d.logicalSize || int64(len(buf)) > d.logicalSize-offset {
 		return 0, fmt.Errorf("vhost: diff write out of bounds")
 	}
@@ -648,6 +661,16 @@ func (d *diffFile) scanDirtyBlocks() ([]uint64, error) {
 		return nil, fmt.Errorf("vhost: diff bitmap is too large")
 	}
 	bitmap := make([]uint64, int(words))
+	if d.backend != nil {
+		err := d.backend.scan(context.Background(), func(block uint64) error {
+			if block >= uint64(numBlocks) {
+				return fmt.Errorf("vhost: mapped block beyond capacity")
+			}
+			bitmap[block/64] |= 1 << (block % 64)
+			return nil
+		})
+		return bitmap, err
+	}
 	bodyEnd := d.bodyOffset + d.logicalSize
 	for physical := d.bodyOffset; physical < bodyEnd; {
 		dataOffset, err := unix.Seek(int(d.f.Fd()), physical, unix.SEEK_DATA)
@@ -706,6 +729,9 @@ func (d *diffFile) validateFreshEncryptedBodySparse() error {
 }
 
 func (d *diffFile) punchHole(offset, length int64) error {
+	if d.backend != nil {
+		return d.backend.discard(context.Background(), offset, length)
+	}
 	return unix.Fallocate(int(d.f.Fd()),
 		unix.FALLOC_FL_PUNCH_HOLE|unix.FALLOC_FL_KEEP_SIZE,
 		d.bodyOffset+offset, length)
@@ -715,9 +741,15 @@ func (d *diffFile) Sync() error {
 	if d.syncFile != nil {
 		return d.syncFile()
 	}
+	if d.backend != nil {
+		return d.backend.Sync()
+	}
 	return d.f.Sync()
 }
 func (d *diffFile) Close() error {
+	if d.backend != nil {
+		return d.backend.Close()
+	}
 	// Owners join all operations before Close; the locks protect direct users too.
 	if d.direct == nil {
 		return d.f.Close()
@@ -938,6 +970,13 @@ func ValidateExistingDiffExt4(ctx context.Context, path string, base BlockReader
 	options, err := parseBlockCOWOptions(rawOptions)
 	if err != nil {
 		return err
+	}
+	if options.checkpoint != nil {
+		source, err := openCheckpointPreflight(ctx, path, options)
+		if err != nil {
+			return err
+		}
+		return validateDiffSourceExt4(ctx, source, base)
 	}
 	diff, err := openExistingDiffFile(path, options.encryption, options.required, true)
 	if err != nil {
@@ -1297,6 +1336,18 @@ func releaseDiffScratch(scratch *diffScratch) {
 func DiffSourceCapacity(path string, template bool, rawOptions ...BlockCOWOption) (int64, error) {
 	options, err := parseBlockCOWOptions(rawOptions)
 	if err != nil {
+		return 0, err
+	}
+	if info, err := diffstore.Probe(path); err == nil {
+		if options.required && !template && !info.Encrypted {
+			return 0, ErrDiffPlaintextForbidden
+		}
+		source, err := diffstore.OpenExport(context.Background(), path, "", options.checkpointKey)
+		if err != nil {
+			return 0, err
+		}
+		return int64(source.Size()), source.Close()
+	} else if !errors.Is(err, diffstore.ErrFormat) {
 		return 0, err
 	}
 	if template {
