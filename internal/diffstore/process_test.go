@@ -138,6 +138,36 @@ func TestProcessHelper(t *testing.T) {
 			t.Fatalf("short-write byte count: %d", st.Size())
 		}
 		fmt.Println("SHORT_WITHOUT_RETRY")
+	case "short-engine-write":
+		s, err := Open(path, Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		stopTestGC(s)
+		if err = s.MarkModified(ctx); err != nil {
+			t.Fatal(err)
+		}
+		// Allocation reservation completes first. Limit the first newly allocated
+		// payload write to a real 512-byte short syscall, while the old version's
+		// data remains at its earlier physical slot.
+		limit := slotPage(s.ctrl.Next)*PageSize + 512
+		s.beforeIO = func(stage string) error {
+			if stage != "data" {
+				return nil
+			}
+			var limits unix.Rlimit
+			if err := unix.Getrlimit(unix.RLIMIT_FSIZE, &limits); err != nil {
+				return err
+			}
+			limits.Cur = limit
+			return unix.Setrlimit(unix.RLIMIT_FSIZE, &limits)
+		}
+		err = s.WritePages(ctx, []Page{{1, pageFor(1, 2)}})
+		if !errors.Is(err, io.ErrShortWrite) || !errors.Is(s.Err(), io.ErrShortWrite) {
+			t.Fatalf("engine did not retain real short-write failure: %v / %v", err, s.Err())
+		}
+		s.Close()
+		fmt.Println("ENGINE_SHORT_WITHOUT_LOGICAL_PUNCH")
 	}
 }
 
@@ -258,6 +288,37 @@ func TestActualDirectShortWrite(t *testing.T) {
 	if err != nil || !strings.Contains(string(out), "SHORT_WITHOUT_RETRY") {
 		t.Fatalf("short syscall: %s %v", out, err)
 	}
+}
+
+func TestActualEngineShortWritePreservesLogicalControlAndVersion(t *testing.T) {
+	s, path := newTestStore(t, 64, nil)
+	putPages(t, s, []uint64{1, 17}, 1)
+	if err := s.Checkpoint(ctx, "safe"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	cmd := helperCommand(t, "short-engine-write", path)
+	out, err := cmd.CombinedOutput()
+	if err != nil || !strings.Contains(string(out), "ENGINE_SHORT_WITHOUT_LOGICAL_PUNCH") {
+		t.Fatalf("short engine syscall: %s %v", out, err)
+	}
+	// Logical block 1 is physical control page 1, not a data address. Incorrect
+	// legacy cleanup at guest offsets would make this reopen fail immediately.
+	s, err = Open(path, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	want := map[uint64][]byte{1: pageFor(1, 1), 17: pageFor(17, 1)}
+	checkActive(t, s, want)
+	v, err := s.Export(ctx, "safe")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer v.Close()
+	checkView(t, v, want)
 }
 func helperCommand(t *testing.T, mode, path string) *exec.Cmd {
 	t.Helper()

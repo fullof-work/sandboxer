@@ -189,6 +189,9 @@ func createHeader(o Options) ([]byte, *xts.Cipher, error) {
 	return b, xc, nil
 }
 func validateInfo(i Info) error {
+	if err := ValidID(i.DiffID); err != nil {
+		return fmt.Errorf("diffstore: invalid DIFF identity: %w", err)
+	}
 	if len(i.DiffID) == 0 || len(i.DiffID) > 128 || filepath.Base(i.DiffID) != i.DiffID || i.DiffID == "." || i.DiffID == ".." {
 		return fmt.Errorf("diffstore: invalid DIFF identity")
 	}
