@@ -13,18 +13,32 @@ import (
 // the trusted source directory. It mutates only the host runtime config; C0
 // remains portable and byte-identical for the whole run.
 func BindPortableDiskGraph(runtime *SandboxConfig, selfRef, relativeDir string) error {
+	return bindPortableDiskGraph(runtime, selfRef, relativeDir, false)
+}
+
+// BindCheckpointDiskGraph binds the explicit immutable references of a validated
+// Checkpoint layout. The local ZIP has no payload and cannot supply self.
+func BindCheckpointDiskGraph(runtime *SandboxConfig, relativeDir string) error {
+	return bindPortableDiskGraph(runtime, "", relativeDir, true)
+}
+
+func bindPortableDiskGraph(runtime *SandboxConfig, selfRef, relativeDir string, checkpoint bool) error {
 	if runtime == nil {
 		return errors.New("portable binding: nil runtime config")
 	}
-	if selfRef == "" {
-		return errors.New("portable binding: current Sandbox self ref is required")
-	}
-	self, err := manifest.ParseRef(selfRef)
-	if err != nil {
-		return fmt.Errorf("portable binding self: %w", err)
-	}
-	if self.Scheme == manifest.RefSchemeFile && self.Location == "" && !filepath.IsAbs(self.Path) {
-		return errors.New("portable binding self file ref must be absolute or located")
+	var self manifest.Ref
+	if !checkpoint {
+		if selfRef == "" {
+			return errors.New("portable binding: current Sandbox self ref is required")
+		}
+		var err error
+		self, err = manifest.ParseRef(selfRef)
+		if err != nil {
+			return fmt.Errorf("portable binding self: %w", err)
+		}
+		if self.Scheme == manifest.RefSchemeFile && self.Location == "" && !filepath.IsAbs(self.Path) {
+			return errors.New("portable binding self file ref must be absolute or located")
+		}
 	}
 
 	selfCount := 0
@@ -33,6 +47,9 @@ func BindPortableDiskGraph(runtime *SandboxConfig, selfRef, relativeDir string) 
 			return nil
 		}
 		if *raw == "self" {
+			if checkpoint {
+				return errors.New("checkpoint binding forbids self")
+			}
 			*raw = self.String()
 			selfCount++
 			return nil
@@ -75,7 +92,7 @@ func BindPortableDiskGraph(runtime *SandboxConfig, selfRef, relativeDir string) 
 			return err
 		}
 	}
-	if selfCount != 1 {
+	if !checkpoint && selfCount != 1 {
 		return fmt.Errorf("portable binding: expected self exactly once, got %d", selfCount)
 	}
 	return nil

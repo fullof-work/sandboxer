@@ -207,7 +207,10 @@ type publicationRef struct {
 	raw   string
 	scope publishScope
 }
-type publicationReport struct{ before, after []publicationRef }
+type publicationReport struct {
+	before, after []publicationRef
+	checkpoints   []checkpointPublication
+}
 
 func (p *Publisher) operation() *Publisher {
 	op := *p
@@ -227,6 +230,9 @@ func (p *Publisher) operation() *Publisher {
 	return &op
 }
 func (p *Publisher) original(raw string, scope publishScope) {
+	if ref, err := manifest.ParseRef(raw); err == nil && p.transientLocations[ref.Location] {
+		return
+	}
 	if raw != "" && raw != "self" {
 		p.report.before = append(p.report.before, publicationRef{raw, scope})
 	}
@@ -305,5 +311,5 @@ func (p *Publisher) result(role LogicalRole, ref, sandboxRef string) PublishResu
 	if role == RoleSandbox {
 		sandboxRef = ref
 	}
-	return PublishResult{Role: role, Ref: ref, SandboxRef: sandboxRef, RemovedRefs: refs}
+	return PublishResult{Role: role, Ref: ref, SandboxRef: sandboxRef, RemovedRefs: refs, checkpointSources: append([]checkpointPublication(nil), p.report.checkpoints...), completion: p.completion}
 }

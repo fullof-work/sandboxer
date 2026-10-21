@@ -231,6 +231,14 @@ func (p *publicationRewrite) openSandbox(ctx context.Context, raw string, scope 
 	return p.sandbox(ctx, raw, child, root, apply)
 }
 func (p *publicationRewrite) sandbox(ctx context.Context, raw string, scope publishScope, root *sandboxfile.Root, apply bool) (*sandboxRewrite, error) {
+	if root.Checkpoint != nil {
+		materialized, cleanup, err := p.p.materializeCheckpointRoot(ctx, scope, root)
+		if err != nil {
+			return nil, err
+		}
+		p.closes = append(p.closes, cleanup, materialized.Close)
+		root = materialized
+	}
 	cfg, err := root.Portable.Clone()
 	if err != nil {
 		return nil, err
@@ -292,7 +300,7 @@ func (p *publicationRewrite) openValue(ctx context.Context, raw string, scope pu
 	if err != nil {
 		return nil, err
 	}
-	force := !ref.Portable()
+	force := !ref.Portable() || p.p.transientLocations[ref.Location]
 	if ref.Scheme == manifest.RefSchemeManifest {
 		if local, ok := scope.fetcher.(*manifestbundle.ManifestFetcher); ok {
 			key, err := manifest.ParseKeyRef(raw)

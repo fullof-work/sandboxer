@@ -52,14 +52,55 @@ func NewProcessStorage(cfg *config.ManifestConfig) (*ProcessStorage, error) {
 // resolver is evaluated at most once and its result is fixed for every fetch,
 // ingest, and local-codec operation owned by the returned storage.
 func NewProcessStorageWithCustomerKey(cfg *config.ManifestConfig, customerKey ingest.CustomerKeyFunc) (*ProcessStorage, error) {
+	s, err := newProcessStorage(cfg, customerKey)
+	if err != nil || cfg == nil {
+		return s, err
+	}
+	policy, err := cfg.Crypto.LocalPolicy()
+	if err != nil {
+		return nil, err
+	}
+	if policy != crypto.LocalOff {
+		key, err := s.keyFn()
+		if err != nil {
+			return nil, err
+		}
+		s.localCodec, err = crypto.NewTarStreamCodec(key)
+		clear(key[:])
+		if err != nil {
+			return nil, err
+		}
+		s.localRequired = policy == crypto.LocalRequired
+	}
+	return s, nil
+}
+
+// NewProcessStorageWithLocalAccess preserves an embedding caller's explicit
+// local codec and plaintext policy, including when no manifest config exists.
+// The customer key is fixed on first use, just as for manifest-backed storage.
+func NewProcessStorageWithLocalAccess(cfg *config.ManifestConfig, customerKey ingest.CustomerKeyFunc, codec tarstream.Codec, required bool) (*ProcessStorage, error) {
+	if required && codec == nil {
+		return nil, fmt.Errorf("artifact storage: local required policy requires a codec")
+	}
+	if codec != nil && customerKey == nil {
+		return nil, fmt.Errorf("artifact storage: local codec requires a customer key resolver")
+	}
+	s, err := newProcessStorage(cfg, customerKey)
+	if err != nil {
+		return nil, err
+	}
+	s.localCodec, s.localRequired = codec, required
+	return s, nil
+}
+
+func newProcessStorage(cfg *config.ManifestConfig, customerKey ingest.CustomerKeyFunc) (*ProcessStorage, error) {
 	s := &ProcessStorage{cfg: cfg}
-	if cfg == nil {
+	if customerKey == nil {
+		if cfg != nil {
+			return nil, fmt.Errorf("artifact storage: customer key resolver is required")
+		}
 		return s, nil
 	}
-	if customerKey == nil {
-		return nil, fmt.Errorf("artifact storage: customer key resolver is required")
-	}
-
 	var (
 		once   sync.Once
 		key    [32]byte
@@ -69,27 +110,13 @@ func NewProcessStorageWithCustomerKey(cfg *config.ManifestConfig, customerKey in
 		once.Do(func() { key, keyErr = customerKey() })
 		return key, keyErr
 	}
-
-	policy, err := cfg.Crypto.LocalPolicy()
-	if err != nil {
-		return nil, err
-	}
-	if policy != crypto.LocalOff {
-		key, err = s.keyFn()
-		if err != nil {
-			return nil, err
+	if cfg != nil {
+		s.fetcher = &onDemandManifestFetcher{cfg: cfg, keyFn: s.keyFn}
+		if !verificationOptions(cfg).VerifyContent {
+			warnVerificationDisabled.Do(func() {
+				log.Printf("WARNING: manifest.verify_content=false; ordinary remote and Bundle Manifest/Chunk SHA-256 verification is disabled")
+			})
 		}
-		s.localCodec, err = crypto.NewTarStreamCodec(key)
-		if err != nil {
-			return nil, err
-		}
-		s.localRequired = policy == crypto.LocalRequired
-	}
-	s.fetcher = &onDemandManifestFetcher{cfg: cfg, keyFn: s.keyFn}
-	if !verificationOptions(cfg).VerifyContent {
-		warnVerificationDisabled.Do(func() {
-			log.Printf("WARNING: manifest.verify_content=false; ordinary remote and Bundle Manifest/Chunk SHA-256 verification is disabled")
-		})
 	}
 	return s, nil
 }
@@ -112,7 +139,7 @@ func (s *ProcessStorage) ManifestConfig() *config.ManifestConfig {
 }
 
 // CustomerKeyFunc returns the process-fixed key resolver used by manifest
-// fetch and ingest operations. It is nil when no manifest config was supplied.
+// fetch, ingest, and local DIFF operations. It is nil when no resolver was supplied.
 func (s *ProcessStorage) CustomerKeyFunc() ingest.CustomerKeyFunc {
 	if s == nil {
 		return nil
@@ -129,7 +156,7 @@ func (s *ProcessStorage) Fetcher() fetch.Fetcher {
 	return s.fetcher
 }
 
-// LocalCodec returns the codec selected by crypto.local.
+// LocalCodec returns the configured or explicitly supplied local codec.
 func (s *ProcessStorage) LocalCodec() tarstream.Codec {
 	if s == nil {
 		return nil

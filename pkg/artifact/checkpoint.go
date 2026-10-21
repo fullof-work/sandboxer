@@ -12,6 +12,7 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	manifestbundle "github.com/kuasar-sandbox/accelerator/pkg/manifest/bundle"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
+	"github.com/kuasar-sandbox/sandboxer/internal/diffstore"
 	"github.com/kuasar-sandbox/sandboxer/internal/readretry"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/sandboxfile"
@@ -38,6 +39,7 @@ type checkpointKeep struct {
 	directory       string
 	files           map[string]bool
 	aliases         map[string]string // semantic alias -> current role's physical carrier basename
+	diffVersions    map[string]map[string]bool
 }
 
 // retain resolves the physical source BEFORE comparing basenames. Memory and
@@ -178,6 +180,31 @@ func (k *checkpointKeep) plan(ctx context.Context, c Checkpoint) (retErr error) 
 		return err
 	}
 	defer func() { retErr = errors.Join(retErr, root.Close()) }()
+	if root.Checkpoint != nil {
+		sourceDir, err := filepath.Abs(child.relativeDir)
+		if err != nil {
+			return err
+		}
+		sourceDir, err = filepath.EvalSymlinks(sourceDir)
+		if err != nil {
+			return err
+		}
+		if sourceDir == k.directory {
+			if k.diffVersions == nil {
+				k.diffVersions = make(map[string]map[string]bool)
+			}
+			add := func(id string) {
+				if k.diffVersions[id] == nil {
+					k.diffVersions[id] = make(map[string]bool)
+				}
+				k.diffVersions[id][root.Checkpoint.CheckpointID] = true
+			}
+			add(root.Checkpoint.Root.DiffID)
+			for _, disk := range root.Checkpoint.Disks {
+				add(disk.DiffID)
+			}
+		}
+	}
 	// Kernel/runtime basename identities bind host-supplied boot inputs at
 	// restore. They are not artifact edges into this checkpoint directory.
 	for _, dep := range portableDiskRefs(root.Portable) {
@@ -253,6 +280,15 @@ func (s *ProcessStorage) CleanupCheckpoint(ctx context.Context, c Checkpoint) (r
 		c.RefLocations = config.RefLocations{}
 	}
 	k := &checkpointKeep{p: newPublisher(s, c.RefLocations, nil, nil), directory: dir, files: map[string]bool{}, aliases: map[string]string{}, resolveLocation: c.ResolveLocation}
+	if _, err := os.Stat(filepath.Join(dir, "diffs")); err == nil {
+		owner, err := diffstore.LockDirectory(dir)
+		if err != nil {
+			return err
+		}
+		defer func() { retErr = errors.Join(retErr, owner.Close()) }()
+	} else if !os.IsNotExist(err) {
+		return err
+	}
 	if err := k.plan(ctx, c); err != nil {
 		return fmt.Errorf("checkpoint keep plan: %w", err)
 	}
@@ -264,6 +300,9 @@ func (s *ProcessStorage) CleanupCheckpoint(ctx context.Context, c Checkpoint) (r
 	physical, err = filepath.EvalSymlinks(dir)
 	if err != nil || physical != dir || !os.SameFile(pinned, current) {
 		return errors.New("checkpoint directory identity changed")
+	}
+	if err := cleanupDiffVersionSet(ctx, dir, k.diffVersions); err != nil {
+		return err
 	}
 	for {
 		entries, err := f.ReadDir(128)

@@ -24,6 +24,7 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/readerr"
 	"github.com/kuasar-sandbox/accelerator/pkg/store"
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
+	"github.com/kuasar-sandbox/sandboxer/internal/diffstore"
 	"github.com/kuasar-sandbox/sandboxer/internal/readretry"
 	"github.com/kuasar-sandbox/sandboxer/internal/runtimebundle"
 	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
@@ -45,9 +46,13 @@ import (
 
 // RunOptions controls a single sandbox-ctl run invocation.
 type RunOptions struct {
-	checkpointDir string // runtime-owned checkpoint provenance; never serialized
-	usageSampler  *usage.Sampler
-	Cfg           *config.SandboxConfig
+	EnableCheckpoint bool
+	checkpointPlan   *CheckpointDiskPlan
+	checkpointOwner  *diffstore.DirectoryOwner
+	namedCheckpoint  bool
+	checkpointDir    string // runtime-owned checkpoint provenance; never serialized
+	usageSampler     *usage.Sampler
+	Cfg              *config.SandboxConfig
 	// PortableConfig is immutable C0. nil selects projection from an explicit
 	// cold config; non-nil selects a Sandbox source and requires SourceBinding.
 	PortableConfig *config.PortableSandboxConfig
@@ -90,9 +95,10 @@ type RunOptions struct {
 // reserved self value and later materialize it when export builds C1. It never
 // enters sandbox.runtime.cfg.
 type RunSourceBinding struct {
-	SandboxRef   string // canonical identity of the current E
-	RuntimeRef   string // host-resolvable ref for that E
-	RelativeDir  string // trusted directory for unlocated basename dependencies
+	Checkpoint   *sandboxfile.Checkpoint // validated local disk layout, never serialized
+	SandboxRef   string                  // canonical identity of the current E
+	RuntimeRef   string                  // host-resolvable ref for that E
+	RelativeDir  string                  // trusted directory for unlocated basename dependencies
 	BundleSource *BundleSourceBinding
 }
 
@@ -153,6 +159,12 @@ func Run(ctx context.Context, opts RunOptions) (code int, retErr error) {
 		opts.CHBinary = "cloud-hypervisor"
 	}
 
+	var checkpointRelease func() error
+	opts, checkpointRelease, err = prepareColdCheckpoint(ctx, opts)
+	if err != nil {
+		return -1, err
+	}
+	defer func() { retErr = errors.Join(retErr, checkpointRelease()) }()
 	var diffCustomerKey [32]byte
 	if opts.LocalCodec != nil {
 		var err error
@@ -192,7 +204,7 @@ func Run(ctx context.Context, opts RunOptions) (code int, retErr error) {
 		if err != nil {
 			return -1, err
 		}
-		if err := config.BindPortableDiskGraph(opts.Cfg, opts.SourceBinding.RuntimeRef, opts.SourceBinding.RelativeDir); err != nil {
+		if err := bindRuntimeDiskGraph(opts.Cfg, c0, opts.SourceBinding); err != nil {
 			return -1, fmt.Errorf("Sandbox source binding: %w", err)
 		}
 	}
@@ -217,8 +229,14 @@ func Run(ctx context.Context, opts RunOptions) (code int, retErr error) {
 		}
 	}
 	baseDir := DefaultBaseDir(opts.BaseRoot, pathID)
+	if opts.EnableCheckpoint && opts.checkpointPlan == nil {
+		opts.checkpointPlan, err = PrepareCheckpointDiskPlan(opts.Cfg, nil, filepath.Join(baseDir, "checkpoint"), nil)
+		if err != nil {
+			return -1, err
+		}
+	}
 	imageDefaults, err := preflightColdArtifacts(ctx, opts.Cfg, opts.Fetcher, opts.RefLocations,
-		baseDir, opts.SandboxID, opts.LocalCodec, diffCustomerKey, opts.LocalRequired, fileOpener)
+		baseDir, opts.SandboxID, opts.LocalCodec, diffCustomerKey, opts.LocalRequired, fileOpener, opts.checkpointPlan)
 	if err != nil {
 		return -1, err
 	}
@@ -296,6 +314,9 @@ func Run(ctx context.Context, opts RunOptions) (code int, retErr error) {
 	shape.CHBinary = opts.CHBinary
 	shape.RuntimeRoot = opts.RuntimeRoot
 	shape.BaseRoot = opts.BaseRoot
+	shape.EnableCheckpoint = opts.EnableCheckpoint
+	shape.checkpointPlan = opts.checkpointPlan
+	shape.checkpointOwner = opts.checkpointOwner
 	shape.Console = opts.StdioMode.Console
 	shape.PingFatalThreshold = opts.PingFatalThreshold
 	shape.StatsJSONPath = opts.StatsJSONPath
@@ -512,7 +533,18 @@ func preflightColdArtifacts(
 	diffCustomerKey [32]byte,
 	required bool,
 	opener FileStreamOpener,
+	checkpointPlans ...*CheckpointDiskPlan,
 ) (*ImageConfig, error) {
+	var plan *CheckpointDiskPlan
+	if len(checkpointPlans) > 0 {
+		plan = checkpointPlans[0]
+	}
+	binding := func(i int) *CheckpointDiskBinding {
+		if plan == nil || i >= len(plan.Disks) {
+			return nil
+		}
+		return &plan.Disks[i]
+	}
 	imageDefaults := &ImageConfig{}
 	root := &cfg.Boot.Root
 	if root.Base != "" && !cfg.SingleDisk() {
@@ -534,7 +566,7 @@ func preflightColdArtifacts(
 		imageDefaults = imageCfg
 	}
 	if err := preflightWritableExt4(ctx, root, "boot.root", DefaultDiffURIForBaseDir(baseDir, sandboxID),
-		fetcher, locations, codec, diffCustomerKey, required, opener); err != nil {
+		fetcher, locations, codec, diffCustomerKey, required, opener, binding(0)); err != nil {
 		return nil, err
 	}
 	for i := range cfg.Boot.Disks {
@@ -550,7 +582,7 @@ func preflightColdArtifacts(
 		}
 		defaultDiff := DefaultDiskDiffURI(baseDir, sandboxID, fmt.Sprintf("disk%d", i))
 		if err := preflightWritableExt4(ctx, disk, fmt.Sprintf("boot.disks[%d]", i), defaultDiff,
-			fetcher, locations, codec, diffCustomerKey, required, opener); err != nil {
+			fetcher, locations, codec, diffCustomerKey, required, opener, binding(i+1)); err != nil {
 			return nil, err
 		}
 	}
@@ -574,6 +606,7 @@ func preflightWritableExt4(
 	diffCustomerKey [32]byte,
 	required bool,
 	opener FileStreamOpener,
+	checkpointBindings ...*CheckpointDiskBinding,
 ) (retErr error) {
 	var baseRefs []string
 	diffURI, templateURI := root.Diff, root.DiffTemplate
@@ -608,6 +641,10 @@ func preflightWritableExt4(
 		return fmt.Errorf("preflight %s writable diff invalid URI: %s", field, diffURI)
 	}
 	var cowOptions []vhost.BlockCOWOption
+	if len(checkpointBindings) > 0 && checkpointBindings[0] != nil {
+		b := checkpointBindings[0]
+		cowOptions = append(cowOptions, vhost.WithCheckpoint(b.DiffID, b.BaseID))
+	}
 	if codec != nil {
 		cowOptions = append(cowOptions, vhost.WithDiffEncryption(diffCustomerKey, required))
 	}
@@ -1098,33 +1135,34 @@ func (q *allQuiescer) Resume() {
 // that owns the bundle holds references; the snapshot path consumes
 // them when a request arrives.
 type SnapshotHandler struct {
-	CheckpointDir  string // derived from the owning VM BaseDir
-	usageSampler   *usage.Sampler
-	Cfg            *config.SandboxConfig
-	PortableConfig *config.PortableSandboxConfig
-	SourceBinding  *RunSourceBinding
-	MemoryBinding  *MemorySourceBinding
-	ManifestCfg    *config.ManifestConfig // required for --upload; the Ingester is built lazily per snapshot
-	Fetcher        fetch.Fetcher
-	BundleReader   *manifestbundle.Reader
-	BundleFetcher  *manifestbundle.ManifestFetcher
-	RefLocations   config.RefLocations
-	CustomerKeyFn  ingest.CustomerKeyFunc
-	LocalCodec     tarstream.Codec
-	LocalRequired  bool
-	SandboxID      string // required: snapshot.Take rejects empty
-	Memfd          *memory.Memfd
-	Disks          []SnapDiskRef   // writable diffs to capture, logical order (root, then data disks)
-	Servers        []*vhost.Server // all vhost servers (quiesced together around the dump)
-	CHSock         string
-	RunDir         string
-	Pinger         *guestlink.Pinger        // optional; if non-nil, paused around quiesce/Take
-	Forwarder      *Forwarder               // optional; if non-nil, paused + active relays collapsed around quiesce
-	Reattach       func() error             // optional; re-establishes the stdio MUX whenever a snapshot attempt resumes
-	Memory         *resctl.MemoryController // optional; blocks local Budget mutation across capture
-	CHProcess      func() processSignaler   // late-bound after CH starts; used to guarantee destroy completion
-	Context        context.Context
-	Logf           func(string, ...any)
+	EnableCheckpoint bool
+	CheckpointDir    string // derived from the owning VM BaseDir
+	usageSampler     *usage.Sampler
+	Cfg              *config.SandboxConfig
+	PortableConfig   *config.PortableSandboxConfig
+	SourceBinding    *RunSourceBinding
+	MemoryBinding    *MemorySourceBinding
+	ManifestCfg      *config.ManifestConfig // required for --upload; the Ingester is built lazily per snapshot
+	Fetcher          fetch.Fetcher
+	BundleReader     *manifestbundle.Reader
+	BundleFetcher    *manifestbundle.ManifestFetcher
+	RefLocations     config.RefLocations
+	CustomerKeyFn    ingest.CustomerKeyFunc
+	LocalCodec       tarstream.Codec
+	LocalRequired    bool
+	SandboxID        string // required: snapshot.Take rejects empty
+	Memfd            *memory.Memfd
+	Disks            []SnapDiskRef   // writable diffs to capture, logical order (root, then data disks)
+	Servers          []*vhost.Server // all vhost servers (quiesced together around the dump)
+	CHSock           string
+	RunDir           string
+	Pinger           *guestlink.Pinger        // optional; if non-nil, paused around quiesce/Take
+	Forwarder        *Forwarder               // optional; if non-nil, paused + active relays collapsed around quiesce
+	Reattach         func() error             // optional; re-establishes the stdio MUX whenever a snapshot attempt resumes
+	Memory           *resctl.MemoryController // optional; blocks local Budget mutation across capture
+	CHProcess        func() processSignaler   // late-bound after CH starts; used to guarantee destroy completion
+	Context          context.Context
+	Logf             func(string, ...any)
 
 	capture captureGate
 }
@@ -1187,7 +1225,7 @@ func (h *SnapshotHandler) handleContext(ctx context.Context, req ctl.Request, cg
 		h.capture.finish(resp.AfterWrite != nil || (err == nil && !req.ResumeAfter) || isTerminalCaptureError(err))
 	}()
 	opts := RunOptions{
-		usageSampler: h.usageSampler, checkpointDir: h.CheckpointDir,
+		usageSampler: h.usageSampler, checkpointDir: h.CheckpointDir, EnableCheckpoint: h.EnableCheckpoint,
 		Cfg: h.Cfg, PortableConfig: h.PortableConfig, SourceBinding: h.SourceBinding, MemoryBinding: h.MemoryBinding,
 		ManifestCfg: h.ManifestCfg, SandboxID: h.SandboxID,
 		Fetcher: h.Fetcher, BundleReader: h.BundleReader, BundleFetcher: h.BundleFetcher, RefLocations: h.RefLocations,
@@ -1219,7 +1257,7 @@ func (h *SnapshotHandler) handleExportContext(ctx context.Context, req ctl.Reque
 		h.capture.finish(resp.AfterWrite != nil || (err == nil && !req.ResumeAfter) || isTerminalCaptureError(err))
 	}()
 	opts := RunOptions{
-		usageSampler: h.usageSampler, checkpointDir: h.CheckpointDir,
+		usageSampler: h.usageSampler, checkpointDir: h.CheckpointDir, EnableCheckpoint: h.EnableCheckpoint,
 		Cfg: h.Cfg, PortableConfig: h.PortableConfig, SourceBinding: h.SourceBinding, MemoryBinding: h.MemoryBinding,
 		ManifestCfg: h.ManifestCfg, SandboxID: h.SandboxID,
 		Fetcher: h.Fetcher, BundleReader: h.BundleReader, BundleFetcher: h.BundleFetcher, RefLocations: h.RefLocations,
@@ -1254,6 +1292,11 @@ func handleExportRequest(
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	req, err = prepareNamedCapture(req, opts, disks)
+	if err != nil {
+		return ctl.Response{}, err
+	}
+	opts.namedCheckpoint = req.CheckpointID != ""
 	mode, err := req.SnapshotMode()
 	if err != nil {
 		return ctl.Response{}, err
@@ -1322,7 +1365,7 @@ func handleExportRequest(
 	if opts.SourceBinding != nil {
 		prospectiveParentRef = opts.SourceBinding.SandboxRef
 	}
-	if err := snapshot.ValidateExportGraph(opts.PortableConfig, prospectiveParentRef, diskMerged); err != nil {
+	if err := validateNamedCaptureGraph(req.CheckpointID, opts.PortableConfig, prospectiveParentRef, diskMerged); err != nil {
 		return ctl.Response{}, fmt.Errorf("export: prospective C1: %w", err)
 	}
 
@@ -1528,7 +1571,8 @@ func handleExportRequest(
 	}
 	sinkOpen = false // snapshot.Export owns and closes the sink on every path.
 	out, err := snapshot.Export(ctx, snapshot.ExportSources{
-		SandboxID: opts.SandboxID, APISock: chSock, CHApiDeadline: opts.Cfg.CHApiDeadline(),
+		CheckpointID: req.CheckpointID,
+		SandboxID:    opts.SandboxID, APISock: chSock, CHApiDeadline: opts.Cfg.CHApiDeadline(),
 		PortableConfig: captureC0, ParentSandboxRef: parentRef,
 		Diffs: diffs, Quiescer: &allQuiescer{servers: servers}, Logf: logf,
 		LocalCodec: opts.LocalCodec, LocalRequired: opts.LocalRequired, MergeBaseOpener: mergeBaseOpener,
@@ -1585,6 +1629,11 @@ func handleSnapshotRequest(
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	req, err = prepareNamedCapture(req, opts, disks)
+	if err != nil {
+		return ctl.Response{}, err
+	}
+	opts.namedCheckpoint = req.CheckpointID != ""
 	dropCaches := req.DropCachesEnabled()
 	mergeRef := req.MergeRefEnabled()
 	snapshotMode, err := req.SnapshotMode()
@@ -1664,7 +1713,7 @@ func handleSnapshotRequest(
 	if opts.SourceBinding != nil {
 		prospectiveParentRef = opts.SourceBinding.SandboxRef
 	}
-	if err := snapshot.ValidateExportGraph(opts.PortableConfig, prospectiveParentRef, diskMerged); err != nil {
+	if err := validateNamedCaptureGraph(req.CheckpointID, opts.PortableConfig, prospectiveParentRef, diskMerged); err != nil {
 		return ctl.Response{}, fmt.Errorf("snapshot: prospective C1: %w", err)
 	}
 
@@ -1986,6 +2035,7 @@ func handleSnapshotRequest(
 	// (replace the next-newest layer, not stack) for BOTH --output and --upload;
 	// E/C1 drops that direct parent to match. Cold/manifest parents stack.
 	src := snapshot.Sources{
+		CheckpointID:          req.CheckpointID,
 		Context:               ctx,
 		SandboxID:             sandboxID,
 		APISock:               chSock,
@@ -2508,6 +2558,21 @@ func prepareSnapshotDependencyPlan(
 		if err != nil {
 			return nil, fmt.Errorf("prepare %s %q: %w", dependency.role, raw, err)
 		}
+		if opts.namedCheckpoint && dependency.role != dependencyMemorySnapshot {
+			// A DIFF binds the original immutable content identities. Preserve
+			// carriers, including E tails and tarstream-vs-Manifest hash domains.
+			if err := prepared.Close(); err != nil {
+				return nil, err
+			}
+			preserved, err := preserveNamedCheckpointDependency(ctx, dependency, opts, knownPaths, outputDir)
+			if err != nil {
+				return nil, err
+			}
+			if preserved != raw {
+				plan.replacements[raw] = preserved
+			}
+			continue
+		}
 		portable, retain, err := portableSnapshotDependencyRef(ctx, dependency, reader, opts)
 		if err == nil && !retain && !bundleTarget {
 			portable, retain, err = retainedCheckpointDependency(ctx, dependency, opts, outputDir)
@@ -2715,7 +2780,7 @@ func snapshotLayerDependencies(opts RunOptions, memoryFromRefs []string, diskMer
 		}
 	}
 	appendRoot(&opts.PortableConfig.Boot.Root, diskMerged[0])
-	if opts.SourceBinding != nil && !diskMerged[0] {
+	if opts.SourceBinding != nil && !opts.PortableConfig.IsCheckpoint() && !diskMerged[0] {
 		role := dependencyDiskLayer
 		root := &opts.PortableConfig.Boot.Root
 		if root.Base == "self" && root.Overlay != nil && root.Overlay.Base == "" {

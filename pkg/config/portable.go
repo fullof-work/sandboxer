@@ -43,15 +43,16 @@ const (
 // serializing SandboxConfig, so host bindings and instance-only input cannot
 // accidentally cross the artifact boundary.
 type PortableSandboxConfig struct {
-	Version   int                     `yaml:"version"`
-	Resources PortableResourcesConfig `yaml:"resources"`
-	Network   PortableNetworkConfig   `yaml:"network"`
-	Boot      PortableBootConfig      `yaml:"boot"`
-	Launch    PortableLaunchConfig    `yaml:"launch"`
-	Mounts    []MountConfig           `yaml:"mounts,omitempty"`
-	Files     []FileConfig            `yaml:"files,omitempty"`
-	Init      []InitConfig            `yaml:"init,omitempty"`
-	Metadata  map[string]string       `yaml:"metadata,omitempty"`
+	checkpointLayout bool                    // selected by the enclosing Sandbox layout, never serialized
+	Version          int                     `yaml:"version"`
+	Resources        PortableResourcesConfig `yaml:"resources"`
+	Network          PortableNetworkConfig   `yaml:"network"`
+	Boot             PortableBootConfig      `yaml:"boot"`
+	Launch           PortableLaunchConfig    `yaml:"launch"`
+	Mounts           []MountConfig           `yaml:"mounts,omitempty"`
+	Files            []FileConfig            `yaml:"files,omitempty"`
+	Init             []InitConfig            `yaml:"init,omitempty"`
+	Metadata         map[string]string       `yaml:"metadata,omitempty"`
 }
 
 type PortableResourcesConfig struct {
@@ -232,6 +233,9 @@ func NewPortableEROFS(cfg *SandboxConfig, identities PortableProjection) (*Porta
 // is root+data order; a true entry means the captured payload already absorbed
 // its direct parent, so C1 retains only the parent's lower chain.
 func (p *PortableSandboxConfig) Exported(parentSandboxRef string, dataRefs []string, merged []bool) (*PortableSandboxConfig, error) {
+	if p != nil && p.checkpointLayout {
+		return p.MaterializedCheckpoint(dataRefs)
+	}
 	if p == nil {
 		return nil, errors.New("portable export: nil C0")
 	}
@@ -455,6 +459,16 @@ func portableArtifactRef(raw string) (string, error) {
 // decoding and validates the semantic contract. Exactly one YAML document is
 // accepted; aliases and merge keys are rejected.
 func ParsePortableSandboxConfig(raw []byte) (*PortableSandboxConfig, error) {
+	return parsePortableSandboxConfig(raw, false)
+}
+
+// ParseCheckpointSandboxConfig validates the no-payload Checkpoint layout.
+// Only the enclosing Sandbox reader may select this layout.
+func ParseCheckpointSandboxConfig(raw []byte) (*PortableSandboxConfig, error) {
+	return parsePortableSandboxConfig(raw, true)
+}
+
+func parsePortableSandboxConfig(raw []byte, checkpoint bool) (*PortableSandboxConfig, error) {
 	if len(raw) == 0 {
 		return nil, errors.New("portable config is empty")
 	}
@@ -483,6 +497,7 @@ func ParsePortableSandboxConfig(raw []byte) (*PortableSandboxConfig, error) {
 	decoder := yaml.NewDecoder(bytes.NewReader(raw))
 	decoder.KnownFields(true)
 	var cfg PortableSandboxConfig
+	cfg.checkpointLayout = checkpoint
 	if err := decoder.Decode(&cfg); err != nil {
 		return nil, fmt.Errorf("portable config schema: %w", err)
 	}
@@ -562,7 +577,7 @@ func MarshalPortableSandboxConfig(cfg *PortableSandboxConfig) ([]byte, error) {
 	if len(raw) > MaxPortableConfigBytes {
 		return nil, fmt.Errorf("portable config exceeds %d bytes", MaxPortableConfigBytes)
 	}
-	if _, err := ParsePortableSandboxConfig(raw); err != nil {
+	if _, err := parsePortableSandboxConfig(raw, cfg.checkpointLayout); err != nil {
 		return nil, fmt.Errorf("validate canonical portable config: %w", err)
 	}
 	return raw, nil
@@ -573,7 +588,7 @@ func (p *PortableSandboxConfig) Clone() (*PortableSandboxConfig, error) {
 	if err != nil {
 		return nil, err
 	}
-	return ParsePortableSandboxConfig(raw)
+	return parsePortableSandboxConfig(raw, p.checkpointLayout)
 }
 
 func (p *PortableSandboxConfig) Validate() error {
@@ -633,8 +648,15 @@ func (p *PortableSandboxConfig) Validate() error {
 			return err
 		}
 	}
-	if count := portableSelfCount(p); count != 1 {
-		return fmt.Errorf("portable disk graph must contain self exactly once (got %d)", count)
+	wantSelf := 1
+	if p.checkpointLayout {
+		wantSelf = 0
+	}
+	if count := portableSelfCount(p); count != wantSelf {
+		if wantSelf == 1 {
+			return fmt.Errorf("portable disk graph must contain self exactly once (got %d)", count)
+		}
+		return fmt.Errorf("portable Checkpoint disk graph must contain no self references (got %d)", count)
 	}
 	if count := portableArtifactRefCount(p); count > MaxPortableArtifactRefs {
 		return fmt.Errorf("portable disk graph exceeds %d artifact refs", MaxPortableArtifactRefs)

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"net"
@@ -20,6 +21,7 @@ import (
 // See docs/sandbox.md §2.3.
 func snapshotCmd(args []string) int {
 	fs := flag.NewFlagSet("snapshot", flag.ContinueOnError)
+	checkpoint := fs.String("checkpoint", "", "create a named local disk checkpoint")
 	jsonOutput := fs.Bool("json", false, "emit the completed Snapshot S and Sandbox E references as JSON")
 	sandboxID := fs.String("sandbox-id", "", "target sandbox id (path fallback when --path-id is omitted)")
 	pathID := fs.String("path-id", "", "run-root directory leaf (takes precedence over --sandbox-id)")
@@ -67,12 +69,16 @@ func snapshotCmd(args []string) int {
 		return 2
 	}
 
+	if *checkpoint != "" && *upload {
+		fmt.Fprintln(os.Stderr, "snapshot: --checkpoint and --upload are mutually exclusive")
+		return 2
+	}
 	// Strict mutual exclusion (docs/sandbox.md §12.3).
 	if *upload && *outDir != "" {
 		fmt.Fprintln(os.Stderr, "snapshot: --output and --upload are mutually exclusive")
 		return 2
 	}
-	if !*upload && *outDir == "" {
+	if !*upload && *outDir == "" && *checkpoint == "" {
 		fmt.Fprintln(os.Stderr, "snapshot: --output and --upload are mutually exclusive; one is required")
 		return 2
 	}
@@ -118,6 +124,10 @@ func snapshotCmd(args []string) int {
 		DropCaches:  dropCaches,
 		MergeRef:    mergeRef,
 	}
+	if *checkpoint != "" {
+		req.Type = ctl.TypeCheckpointSnapshotRequest
+		req.CheckpointID = *checkpoint
+	}
 	if modeSet {
 		req.Mode = *mode
 	}
@@ -132,6 +142,9 @@ func snapshotCmd(args []string) int {
 	}
 	if resp.Type == ctl.TypeError {
 		fmt.Fprintf(os.Stderr, "snapshot: error from sandbox: %s\n", resp.Msg)
+		if errors.Is(ctl.CaptureError(resp), ctl.ErrCheckpointUnsupported) {
+			return 78
+		}
 		return 1
 	}
 	if warning := snapshotDropCachesWarning(*dropCaches, resp.DropCachesResult); warning != "" {

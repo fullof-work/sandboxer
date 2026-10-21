@@ -20,6 +20,8 @@ import (
 	"github.com/kuasar-sandbox/sandboxer/pkg/snapshotfile"
 )
 
+var errBundleCheckpoint = errors.New("bundle contains local disk Checkpoint")
+
 func (p *Publisher) publishBundle(
 	ctx context.Context,
 	rootRef string,
@@ -32,6 +34,9 @@ func (p *Publisher) publishBundle(
 		return PublishResult{}, errors.New("publish Bundle: carrier has no root Manifest")
 	}
 	role, dependencies, sandboxRef, err := p.inspectBundleRoot(ctx, rootRef, scope, first, root)
+	if errors.Is(err, errBundleCheckpoint) {
+		return p.publishCheckpointBundle(ctx, rootRef, scope)
+	}
 	if err != nil {
 		return PublishResult{}, err
 	}
@@ -187,6 +192,9 @@ func (p *Publisher) inspectBundleRoot(
 ) (role LogicalRole, dependencies []store.ContentKey, sandboxRef string, retErr error) {
 	if sandboxRoot, err := sandboxfile.Open(ctx, first); err == nil {
 		defer func() { retErr = errors.Join(retErr, sandboxRoot.Close()) }()
+		if sandboxRoot.Checkpoint != nil {
+			return "", nil, "", errBundleCheckpoint
+		}
 		p.retainLocatedDisks(sandboxRoot.Portable)
 		dependencies, err := manifestDependenciesFromSandbox(sandboxRoot.Portable, rootKey)
 		return RoleSandbox, dependencies, "", err
@@ -225,38 +233,33 @@ func (p *Publisher) inspectBundleRoot(
 			return "", nil, "", err
 		}
 	}
-	parsedE, err := manifest.ParseRef(cfg.SandboxRef)
+	// Inspect every selected E before the exact-copy shortcut, including a
+	// located file outside this Bundle. A Checkpoint must always materialize.
+	sandboxStream, _, err := p.open(ctx, cfg.SandboxRef, childScope)
 	if err != nil {
-		return "", nil, "", fmt.Errorf("publish Bundle: snapshot sandbox_ref: %w", err)
+		return "", nil, "", err
+	}
+	sandboxRoot, err := sandboxfile.Open(ctx, sandboxStream)
+	if err != nil {
+		return "", nil, "", err
+	}
+	defer func() { retErr = errors.Join(retErr, sandboxRoot.Close()) }()
+	if sandboxRoot.Checkpoint != nil {
+		return "", nil, "", errBundleCheckpoint
 	}
 	if err := appendManifestDependency(cfg.SandboxRef, "snapshot sandbox_ref", seen, &dependencies); err != nil {
 		return "", nil, "", err
 	}
+	parsedE, err := manifest.ParseRef(cfg.SandboxRef)
+	if err != nil {
+		return "", nil, "", err
+	}
 	if parsedE.Scheme == manifest.RefSchemeManifest {
-		if childScope.fetcher == nil {
-			return "", nil, "", errors.New("publish Bundle: snapshot sandbox_ref requires a Bundle fetcher")
-		}
-		key, err := manifest.ParseKeyRef(parsedE.Path)
-		if err != nil {
-			return "", nil, "", err
-		}
-		sandboxStream, err := readretry.Open(ctx, func() (fetch.Stream, error) { return childScope.fetcher.OpenManifest(ctx, key) })
-		if err != nil {
-			return "", nil, "", fmt.Errorf("publish Bundle: open snapshot sandbox_ref: %w", err)
-		}
-		sandboxRoot, err := sandboxfile.Open(ctx, sandboxStream)
-		if err != nil {
-			return "", nil, "", fmt.Errorf("publish Bundle: parse snapshot sandbox_ref: %w", err)
-		}
 		p.retainLocatedDisks(sandboxRoot.Portable)
 		for _, dependency := range portableDiskRefs(sandboxRoot.Portable) {
 			if err := appendManifestDependency(dependency.raw, "Sandbox disk dependency", seen, &dependencies); err != nil {
-				_ = sandboxRoot.Close()
 				return "", nil, "", err
 			}
-		}
-		if err := sandboxRoot.Close(); err != nil {
-			return "", nil, "", err
 		}
 	}
 	return RoleSnapshot, dependencies, cfg.SandboxRef, nil
@@ -332,4 +335,26 @@ func selectedBundleCarrier(current, selected string) string {
 		ref.Location = parent.Location
 	}
 	return ref.String()
+}
+
+func (p *Publisher) publishCheckpointBundle(ctx context.Context, raw string, scope publishScope) (PublishResult, error) {
+	stream, child, err := p.open(ctx, raw, scope)
+	if err != nil {
+		return PublishResult{}, err
+	}
+	root, err := sandboxfile.Open(ctx, stream)
+	if err == nil {
+		ref, err := p.publishSandboxRoot(ctx, raw, child, root)
+		return p.result(RoleSandbox, ref, ref), err
+	}
+	stream, child, err = p.open(ctx, raw, scope)
+	if err != nil {
+		return PublishResult{}, err
+	}
+	snap, err := snapshotfile.Open(ctx, stream)
+	if err != nil {
+		return PublishResult{}, err
+	}
+	ref, e, err := p.publishSnapshotRoot(ctx, raw, child, snap)
+	return p.result(RoleSnapshot, ref, e), err
 }

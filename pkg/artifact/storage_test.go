@@ -134,3 +134,35 @@ func TestProcessStorageLocalOnlyCloseDoesNotDialOrResolveKey(t *testing.T) {
 		t.Fatalf("second close: %v", err)
 	}
 }
+
+func TestProcessStorageExplicitLocalAccessWithoutManifest(t *testing.T) {
+	key := [32]byte{0x31}
+	codec, err := manifestcrypto.NewTarStreamCodec(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	storage, err := NewProcessStorageWithLocalAccess(nil, func() ([32]byte, error) { calls++; return key, nil }, codec, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer storage.Close()
+	if storage.Fetcher() != nil || storage.LocalCodec() != codec || !storage.LocalRequired() {
+		t.Fatal("explicit local access policy changed")
+	}
+	for range 2 {
+		got, err := storage.CustomerKeyFunc()()
+		if err != nil || got != key {
+			t.Fatalf("customer key: %x %v", got, err)
+		}
+	}
+	if calls != 1 {
+		t.Fatalf("key resolved %d times", calls)
+	}
+	if _, err := NewProcessStorageWithLocalAccess(nil, nil, codec, true); err == nil {
+		t.Fatal("codec accepted without key")
+	}
+	if _, err := NewProcessStorageWithLocalAccess(nil, nil, nil, true); err == nil {
+		t.Fatal("required accepted without codec")
+	}
+}

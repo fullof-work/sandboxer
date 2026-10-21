@@ -37,10 +37,13 @@ import (
 // Request is a control request on ctl.sock. Type selects which fields
 // are populated.
 type Request struct {
-	UsageHistory bool   `json:"usage_history,omitempty"`
-	UsageCursor  int64  `json:"usage_cursor,omitempty,string"`
-	UsageLimit   int    `json:"usage_limit,omitempty"`
-	Type         string `json:"type"`
+	UsageHistory    bool                `json:"usage_history,omitempty"`
+	UsageCursor     int64               `json:"usage_cursor,omitempty,string"`
+	UsageLimit      int                 `json:"usage_limit,omitempty"`
+	Type            string              `json:"type"`
+	CheckpointID    string              `json:"checkpoint_id,omitempty"`
+	CheckpointOwner string              `json:"checkpoint_owner,omitempty"`
+	CheckpointRefs  []DiffCheckpointRef `json:"checkpoint_refs,omitempty"`
 
 	// snapshot_request: OutDir and Upload are mutually exclusive (the
 	// receiving run process enforces); ResumeAfter defaults to false
@@ -69,6 +72,10 @@ type Response struct {
 	ResourceStats *ResourceStats  `json:"resource_stats,omitempty"`
 	Usage         json.RawMessage `json:"usage,omitempty"`
 	Type          string          `json:"type"`
+
+	Code            string              `json:"code,omitempty"`
+	Checkpoints     []DiffCheckpointRef `json:"checkpoints,omitempty"`
+	CheckpointCount int                 `json:"checkpoint_count,omitempty"`
 
 	// snapshot_done fields.
 	MemorySize          uint64                 `json:"memory_size,omitempty"`

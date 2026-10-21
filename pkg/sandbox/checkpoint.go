@@ -292,7 +292,10 @@ func prepareCheckpointDisks(ctx context.Context, opts RunOptions, disks []SnapDi
 		if d.SnapshotView == nil || d.Size <= 0 {
 			return opts, nil, nil, nil, fmt.Errorf("disk %d has invalid SnapshotView/size", i)
 		}
-		diffs[i] = snapshot.DiskDiff{Path: d.DiffPath, Owned: d.OwnedDiff, SnapshotView: d.SnapshotView, WaitReady: d.WaitReady, CheckError: d.CheckError}
+		diffs[i] = snapshot.DiskDiff{Path: d.DiffPath, Owned: d.OwnedDiff, SnapshotView: d.SnapshotView, WaitReady: d.WaitReady, CheckError: d.CheckError, DiffID: d.DiffID, Checkpoint: d.Checkpoint, DeleteCheckpoint: d.DeleteCheckpoint, WaitMaterialized: d.WaitMaterialized, Export: d.Export}
+		if opts.namedCheckpoint || c0.IsCheckpoint() {
+			continue
+		}
 		raw, _, err := currentDiskParentBinding(opts, i)
 		if err != nil {
 			return opts, nil, nil, nil, err
@@ -337,6 +340,16 @@ func prepareCheckpointDisks(ctx context.Context, opts RunOptions, disks []SnapDi
 		*lowers = append([]string(nil), (*lowers)[len(prefix)-1:]...)
 		size := d.Size
 		if err := snapshot.ValidateMergeBaseWithOpener(ctx, key, size, opts.LocalCodec, opts.LocalRequired, opener); err != nil {
+			return opts, nil, nil, nil, err
+		}
+	}
+	if opts.namedCheckpoint {
+		parent := ""
+		if opts.SourceBinding != nil {
+			parent = opts.SourceBinding.SandboxRef
+		}
+		c0, err = c0.Checkpointed(parent)
+		if err != nil {
 			return opts, nil, nil, nil, err
 		}
 	}

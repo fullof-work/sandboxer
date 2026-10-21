@@ -46,6 +46,7 @@ import (
 func runCmd(args []string) int {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 
+	enableCheckpoint := fs.Bool("enable-checkpoint", false, "retain versioned writable disks in BaseRoot/PathID/checkpoint")
 	configPath := fs.String("config", "", "sandbox.yaml path(s), ':'-separated, merged front-to-back (or SANDBOX_CONFIG env)")
 	manifestPath := fs.String("manifest-config", "", "path to storage config YAML (overrides MANIFEST_CONFIG env; required for manifest:// or crypto.local=auto|required)")
 	sandboxID := fs.String("sandbox-id", "", "sandbox id (overrides sandbox.yaml)")
@@ -348,7 +349,7 @@ func runCmd(args []string) int {
 	if restoreR != "" {
 		return runRestore(ctx, cfg, presence, manifestCfg, restoreR,
 			*sandboxID, *pathID, chBin, rd, br, *statsJSON, stdioMode, *pingFatal, *statsInterval, forwards, refLocations,
-			manifestFetcher, keyFn, localCodec, localRequired, notifyReadiness, diagnostics)
+			manifestFetcher, keyFn, localCodec, localRequired, notifyReadiness, diagnostics, *enableCheckpoint)
 	}
 
 	var (
@@ -383,6 +384,7 @@ func runCmd(args []string) int {
 			}
 		} else {
 			sourceBinding = &sandbox.RunSourceBinding{
+				Checkpoint: source.Root.Checkpoint,
 				SandboxRef: source.PortableRef, RuntimeRef: source.RuntimeRef, RelativeDir: source.RelativeDir,
 				BundleSource: source.BundleSource,
 			}
@@ -393,6 +395,7 @@ func runCmd(args []string) int {
 	}
 
 	exit, err := sandbox.Run(ctx, sandbox.RunOptions{
+		EnableCheckpoint:   *enableCheckpoint,
 		Cfg:                cfg,
 		PortableConfig:     portableConfig,
 		SourceBinding:      sourceBinding,
@@ -428,7 +431,7 @@ func runRestore(ctx context.Context, cfg *config.SandboxConfig, presence config.
 	ref string, sandboxID, pathID, chBin, runDir, baseRoot, statsJSON string, stdioMode stdio.Mode, pingFatal int,
 	statsInterval time.Duration, forwards []sandbox.ForwardSpec, refLocations config.RefLocations,
 	fetcher fetch.Fetcher, keyFn ingest.CustomerKeyFunc, localCodec tarstream.Codec, localRequired bool,
-	notifyReadiness sandbox.ReadinessNotify, diagnostics io.Writer,
+	notifyReadiness sandbox.ReadinessNotify, diagnostics io.Writer, checkpointOptions ...bool,
 ) int {
 	// Validate host-only restore policy before inspecting the remote reference or
 	// constructing a Fetcher. restore.Run repeats this at its public boundary,
@@ -472,6 +475,7 @@ func runRestore(ctx context.Context, cfg *config.SandboxConfig, presence config.
 	}
 
 	runtime, err := runtimesdk.Restore(ctx, runtimesdk.RestoreSpec{
+		EnableCheckpoint:    len(checkpointOptions) > 0 && checkpointOptions[0],
 		SnapshotPath:        snapshotPath,
 		SnapshotManifestKey: snapshotKey,
 		SnapshotRef:         snapshotRef,

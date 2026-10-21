@@ -8,6 +8,7 @@
 //	config    — produce / merge / validate a sandbox.yaml
 //	info      — inspect a Sandbox E or Snapshot S
 //	publish   — publish a complete E or S graph
+//	checkpoint — list or delete local disk versions
 //
 // See docs/sandbox.md for the full design.
 package main
@@ -48,6 +49,8 @@ func main() {
 	switch os.Args[1] {
 	case "run":
 		os.Exit(runCmd(os.Args[2:]))
+	case "checkpoint":
+		os.Exit(checkpointCmd(os.Args[2:]))
 	case "snapshot":
 		os.Exit(snapshotCmd(os.Args[2:]))
 	case "export":
@@ -99,7 +102,7 @@ func printUsage(w *os.File) {
 Usage:
   sandbox-ctl run       [--config host.yaml[:instance.yaml]] [--manifest-config <path>]
                         [--sandbox-id <sid>] [--path-id <leaf>] [--ch-binary <path>]
-                        [--run-root <dir>] [--base-root <dir>]
+                        [--run-root <dir>] [--base-root <dir>] [--enable-checkpoint]
                         [--from <sandbox-ref> [--replace-boot] | --restore <snapshot-ref>]
                         [--ref-location name=file:///absolute/path ...]
                         [--stdin] [--stdout=false] [--stderr=false]
@@ -109,16 +112,19 @@ Usage:
                         [--ping-fatal-threshold N] [--stats-interval <dur>]
                         [--ready-fd N]
   sandbox-ctl export    [--sandbox-id <sid>] [--path-id <leaf>]
-                        (--output <out_dir> | --upload)
+                        (--output <out_dir> | --upload | --checkpoint <ID>)
                         [--mode local|bundle] [--resume]
                         [--run-root <dir>] [--timeout <sec>]
+  # With --checkpoint, optional --output must be the owner's checkpoint directory.
+  sandbox-ctl checkpoint list|delete (--sandbox-id <sid> | --checkpoint-dir <dir>)
+                        [--path-id <leaf>] [--checkpoint <ID>] [--diff-id <ID> ...] [--json]
   sandbox-ctl export    --from <flattened-erofs-ref> --config sandbox.yaml
                         [--sandbox-id <sid>] (--output <out_dir> | --upload)
                         [--mode local|bundle] [--manifest-config <path>]
                         [--ref-location name=file:///absolute/path ...]
                         [--timeout <sec>]
   sandbox-ctl snapshot  [--sandbox-id <sid>] [--path-id <leaf>]
-                        (--output <out_dir> | --upload)
+                        (--output <out_dir> | --upload | --checkpoint <ID>)
                         [--mode local|bundle] [--resume]
                         [--drop-caches] [--merge-ref=true|false]
                         [--run-root <dir>] [--timeout <sec>]

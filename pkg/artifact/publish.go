@@ -40,7 +40,9 @@ type PublishResult struct {
 	// SandboxRef is the final E, including its selected carrier binding.
 	SandboxRef string
 	// RemovedRefs retain full internal source scope. Use Report for public output.
-	RemovedRefs []string
+	RemovedRefs       []string
+	checkpointSources []checkpointPublication
+	completion        *publishCompletion
 }
 
 // Publisher publishes logical image/E/S roots and their selected graphs. Input
@@ -52,11 +54,14 @@ type Publisher struct {
 	target    publishTarget
 	logf      func(string, ...any)
 
-	memoMu     *sync.Mutex
-	diskMemo   map[string]string
-	memoryMemo map[string]string
-	visiting   map[string]struct{}
-	report     *publicationReport
+	memoMu             *sync.Mutex
+	diskMemo           map[string]string
+	memoryMemo         map[string]string
+	visiting           map[string]struct{}
+	report             *publicationReport
+	completion         *publishCompletion
+	transientLocations map[string]bool
+	checkpointPins     *PinnedDiffCheckpoints
 }
 
 type publishTarget interface {
@@ -298,7 +303,7 @@ func newPublisher(storage *ProcessStorage, locations config.RefLocations, target
 		logf = func(string, ...any) {}
 	}
 	return &Publisher{
-		storage: storage, locations: locations, target: target, logf: logf,
+		storage: storage, locations: locations, target: target, logf: logf, completion: &publishCompletion{},
 		memoMu: &sync.Mutex{}, diskMemo: make(map[string]string), memoryMemo: make(map[string]string), visiting: make(map[string]struct{}),
 	}
 }
@@ -307,7 +312,13 @@ func (p *Publisher) Close() error {
 	if p == nil || p.target == nil {
 		return nil
 	}
-	return p.target.Close()
+	err := p.target.Close()
+	if err == nil && p.completion != nil {
+		p.completion.mu.Lock()
+		p.completion.closed = true
+		p.completion.mu.Unlock()
+	}
+	return err
 }
 
 type publishScope struct {
@@ -410,6 +421,14 @@ func (p *Publisher) publishSandboxRoot(ctx context.Context, identity string, sco
 			ref = ""
 		}
 	}()
+	if root.Checkpoint != nil {
+		materialized, cleanup, err := p.materializeCheckpointRoot(ctx, scope, root)
+		if err != nil {
+			return "", err
+		}
+		defer func() { retErr = errors.Join(retErr, cleanup()) }()
+		return p.publishSandboxRoot(ctx, identity, scope, materialized)
+	}
 	refs := portableDiskRefs(root.Portable)
 	for _, dependency := range refs {
 		p.original(dependency.raw, scope)
@@ -485,20 +504,25 @@ func (p *Publisher) publishSnapshotRoot(ctx context.Context, identity string, sc
 		}
 		cfg.FromRefs[i] = published
 	}
-	if portable, ok, err := portablePublishRef(cfg.SandboxRef); err != nil {
+	sandboxStream, sandboxScope, err := p.open(ctx, cfg.SandboxRef, scope)
+	if err != nil {
 		return "", "", fmt.Errorf("publish Snapshot sandbox_ref: %w", err)
-	} else if ok {
+	}
+	sandboxRoot, err := sandboxfile.Open(ctx, sandboxStream)
+	if err != nil {
+		return "", "", err
+	}
+	portable, keep, err := p.keepPortable(ctx, cfg.SandboxRef, scope)
+	if err != nil {
+		return "", "", errors.Join(err, sandboxRoot.Close())
+	}
+	if keep && sandboxRoot.Checkpoint == nil {
+		if err := sandboxRoot.Close(); err != nil {
+			return "", "", err
+		}
 		cfg.SandboxRef = portable
 		p.retained(portable, scope)
 	} else {
-		sandboxStream, sandboxScope, err := p.open(ctx, cfg.SandboxRef, scope)
-		if err != nil {
-			return "", "", fmt.Errorf("publish Snapshot sandbox_ref: %w", err)
-		}
-		sandboxRoot, err := sandboxfile.Open(ctx, sandboxStream)
-		if err != nil {
-			return "", "", fmt.Errorf("publish Snapshot sandbox_ref: %w", err)
-		}
 		cfg.SandboxRef, err = p.publishSandboxRoot(ctx, cfg.SandboxRef, sandboxScope, sandboxRoot)
 		if err != nil {
 			return "", "", err
@@ -528,7 +552,7 @@ func (p *Publisher) publishDisk(ctx context.Context, raw string, scope publishSc
 			}
 		}
 	}()
-	if portable, ok, err := portablePublishRef(raw); err != nil {
+	if portable, ok, err := p.keepPortable(ctx, raw, scope); err != nil {
 		return "", err
 	} else if ok {
 		return portable, nil
@@ -583,7 +607,7 @@ func (p *Publisher) publishMemoryLayer(ctx context.Context, raw string, scope pu
 			}
 		}
 	}()
-	if portable, ok, err := portablePublishRef(raw); err != nil {
+	if portable, ok, err := p.keepPortable(ctx, raw, scope); err != nil {
 		return "", err
 	} else if ok {
 		return portable, nil
@@ -643,6 +667,7 @@ func (p *Publisher) open(ctx context.Context, raw string, scope publishScope) (f
 		if err != nil {
 			return nil, scope, err
 		}
+		child := scope
 		stream, err := readretry.Open(ctx, func() (fetch.Stream, error) {
 			if local, ok := fetcher.(*manifestbundle.ManifestFetcher); ok {
 				selected, err := local.SelectManifest(ctx, key)
@@ -650,11 +675,26 @@ func (p *Publisher) open(ctx context.Context, raw string, scope publishScope) (f
 					return nil, err
 				}
 				scope.rememberSelection(raw, selected)
+				if selected.Reader != nil && selected.Ref != "" {
+					carrier, err := manifest.ParseRef(selected.Ref)
+					if err != nil {
+						return nil, err
+					}
+					path, err := p.locations.ResolveFile(carrier, scope.relativeDir)
+					if err != nil {
+						return nil, err
+					}
+					path, err = filepath.EvalSymlinks(path)
+					if err != nil {
+						return nil, err
+					}
+					child.relativeDir = filepath.Dir(path)
+				}
 				return selected.OpenManifest(ctx, key)
 			}
 			return fetcher.OpenManifest(ctx, key)
 		})
-		return stream, scope, err
+		return stream, child, err
 	case manifest.RefSchemeFile:
 		path, err := p.locations.ResolveFile(ref, scope.relativeDir)
 		if err != nil {
@@ -665,6 +705,10 @@ func (p *Publisher) open(ctx context.Context, raw string, scope publishScope) (f
 			if err != nil {
 				return nil, scope, err
 			}
+		}
+		path, err = filepath.EvalSymlinks(path)
+		if err != nil {
+			return nil, scope, err
 		}
 		opened, err := p.storage.OpenFileWithLocations(ctx, path, ref, p.locations)
 		if err != nil {

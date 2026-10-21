@@ -16,7 +16,9 @@ import (
 // handlers. Each accepted connection is serviced in its own goroutine,
 // so concurrent snapshot/exec requests don't block each other.
 type Server struct {
-	Path string
+	Path                    string
+	CheckpointListHandler   func(Request) ([]DiffCheckpointRef, error)
+	CheckpointDeleteHandler func(Request) error
 
 	// SnapshotHandler services a snapshot_request: it returns the
 	// response and the server writes it back, then closes the conn.
@@ -43,7 +45,7 @@ type Server struct {
 
 // Listen binds the UDS.
 func (s *Server) Listen() error {
-	if s.SnapshotHandler == nil && s.ExportHandler == nil && s.UsageHandler == nil && s.ResourceStatsHandler == nil && s.ExecHandler == nil {
+	if s.SnapshotHandler == nil && s.ExportHandler == nil && s.UsageHandler == nil && s.ResourceStatsHandler == nil && s.ExecHandler == nil && s.CheckpointListHandler == nil && s.CheckpointDeleteHandler == nil {
 		return errors.New("ctl: Server has no handlers")
 	}
 	if s.Logf == nil {
@@ -128,7 +130,47 @@ func (s *Server) handle(conn *net.UnixConn) {
 		return
 	}
 
+	if (req.Type == TypeCheckpointSnapshotRequest || req.Type == TypeCheckpointExportRequest) && req.CheckpointID == "" {
+		_ = WriteMessage(conn, Response{Type: TypeError, Msg: "checkpoint capture requires a nonempty ID"})
+		_ = conn.Close()
+		return
+	}
 	switch req.Type {
+	case TypeCheckpointListRequest:
+		defer conn.Close()
+		if s.CheckpointListHandler == nil {
+			_ = WriteMessage(conn, Response{Type: TypeError, Code: CheckpointUnsupportedCode, Msg: CheckpointUnsupportedCode})
+			return
+		}
+		refs, err := s.CheckpointListHandler(req)
+		if err != nil {
+			code := ""
+			if errors.Is(err, ErrCheckpointUnsupported) {
+				code = CheckpointUnsupportedCode
+			}
+			_ = WriteMessage(conn, Response{Type: TypeError, Code: code, Msg: err.Error()})
+			return
+		}
+		if err := WriteCheckpointList(conn, refs); err != nil {
+			s.Logf("checkpoint list: %v", err)
+		}
+		return
+	case TypeCheckpointDeleteRequest:
+		defer conn.Close()
+		if s.CheckpointDeleteHandler == nil {
+			_ = WriteMessage(conn, Response{Type: TypeError, Code: CheckpointUnsupportedCode, Msg: CheckpointUnsupportedCode})
+			return
+		}
+		if err := s.CheckpointDeleteHandler(req); err != nil {
+			code := ""
+			if errors.Is(err, ErrCheckpointUnsupported) {
+				code = CheckpointUnsupportedCode
+			}
+			_ = WriteMessage(conn, Response{Type: TypeError, Code: code, Msg: err.Error()})
+			return
+		}
+		_ = WriteMessage(conn, Response{Type: TypeCheckpointDeleteDone})
+		return
 	case TypeResourceStatsRequest:
 		defer conn.Close()
 		if s.ResourceStatsHandler == nil {
@@ -172,16 +214,24 @@ func (s *Server) handle(conn *net.UnixConn) {
 		s.ExecHandler(conn, req)
 		return
 
-	case TypeSnapshotRequest:
+	case TypeSnapshotRequest, TypeCheckpointSnapshotRequest:
 		defer conn.Close()
 		if s.SnapshotHandler == nil {
-			_ = WriteMessage(conn, Response{Type: TypeError, Msg: "snapshot not supported"})
+			code := ""
+			if req.Type == TypeCheckpointSnapshotRequest {
+				code = CheckpointUnsupportedCode
+			}
+			_ = WriteMessage(conn, Response{Type: TypeError, Code: code, Msg: "snapshot not supported"})
 			return
 		}
 		resp, err := s.SnapshotHandler(req)
 		if err != nil {
 			// A post-commit cleanup error still owns terminal teardown.
-			resp = Response{Type: TypeError, Msg: err.Error(), AfterWrite: resp.AfterWrite}
+			code := ""
+			if errors.Is(err, ErrCheckpointUnsupported) {
+				code = CheckpointUnsupportedCode
+			}
+			resp = Response{Type: TypeError, Code: code, Msg: err.Error(), AfterWrite: resp.AfterWrite}
 		} else {
 			resp.Type = TypeSnapshotDone
 		}
@@ -190,16 +240,24 @@ func (s *Server) handle(conn *net.UnixConn) {
 		}
 		return
 
-	case TypeExportRequest:
+	case TypeExportRequest, TypeCheckpointExportRequest:
 		defer conn.Close()
 		if s.ExportHandler == nil {
-			_ = WriteMessage(conn, Response{Type: TypeError, Msg: "export not supported"})
+			code := ""
+			if req.Type == TypeCheckpointExportRequest {
+				code = CheckpointUnsupportedCode
+			}
+			_ = WriteMessage(conn, Response{Type: TypeError, Code: code, Msg: "export not supported"})
 			return
 		}
 		resp, err := s.ExportHandler(req)
 		if err != nil {
 			// A post-commit cleanup error still owns terminal teardown.
-			resp = Response{Type: TypeError, Msg: err.Error(), AfterWrite: resp.AfterWrite}
+			code := ""
+			if errors.Is(err, ErrCheckpointUnsupported) {
+				code = CheckpointUnsupportedCode
+			}
+			resp = Response{Type: TypeError, Code: code, Msg: err.Error(), AfterWrite: resp.AfterWrite}
 		} else {
 			resp.Type = TypeExportDone
 		}

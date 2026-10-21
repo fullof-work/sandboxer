@@ -24,6 +24,7 @@ import (
 
 func exportCmd(args []string) int {
 	fs := flag.NewFlagSet("export", flag.ContinueOnError)
+	checkpoint := fs.String("checkpoint", "", "create a named local disk checkpoint")
 	jsonOutput := fs.Bool("json", false, "emit the completed Sandbox E reference as JSON")
 	sandboxID := fs.String("sandbox-id", "", "live sandbox id; optional output alias for image assembly")
 	pathID := fs.String("path-id", "", "live run-root directory leaf (takes precedence over --sandbox-id)")
@@ -66,7 +67,11 @@ func exportCmd(args []string) int {
 		fmt.Fprintln(os.Stderr, "export: --upload and explicit --mode are mutually exclusive")
 		return 2
 	}
-	if *upload == (*outDir != "") {
+	if *checkpoint != "" && (*upload || *from != "") {
+		fmt.Fprintln(os.Stderr, "export: --checkpoint cannot be combined with --upload or --from")
+		return 2
+	}
+	if *checkpoint == "" && *upload == (*outDir != "") {
 		fmt.Fprintln(os.Stderr, "export: exactly one of --output or --upload is required")
 		return 2
 	}
@@ -129,7 +134,7 @@ func exportCmd(args []string) int {
 		fmt.Fprintf(os.Stderr, "export: target path: %v\n", err)
 		return 2
 	}
-	return liveExport(targetPathID, *outDir, *upload, *mode, modeSet, *resume, *runRoot, *timeoutS, *jsonOutput)
+	return liveExport(targetPathID, *outDir, *upload, *mode, modeSet, *resume, *runRoot, *timeoutS, *jsonOutput, *checkpoint)
 }
 
 func prepareArtifactOutputDir(path string) (string, error) {
@@ -157,7 +162,7 @@ func prepareArtifactOutputDir(path string) (string, error) {
 	return abs, nil
 }
 
-func liveExport(pathID, outDir string, upload bool, mode string, modeSet, resume bool, runRoot string, timeoutS int, jsonOutput bool) int {
+func liveExport(pathID, outDir string, upload bool, mode string, modeSet, resume bool, runRoot string, timeoutS int, jsonOutput bool, checkpointIDs ...string) int {
 	if runRoot == "" {
 		runRoot = os.Getenv("SANDBOX_RUN_ROOT")
 	}
@@ -175,6 +180,10 @@ func liveExport(pathID, outDir string, upload bool, mode string, modeSet, resume
 		_ = conn.SetDeadline(time.Now().Add(time.Duration(timeoutS) * time.Second))
 	}
 	req := ctl.Request{Type: ctl.TypeExportRequest, OutDir: outDir, Upload: upload, ResumeAfter: resume}
+	if len(checkpointIDs) > 0 && checkpointIDs[0] != "" {
+		req.Type = ctl.TypeCheckpointExportRequest
+		req.CheckpointID = checkpointIDs[0]
+	}
 	if modeSet {
 		req.Mode = mode
 	}
@@ -188,6 +197,10 @@ func liveExport(pathID, outDir string, upload bool, mode string, modeSet, resume
 		return 1
 	}
 	if resp.Type == ctl.TypeError {
+		if errors.Is(ctl.CaptureError(resp), ctl.ErrCheckpointUnsupported) {
+			fmt.Fprintln(os.Stderr, ctl.CaptureError(resp))
+			return 78
+		}
 		fmt.Fprintf(os.Stderr, "export: error from sandbox: %s\n", resp.Msg)
 		return 1
 	}
