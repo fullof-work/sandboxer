@@ -745,9 +745,7 @@ func (c *COWCache) discard(ctx context.Context, cow *BlockCOW, block int64) erro
 			if p != nil {
 				c.releaseLocked(p)
 			}
-			cow.bitmapMu.Lock()
-			cow.bitmap[block/64] &^= 1 << (uint64(block) % 64)
-			cow.bitmapMu.Unlock()
+			cow.markAbsent(block)
 		} else {
 			report = c.failLocked(fmt.Errorf("vhost: discard block %d: %w", block, err))
 		}

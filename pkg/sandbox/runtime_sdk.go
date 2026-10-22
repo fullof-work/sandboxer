@@ -48,6 +48,7 @@ type RuntimeSpec struct {
 	EnableCheckpoint                bool
 	checkpointPlan                  *CheckpointDiskPlan
 	checkpointOwner                 *diffstore.DirectoryOwner
+	checkpointReleaseSources        func() error
 	Kernel, Bundle, Cmdline         string
 	Resources                       config.ResourcesConfig
 	Network                         NetworkDeviceSpec
@@ -596,6 +597,7 @@ func (r *Runtime) Launch(ctx context.Context, spec LaunchSpec) error {
 		r.checkpointCleanup = release
 		r.spec.checkpointOwner = prepared.checkpointOwner
 		r.spec.checkpointPlan = prepared.checkpointPlan
+		r.spec.checkpointReleaseSources = prepared.checkpointReleaseSources
 		cfg = prepared.Cfg
 		spec.PortableConfig = prepared.PortableConfig
 		spec.SourceBinding = prepared.SourceBinding
@@ -847,6 +849,15 @@ func (r *Runtime) Launch(ctx context.Context, spec LaunchSpec) error {
 			return fail(e)
 		}
 		logical = append(logical, d)
+	}
+	// Every root/data writer now belongs to Runtime and can serve its active
+	// DIFF independently. Release only preparation readers, before advertising
+	// successful Launch; the directory owner and materialized lowers stay live.
+	if release := r.spec.checkpointReleaseSources; release != nil {
+		if err := release(); err != nil {
+			return fail(fmt.Errorf("release checkpoint source readers: %w", err))
+		}
+		r.spec.checkpointReleaseSources = nil
 	}
 
 	ls, err := MergeLaunch(imageCfg, cfg.Launch)

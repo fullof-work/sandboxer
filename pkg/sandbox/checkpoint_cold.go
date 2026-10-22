@@ -45,6 +45,7 @@ func prepareColdCheckpoint(ctx context.Context, opts RunOptions) (_ RunOptions, 
 			return opts, release, err
 		}
 		closes = append(closes, pins.Close)
+		opts.checkpointReleaseSources = pins.Close
 	}
 	directory := filepath.Join(DefaultBaseDir(opts.BaseRoot, opts.PathID), "checkpoint")
 	if opts.EnableCheckpoint {
@@ -75,6 +76,13 @@ func prepareColdCheckpoint(ctx context.Context, opts RunOptions) (_ RunOptions, 
 		if err != nil {
 			return opts, release, err
 		}
+		// MaterializePinnedCheckpoint includes Publisher.Close. Its ordinary
+		// artifacts now own all source bytes; keep their directory and storage,
+		// but stop retaining the source versions for the runtime lifetime.
+		if err := pins.Close(); err != nil {
+			return opts, release, err
+		}
+		opts.checkpointReleaseSources = nil
 		ref, err := manifest.ParseRef(result.SandboxRef)
 		if err != nil {
 			return opts, release, err

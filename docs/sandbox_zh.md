@@ -677,6 +677,46 @@ guest 数据。目录只有一个 writer owner，固定版本的独立 read pin 
 可能增加索引和数据 COW。不承诺整个 pause 恒定耗时、所有负载都更快，也不扩大既有
 FLUSH 契约之外的宿主崩溃或掉电 guest 数据持久性保证。
 
+重开已有 v2 DIFF 时按需确认上层块是否存在。Open 返回之前仍会完成 writer 所有权、
+身份/密钥/容量检查、已提交 redo 重放、根节点校验及当前 Checkpoint 元数据健康检查；
+同目录继续运行不再等待全量索引
+扫描。未知块与空洞严格区分。读取及部分写入按最多 256 个块（1 MiB）的范围查询当前
+索引。完整页覆盖也会在发布缓存内容前校验未知元数据，但不读取旧 payload；Discard
+在移除映射前同样校验未知范围。
+已接受的写入和 discard 优先于索引查询结果。
+查询还会沿有界的边缘路径校验相关前驱/后继子树的边界，即使页校验和有效，也拒绝
+不一致的相邻边界。发现索引错误会进入 fatal 状态，不会回退读 base。
+因此子节点损坏可能在首次访问时
+发现，而非 Open 时发现。
+这只检查已访问路径及相邻边界，不是全树检查。未遍历子树中的任意逻辑损坏可能延后
+到访问相应路径或完整扫描时才发现；按需 Open 不等于全树完整性审计。
+
+没有全盘后台预热。首次访问未知范围需要支付索引查询成本，其影响取决于访问局部性
+和存储延迟。在已有 presence 位图之外，每个逻辑 4 KiB 块增加一个已知状态位
+（30 GiB 磁盘约增加 0.94 MiB）。`diff_presence_complete` 为 false 时，
+`diff_dirty_blocks` 和 `diff_dirty_percent` 是下界；`diff_presence_known_blocks`
+表示已确认范围。全新 DIFF 和 raw/v1 仍提供精确计数。普通 `SnapshotView` 和活动层
+导出在提供空洞信息前通过完整索引遍历补齐剩余 presence，因此扫描成本可能转移到
+这个已静止的操作。补齐使用一份临时位图，枚举已映射 key，而非稀疏磁盘的每个逻辑范围。
+命名捕获/导出不依赖此位图。历史或跨目录恢复仍需物化选定版本，按需 presence
+不会消除这部分成本。
+
+恢复来源读者是临时资源。同目录热恢复和冷启动（CLI、SDK `Start` 以及
+`StartRuntime` + `Launch`）持有完整来源集合，直到根盘和每个数据盘 writer 全部打开
+并登记，再在对外报告成功前关闭来源 pins。历史/跨目录恢复，包括未启用 Checkpoint
+的目标，在完整物化及其 publisher Close 成功后关闭。目录 owner、活动磁盘、借用的
+存储访问能力及物化 lower 文件继续保留运行所需的寿命。pin 关闭失败会使启动失败；
+错误清理也关闭部分已准备资源，重复 pin 清理安全。
+
+释放这些读者不删除 Checkpoint 名称，也不关闭其他 publisher 的固定视图。显式
+Delete 可以先撤销名称可见性，真正的导出读者仍保护旧页。最后一个这样的读者关闭后，
+现有 GC 可以撤销保护并回收过时内容，无需等待恢复后的沙箱退出。在此之前，受保护
+旧页的首次写入可能需要 CoW，已私有页的重复覆盖不会。Delete 仍不承诺同步回收空间。
+
+预期收益最大的是已映射索引较大、启动只访问其中一部分的场景。很小的稀疏索引本来
+扫描成本就低，按需状态管理反而可能增加首批负载的总耗时。启动即读取全盘或立即
+执行普通导出时仍需完整索引；Open 缩短本身不能证明端到端收益。
+
 ## 3. 配置与制品格式
 
 ### 3.1 `sandbox.yaml`
@@ -2724,6 +2764,17 @@ python3 test/perf/checkpoint_cow.py --tmpdir /path/to/native-ext4/scratch \
 
 python3 test/perf/checkpoint_template.py --tmpdir /path/to/native-ext4/scratch \
   --output /path/to/template-results
+
+# 基线/候选二进制共用同一 fixture，交替执行至少三轮。
+# CASE：dense-plain/dense-xts（1 GiB payload），sparse-plain/sparse-xts
+# （逻辑容量 30 GiB，仅映射 240 页）。
+CHECKPOINT_PRESENCE_DIR=/path/to/owned/native-ext4/fixtures \
+CHECKPOINT_PRESENCE_CASE=dense-plain CHECKPOINT_PRESENCE_PHASE=seed \
+  go test ./pkg/vhost -run '^TestCheckpointPresencePhases$' -count=1 -v
+CHECKPOINT_PRESENCE_DIR=/path/to/owned/native-ext4/fixtures \
+CHECKPOINT_PRESENCE_CASE=dense-plain CHECKPOINT_PRESENCE_PHASE=measure \
+CHECKPOINT_PRESENCE_LABEL=candidate \
+  go test ./pkg/vhost -run '^TestCheckpointPresencePhases$' -count=1 -v
 ```
 
 源码测试覆盖独立进程 pin 和 writer 交接、杀死 owner 后 redo 重开、真实短写、空间
@@ -2731,6 +2782,16 @@ python3 test/perf/checkpoint_template.py --tmpdir /path/to/native-ext4/scratch \
 artifact 测试覆盖精确发布后删除、Bundle/外部来源、重写、来源目录身份和同目录重开/
 跨目录物化。产物用例使用根盘加两个数据盘，串起冷启动、命名捕获、继续运行、并发
 固定版本发布、历史/跨目录恢复以及移除原来源后的恢复。
+它还在交接后查询内核 OFD 版本 pin 锁范围，并在明文及 XTS 模式下串起热/冷恢复、
+显式 Delete、继续写入、再次捕获、发布及便携产物恢复，从而区分 List 为空与读者
+已真正释放。
+
+按需 presence 回归覆盖已分配零页、未知上层/base 块的部分写入、已接受但未回写的
+整页覆盖、并发 discard、取消、sticky 索引故障及普通导出完整性。presence harness
+分别记录 Open/索引字节、首读、带延迟分位数的 1,024 次启动读取、重复热读及完整
+活动 `SnapshotView` 构建。应比较 Open 加首批负载的总时间，不能只比较 Open；这些
+是块层测量，并非 VM 到业务就绪的耗时。稀疏 30 GiB 逻辑样本不能代表实际 30 GiB
+payload 的验证。
 
 性能 driver 记录主机、文件系统、构建身份、原始日志、前端及 checkpoint 的
 p50/p95/p99、包含最终 Drain 的吞吐、数据/索引/redo/GC 物理字节计数、cache hit
@@ -2745,7 +2806,8 @@ v1 分别比较，并区分无版本、共享首写、已私有覆盖。这些�
 RSS 仍包含这部分准备阶段。
 
 规模 driver 在进入下一档前删除上一档历史，分别报告 checkpoint 注册、control 重开
-和 presence 重建。完整 resume 包含重建位图，耗时会随映射页数增长。vhost helper
+和 presence 重建；其中显式全扫描的耗时会随映射页数增长。v2 BlockCOW 重开现在将
+这部分工作推迟到访问对应范围或后续普通活动层导出时执行。vhost helper
 在回写前固定恰好 32 个脏页（128 KiB），分别记录模板 readiness、Drain、最终
 materialization、元数据登记、捕获总耗时和重开。不使用 helper 时，登记样本的待写
 payload 为零。捕获总耗时不含最初 open 和 guest 写入准入，也不含 VM 内存捕获。

@@ -16,6 +16,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
@@ -91,6 +92,8 @@ type Options struct {
 	// NotifyReadiness receives the one-shot startup milestones for this run.
 	// nil preserves the historical behavior exactly.
 	NotifyReadiness sandbox.ReadinessNotify
+
+	checkpointReleaseSources func() error // temporary source pins; writers own the handoff
 }
 
 // Run executes restore. Returns the CH exit code.
@@ -474,19 +477,6 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 	// memory-layer Close defer so cancellation and join always run first.
 	defer prefetch.Stop()
 
-	// Reconstruct each logical disk (root + data disks, in order): layer the
-	// captured base ([top] ++ base_from_refs) into a ro base, build a fresh
-	// writable CoW on top, and (overlay mode) open the erofs base as the ro
-	// device. All disk provenance comes from E/C0; S contributes no disk fields.
-	rootTop, rootChain := snapCfg.Boot.Root.Base, append([]string(nil), snapCfg.Boot.Root.BaseFromRefs...)
-	if !snapCfg.SingleDisk() {
-		rootTop = snapCfg.Boot.Root.Overlay.Base
-		rootChain = append([]string(nil), snapCfg.Boot.Root.Overlay.BaseFromRefs...)
-	}
-	rootDiffURI, rootDiffTmpl := snapCfg.Boot.Root.Diff, snapCfg.Boot.Root.DiffTemplate
-	if !snapCfg.SingleDisk() {
-		rootDiffURI, rootDiffTmpl = snapCfg.Boot.Root.Overlay.Diff, snapCfg.Boot.Root.Overlay.DiffTemplate
-	}
 	cacheSize, maxDirtySize, err := snapCfg.Resources.DiffCOW.Bytes()
 	if err != nil {
 		return -1, err
@@ -501,40 +491,16 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 			code = -1
 		}
 	}()
-	rootDB, rootCleanup, err := reconstructDisk(ctx, opts, diffCustomerKey, snapCfg.SingleDisk(), rootTop, rootChain,
-		snapCfg.Boot.Root.Base, rootDiffURI, rootDiffTmpl, "overlay", logf, cowCache)
+	disks, cleanupDisks, err := reconstructRestoreDisks(ctx, opts, diffCustomerKey, &snapCfg, logf, cowCache)
 	if err != nil {
 		return -1, err
 	}
 	defer func() {
-		retErr = errors.Join(retErr, rootCleanup())
+		retErr = errors.Join(retErr, cleanupDisks())
 		if retErr != nil {
 			code = -1
 		}
 	}()
-	disks := []sandbox.DiskBackend{rootDB}
-
-	for i := range snapCfg.Boot.Disks {
-		d := &snapCfg.Boot.Disks[i]
-		single := d.Single()
-		top, chain := d.Base, append([]string(nil), d.BaseFromRefs...)
-		diffURI, diffTmpl := d.Diff, d.DiffTemplate
-		if !single {
-			top, chain = d.Overlay.Base, append([]string(nil), d.Overlay.BaseFromRefs...)
-			diffURI, diffTmpl = d.Overlay.Diff, d.Overlay.DiffTemplate
-		}
-		db, dcleanup, derr := reconstructDisk(ctx, opts, diffCustomerKey, single, top, chain, d.Base, diffURI, diffTmpl, fmt.Sprintf("disk%d", i), logf, cowCache)
-		if derr != nil {
-			return -1, derr
-		}
-		defer func() {
-			retErr = errors.Join(retErr, dcleanup())
-			if retErr != nil {
-				code = -1
-			}
-		}()
-		disks = append(disks, db)
-	}
 
 	// Network: when the snapshot has a virtio-net device, re-acquire its host
 	// side for this restore. tapfd mode re-runs
@@ -734,6 +700,62 @@ func openAndEstablishRestoreMUX(
 		notifyReady()
 	}
 	return spec, nil
+}
+
+// reconstructRestoreDisks owns the complete root/data-disk handoff. The source
+// pins must survive every writer open, including a failure on the last disk.
+// Only after all writers and their cleanups are registered may they be released.
+// Disk provenance comes from E/C0; S contributes no disk fields.
+func reconstructRestoreDisks(ctx context.Context, opts Options, key [32]byte, cfg *config.SandboxConfig, logf func(string, ...any), cache *vhost.COWCache) (_ []sandbox.DiskBackend, cleanup func() error, retErr error) {
+	var closes []func() error
+	cleanup = sync.OnceValue(func() error {
+		var err error
+		for i := len(closes) - 1; i >= 0; i-- {
+			err = errors.Join(err, closes[i]())
+		}
+		return err
+	})
+	defer func() {
+		if retErr != nil {
+			retErr = errors.Join(retErr, cleanup())
+		}
+	}()
+	roots := []*config.RootConfig{&cfg.Boot.Root}
+	for i := range cfg.Boot.Disks {
+		roots = append(roots, &cfg.Boot.Disks[i].RootConfig)
+	}
+	disks := make([]sandbox.DiskBackend, 0, len(roots))
+	for i, root := range roots {
+		if err := ctx.Err(); err != nil {
+			return nil, cleanup, err
+		}
+		single := root.Single()
+		top, chain := root.Base, append([]string(nil), root.BaseFromRefs...)
+		diffURI, diffTemplate := root.Diff, root.DiffTemplate
+		if !single {
+			top, chain = root.Overlay.Base, append([]string(nil), root.Overlay.BaseFromRefs...)
+			diffURI, diffTemplate = root.Overlay.Diff, root.Overlay.DiffTemplate
+		}
+		diskKey := "overlay"
+		if i != 0 {
+			diskKey = fmt.Sprintf("disk%d", i-1)
+		}
+		disk, closeDisk, err := reconstructDisk(ctx, opts, key, single, top, chain, root.Base, diffURI, diffTemplate, diskKey, logf, cache)
+		if err != nil {
+			return nil, cleanup, err
+		}
+		closes = append(closes, closeDisk)
+		disks = append(disks, disk)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, cleanup, err
+	}
+	if opts.checkpointReleaseSources != nil {
+		if err := opts.checkpointReleaseSources(); err != nil {
+			return nil, cleanup, fmt.Errorf("restore: release Checkpoint sources: %w", err)
+		}
+	}
+	return disks, cleanup, nil
 }
 
 // reconstructDisk rebuilds one logical disk for restore: the read-only base is
