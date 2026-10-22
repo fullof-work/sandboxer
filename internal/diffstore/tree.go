@@ -508,12 +508,10 @@ func (s *Store) Scan(ctx context.Context, visit func(uint64) error) error {
 	if err := s.healthy(ctx); err != nil {
 		return err
 	}
-	return walkTree(ctx, storeReader{s}, s.ctrl.Root, func(e entry) error {
-		if e.key >= uint64(s.Size()/PageSize) {
-			return fmt.Errorf("diffstore: mapping outside capacity")
-		}
-		return visit(e.key)
-	}, 0)
+	if s.ctrl.Root == 0 {
+		return nil
+	}
+	return s.scanActive(ctx, s.ctrl.Root, 0, uint64(s.Size()/PageSize)-1, 0, visit)
 }
 func (s *Store) Discard(ctx context.Context, off, length int64) error {
 	if off < 0 || length < 0 || off%PageSize != 0 || length%PageSize != 0 || off > s.Size() || length > s.Size()-off {

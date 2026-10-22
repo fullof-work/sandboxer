@@ -21,6 +21,7 @@ type diffBackend interface {
 	withRead(int, int64, func([]byte) error) error
 	writePages(context.Context, []*cachePage) error
 	scan(context.Context, func(uint64) error) error
+	presence(context.Context, uint64, []bool) error
 	discard(context.Context, int64, int64) error
 	markModified(context.Context) error
 	err() error
@@ -54,6 +55,9 @@ func (d *checkpointDiff) ReadAt(p []byte, off int64) (int, error)  { return d.st
 func (d *checkpointDiff) WriteAt(p []byte, off int64) (int, error) { return d.store.WriteAt(p, off) }
 func (d *checkpointDiff) scan(ctx context.Context, visit func(uint64) error) error {
 	return d.store.Scan(ctx, visit)
+}
+func (d *checkpointDiff) presence(ctx context.Context, start uint64, present []bool) error {
+	return d.store.Presence(ctx, start, present)
 }
 func (d *checkpointDiff) discard(ctx context.Context, off, length int64) error {
 	return d.store.Discard(ctx, off, length)

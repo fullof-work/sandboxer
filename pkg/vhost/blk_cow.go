@@ -19,7 +19,8 @@ import (
 // plaintext page. Reads prefer latest cached data; only misses reach the diff.
 // First partial writes materialize from base/zeros. A shared bounded cache
 // asynchronously writes frozen full pages. Block stripes serialize frontend
-// access; the worker never acquires them. Reopen rebuilds presence from extents.
+// access; the worker never acquires them. Reopened v2 diffs resolve unknown
+// presence from the index on demand; raw/v1 rebuild presence from extents.
 //
 // The vhost profile does not advertise DISCARD or WRITE_ZEROES and rejects
 // those wire requests. The low-level Discard helper has hole semantics below.
@@ -35,7 +36,8 @@ type BlockCOW struct {
 	diff      *diffFile
 	size      int64
 	bitmapMu  sync.RWMutex
-	bitmap    []uint64 // each bit = one 4K block
+	bitmap    []uint64 // each bit = one 4K block; meaningful when known
+	known     []uint64 // nil means all presence is known (raw/v1 or a fresh diff)
 	blockMu   []sync.RWMutex
 	blockSize int64
 
@@ -59,7 +61,8 @@ const (
 )
 
 // OpenBlockCOW opens or atomically creates the active diff described by init,
-// rebuilds logical upper presence from its body, and pairs it with the optional base.
+// pairs it with the optional base, and resolves logical upper presence. Existing
+// v2 diffs start with unknown presence instead of scanning the whole index.
 //
 // If base is nil, reads to clean blocks return zeros.
 func OpenBlockCOW(diffPath string, base BlockReader, init DiffInit, rawOptions ...BlockCOWOption) (*BlockCOW, error) {
@@ -71,19 +74,15 @@ func OpenBlockCOW(diffPath string, base BlockReader, init DiffInit, rawOptions .
 	var diff *diffFile
 	var fresh *freshDiffInit
 	var bitmap []uint64
+	var known []uint64
 	if options.checkpoint != nil {
 		diff, fresh, err = openCheckpointDiff(diffPath, init, options)
 		if err != nil {
 			return nil, err
 		}
-		bitmap, err = diff.scanDirtyBlocks()
-		if err != nil {
-			if fresh != nil {
-				_ = fresh.abort()
-			} else {
-				_ = diff.Close()
-			}
-			return nil, fmt.Errorf("vhost: rebuild checkpoint bitmap: %w", err)
+		bitmap = make([]uint64, int((diff.logicalSize/cowBlockSize+63)/64))
+		if init.Existing {
+			known = make([]uint64, len(bitmap))
 		}
 	} else if !init.Existing && init.TemplatePath != "" {
 		fresh, err = createFreshDiffFile(diffPath, init, options.encryption)
@@ -120,6 +119,7 @@ func OpenBlockCOW(diffPath string, base BlockReader, init DiffInit, rawOptions .
 		diff:           diff,
 		size:           size,
 		bitmap:         bitmap,
+		known:          known,
 		blockMu:        make([]sync.RWMutex, cowLockStripes),
 		blockSize:      cowBlockSize,
 		discardOnClose: options.discardOnClose,
@@ -163,30 +163,43 @@ func OpenBlockCOW(diffPath string, base BlockReader, init DiffInit, rawOptions .
 	return cow, nil
 }
 
-// dirtyCount returns the number of blocks marked dirty (test helper).
+// DirtyCount returns the number of known upper-present blocks. It is a lower
+// bound until BackendStats reports diff_presence_complete after a v2 reopen.
 func (c *BlockCOW) DirtyCount() int {
+	dirty, _ := c.presenceCounts()
+	return dirty
+}
+
+func (c *BlockCOW) presenceCounts() (dirty, known int) {
 	c.bitmapMu.RLock()
 	defer c.bitmapMu.RUnlock()
-	count := 0
 	for _, w := range c.bitmap {
-		count += popcount64(w)
+		dirty += popcount64(w)
 	}
-	return count
+	if c.known == nil {
+		known = int(c.size / c.blockSize)
+	} else {
+		for _, w := range c.known {
+			known += popcount64(w)
+		}
+	}
+	return dirty, known
 }
 
 // BackendStats reports cow-specific metrics. Implements StatsReporter.
-// The dirty-block count includes blocks already present in the diff
-// file when the server started (rebuilt from SEEK_DATA), so it tracks
-// the logical upper-layer footprint, including accepted unflushed writes.
+// Counts include accepted unflushed writes. After a v2 reopen the dirty count
+// and percentage are lower bounds until diff_presence_complete is true.
 func (c *BlockCOW) BackendStats() map[string]any {
-	dirty := c.DirtyCount()
+	dirty, known := c.presenceCounts()
 	total := c.size / c.blockSize
 	stats := map[string]any{
-		"diff_dirty_blocks":  dirty,
-		"diff_cow_cache":     c.cache.Stats(),
-		"diff_total_blocks":  total,
-		"diff_block_bytes":   c.blockSize,
-		"diff_dirty_percent": fmt.Sprintf("%.2f", float64(dirty)*100/float64(total)),
+		"diff_dirty_blocks":          dirty,
+		"diff_cow_cache":             c.cache.Stats(),
+		"diff_total_blocks":          total,
+		"diff_block_bytes":           c.blockSize,
+		"diff_dirty_percent":         fmt.Sprintf("%.2f", float64(dirty)*100/float64(total)),
+		"diff_presence_known_blocks": known,
+		"diff_presence_complete":     int64(known) == total,
 	}
 	if d, err := c.checkpointBackend(); err == nil {
 		stats["diff_checkpoint_store"] = d.store.Stats()
@@ -216,6 +229,18 @@ func (c *BlockCOW) markDirty(blk int64) {
 	c.bitmapMu.Lock()
 	defer c.bitmapMu.Unlock()
 	c.bitmap[blk/64] |= 1 << (uint64(blk) % 64)
+	if c.known != nil {
+		c.known[blk/64] |= 1 << (uint64(blk) % 64)
+	}
+}
+
+func (c *BlockCOW) markAbsent(blk int64) {
+	c.bitmapMu.Lock()
+	defer c.bitmapMu.Unlock()
+	c.bitmap[blk/64] &^= 1 << (uint64(blk) % 64)
+	if c.known != nil {
+		c.known[blk/64] |= 1 << (uint64(blk) % 64)
+	}
 }
 
 func (c *BlockCOW) materialBlockResolved(blk int64) bool {
@@ -286,6 +311,11 @@ func (c *BlockCOW) readRange(ctx context.Context, buf []byte, offset int64, bitm
 }
 
 func (c *BlockCOW) readRangeLocked(ctx context.Context, buf []byte, offset int64, bitmap []uint64) (int, error) {
+	if bitmap == nil {
+		if err := c.resolvePresenceLocked(ctx, offset/cowBlockSize, (offset+int64(len(buf))-1)/cowBlockSize); err != nil {
+			return 0, err
+		}
+	}
 	done := 0
 	end := offset + int64(len(buf))
 	for done < len(buf) {
@@ -398,8 +428,16 @@ func (c *BlockCOW) writeAt(ctx context.Context, buf []byte, offset int64) (int, 
 // writeBlockLocked fills a quota-reserved page, then publishes upper presence.
 // The worker never takes the caller's block stripe, including while it waits.
 func (c *BlockCOW) writeBlockLocked(ctx context.Context, buf []byte, offset, blk int64) (int, error) {
-	upper := c.blockDirty(blk)
 	start := blk * c.blockSize
+	// A complete overwrite needs no old payload or presence lookup. Its accepted
+	// cache page becomes known-present; the store still protects retained roots
+	// when writeback commits the mapping.
+	if offset != start || int64(len(buf)) != c.blockSize {
+		if err := c.resolvePresenceLocked(ctx, blk, blk); err != nil {
+			return 0, err
+		}
+	}
+	upper := c.blockDirty(blk)
 	return c.cache.write(ctx, c, buf, offset, blk, upper, func(page []byte) error {
 		if offset == start && int64(len(buf)) == c.blockSize {
 			return nil
@@ -747,11 +785,16 @@ func (c *BlockCOW) activeView(ctx context.Context) (*cowSnapshotReaderAt, []spar
 	if err := c.WaitMaterialized(ctx); err != nil {
 		return nil, nil, err
 	}
-	_, endOp, err := c.begin(nil)
+	ctx, endOp, err := c.begin(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
 	defer c.end(endOp)
+	// Ordinary exports need exact holes. Enumerate remaining presence before
+	// copying the bitmap; named checkpoints do not take this path.
+	if err := c.resolveAllPresence(ctx); err != nil {
+		return nil, nil, err
+	}
 	c.bitmapMu.RLock()
 	bitmap := append([]uint64(nil), c.bitmap...)
 	c.bitmapMu.RUnlock()

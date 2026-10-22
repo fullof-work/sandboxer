@@ -406,6 +406,14 @@ func openStore(path string, o Options, metadata bool) (*Store, error) {
 		return fail(fmt.Errorf("diffstore: invalid control generation"))
 	}
 	s := &Store{file: f, lock: lock, lockPath: lockPath, info: info, cipher: xc, ctrl: ctrl, cache: newCache(cachePages), metadataOnly: metadata}
+	// Read only the root before exposing a data owner. Full presence discovery
+	// is on demand; replay, identity and this minimum tree check still finish
+	// synchronously. Metadata-only cleanup remains possible for a damaged tree.
+	if !metadata && ctrl.Root != 0 {
+		if _, err = s.activeNode(ctrl.Root); err != nil {
+			return fail(err)
+		}
+	}
 	s.currentFlag.Store(ctrl.Current)
 	s.retiredFlag.Store(ctrl.Retired)
 	s.startGC()

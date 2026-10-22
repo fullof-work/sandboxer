@@ -761,6 +761,35 @@ Retained versions cost space and post-capture writes may incur index/data COW.
 It does not promise constant total pause time, universal speedups, or guest-data
 durability across host crashes/power loss beyond the existing FLUSH contract.
 
+Reopening an existing v2 DIFF resolves upper presence on demand. Writer ownership,
+identity/key/capacity checks, committed redo replay and root-page validation finish
+before Open returns; a full index scan is no longer on the same-directory resume
+path. Unknown blocks are distinct from holes. Reads and partial writes query the
+current index in ranges of at most 256 blocks (1 MiB); complete page overwrites
+publish their cached contents directly. Accepted writes and discards take priority
+over index answers. A discovered index error is fatal, never a fallback to base.
+Child-node corruption may therefore be detected on first access rather than Open.
+
+There is no background full-disk prefetch. The first access to an unknown range
+pays its index lookup; locality and storage latency determine that cost. One extra
+bit per logical 4 KiB block records known presence (about 0.94 MiB for a 30 GiB
+disk), in addition to the existing presence bitmap. `diff_dirty_blocks` and
+`diff_dirty_percent` are lower bounds while `diff_presence_complete` is false;
+`diff_presence_known_blocks` reports coverage. Fresh diffs and raw/v1 retain exact
+counts. Ordinary `SnapshotView` and active-diff export complete the remaining
+presence with a full index traversal before exposing holes, which can move scan
+cost to that quiescent operation. Completion uses one temporary bitmap and visits
+mapped keys rather than every logical range of a sparse disk. Named capture/export
+does not require this bitmap. Historical or
+cross-directory restore still materializes its selected version; its cost is not
+removed by lazy presence.
+
+The expected benefit is largest when a large mapped index would otherwise be
+scanned but startup touches only a subset. A small sparse index is already cheap
+to scan, so lazy bookkeeping can instead increase the first workload's total
+time. Full-disk startup reads or an immediate ordinary export still need the
+complete index; shorter Open alone does not establish an end-to-end improvement.
+
 ## 3. Configuration and artifact formats
 
 ### 3.1 `sandbox.yaml`
@@ -3053,6 +3082,17 @@ python3 test/perf/checkpoint_cow.py --tmpdir /path/to/native-ext4/scratch \
 
 python3 test/perf/checkpoint_template.py --tmpdir /path/to/native-ext4/scratch \
   --output /path/to/template-results
+
+# Reuse the same fixture for baseline/candidate binaries; alternate >=3 rounds.
+# Cases: dense-plain/dense-xts (1 GiB payload), sparse-plain/sparse-xts
+# (30 GiB logical capacity with only 240 mapped pages).
+CHECKPOINT_PRESENCE_DIR=/path/to/owned/native-ext4/fixtures \
+CHECKPOINT_PRESENCE_CASE=dense-plain CHECKPOINT_PRESENCE_PHASE=seed \
+  go test ./pkg/vhost -run '^TestCheckpointPresencePhases$' -count=1 -v
+CHECKPOINT_PRESENCE_DIR=/path/to/owned/native-ext4/fixtures \
+CHECKPOINT_PRESENCE_CASE=dense-plain CHECKPOINT_PRESENCE_PHASE=measure \
+CHECKPOINT_PRESENCE_LABEL=candidate \
+  go test ./pkg/vhost -run '^TestCheckpointPresencePhases$' -count=1 -v
 ```
 
 The source suite checks independent-process pins and writer handoff, killed-owner
@@ -3063,6 +3103,15 @@ source-directory identity and same-directory versus materialized restore. The
 product case exercises root plus two data disks through cold boot, named capture,
 resume, concurrent fixed-version publication, historical/cross-directory restore
 and restoration after removing the original sources.
+
+Lazy-presence regressions cover allocated zeros, unknown upper/base partial
+writes, accepted but unflushed overwrites, concurrent discard, cancellation,
+sticky index failures and ordinary-export completeness. The presence harness
+separately records Open/index bytes, first read, 1,024 startup reads with latency
+percentiles, a warm repeat and complete active SnapshotView construction. Compare
+Open plus the first workload, not Open alone; these are block-layer measurements,
+not VM-to-business-ready timings. A sparse 30 GiB logical fixture does not validate
+30 GiB of actual payload.
 
 The benchmark driver records host/filesystem/build identity, raw logs, frontend
 and checkpoint p50/p95/p99, throughput including final Drain, physical data/index/
@@ -3081,7 +3130,8 @@ preparation is excluded; process peak RSS still includes that setup.
 
 The scaling driver removes each history before the next size. It reports
 checkpoint registration, control reopen and presence reconstruction separately;
-full resume includes rebuilding the presence bitmap and scales with mapped pages.
+its explicit full-scan measurement scales with mapped pages. V2 BlockCOW reopen
+now defers that work to accessed ranges or a later ordinary active export.
 The vhost helper freezes exactly 32 dirty pages (128 KiB) before writeback and
 reports template readiness, Drain, final materialization, metadata registration,
 capture total and reopen separately. Without the helper, registration samples

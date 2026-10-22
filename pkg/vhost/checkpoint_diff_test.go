@@ -142,8 +142,8 @@ func TestCheckpointCOWReopenPresenceCapacityAndIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer reopened.Close()
-	if reopened.DirtyCount() != 4 {
-		t.Fatalf("presence count=%d", reopened.DirtyCount())
+	if reopened.DirtyCount() != 0 || reopened.BackendStats()["diff_presence_complete"] != false {
+		t.Fatal("reopen eagerly resolved presence", reopened.BackendStats())
 	}
 	if !reopened.CanResumeCheckpoint("reopen") {
 		t.Fatal("continuation marker lost")
