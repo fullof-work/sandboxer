@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -25,6 +26,11 @@ import (
 
 func restoreCheckpointFixture(t *testing.T, encrypted ...bool) (Options, *openedSandboxSource, []byte) {
 	t.Helper()
+	return restoreCheckpointDiskFixture(t, len(encrypted) > 0 && encrypted[0], 0)
+}
+
+func restoreCheckpointDiskFixture(t *testing.T, encrypted bool, dataDisks int) (Options, *openedSandboxSource, []byte) {
+	t.Helper()
 	ctx := context.Background()
 	base := t.TempDir()
 	pathID := "different-path-id"
@@ -35,39 +41,56 @@ func restoreCheckpointFixture(t *testing.T, encrypted ...bool) (Options, *opened
 	}
 	sha := strings.Repeat("a", 64)
 	p := &config.PortableSandboxConfig{Version: 1, Resources: config.PortableResourcesConfig{Capacity: config.CapacityConfig{CPU: 1, Memory: "1GiB"}, Allocatable: config.AllocatableConfig{CPU: 1, Memory: "1GiB"}}, Boot: config.PortableBootConfig{Kernel: "file://vmlinux@digest:" + sha, Runtime: "file://runtime.bundle@digest:" + sha, Root: config.PortableRootConfig{Base: "self"}}, Launch: config.PortableLaunchConfig{Exec: "/bin/true", Workdir: "/", Restart: "never"}}
+	for i := 0; i < dataDisks; i++ {
+		name := fmt.Sprintf("data-%d", i)
+		p.Boot.Disks = append(p.Boot.Disks, config.PortableDiskConfig{Name: name})
+		p.Mounts = append(p.Mounts, config.MountConfig{Type: "disk", Source: name, Target: "/" + name})
+	}
 	p, err = p.Checkpointed("")
 	if err != nil {
 		t.Fatal(err)
 	}
 	var codec tarstream.Codec
 	key := [32]byte{0x31}
-	storeOpts := diffstore.Options{DiffID: "root", BaseID: artifact.DiffCheckpointBaseID(p.Boot.Root), LogicalSize: 8192}
-	if len(encrypted) > 0 && encrypted[0] {
+	if encrypted {
 		codec, err = manifestcrypto.NewTarStreamCodec(key)
 		if err != nil {
 			t.Fatal(err)
 		}
-		storeOpts.Key, storeOpts.RequireEncryption = &key, true
 	}
-	store, err := diffstore.Create(filepath.Join(dir, "diffs", "root.diff"), storeOpts)
-	if err != nil {
-		t.Fatal(err)
+	cp := &sandboxfile.Checkpoint{Version: 1, CheckpointID: "cp", Root: sandboxfile.CheckpointDisk{DiffID: "root"}, Disks: []sandboxfile.CheckpointNamedDisk{}}
+	roots := []config.PortableRootConfig{p.Boot.Root}
+	ids := []string{"root"}
+	for _, disk := range p.Boot.Disks {
+		roots = append(roots, disk.PortableRootConfig)
+		ids = append(ids, disk.Name)
+		cp.Disks = append(cp.Disks, sandboxfile.CheckpointNamedDisk{Name: disk.Name, DiffID: disk.Name})
 	}
 	contents := bytes.Repeat([]byte{0x46}, 8192)
 	binary.LittleEndian.PutUint16(contents[1024+0x38:], 0xef53)
-	if _, err := store.WriteAt(contents, 0); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.Checkpoint(ctx, "cp"); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.Close(); err != nil {
-		t.Fatal(err)
+	for i, root := range roots {
+		storeOpts := diffstore.Options{DiffID: ids[i], BaseID: artifact.DiffCheckpointBaseID(root), LogicalSize: int64(len(contents))}
+		if encrypted {
+			storeOpts.Key, storeOpts.RequireEncryption = &key, true
+		}
+		store, err := diffstore.Create(filepath.Join(dir, "diffs", ids[i]+".diff"), storeOpts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.WriteAt(contents, 0); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.Checkpoint(ctx, "cp"); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.Close(); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := owner.Close(); err != nil {
 		t.Fatal(err)
 	}
-	source, err := sandboxfile.BuildCheckpointSource(ctx, p, &sandboxfile.Checkpoint{Version: 1, CheckpointID: "cp", Root: sandboxfile.CheckpointDisk{DiffID: "root"}, Disks: []sandboxfile.CheckpointNamedDisk{}})
+	source, err := sandboxfile.BuildCheckpointSource(ctx, p, cp)
 	if err != nil {
 		t.Fatal(err)
 	}

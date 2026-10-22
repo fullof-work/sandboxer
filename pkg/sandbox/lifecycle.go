@@ -46,14 +46,15 @@ import (
 
 // RunOptions controls a single sandbox-ctl run invocation.
 type RunOptions struct {
-	EnableCheckpoint  bool
-	checkpointPlan    *CheckpointDiskPlan
-	checkpointStorage *artifact.ProcessStorage
-	checkpointOwner   *diffstore.DirectoryOwner
-	namedCheckpoint   bool
-	checkpointDir     string // runtime-owned checkpoint provenance; never serialized
-	usageSampler      *usage.Sampler
-	Cfg               *config.SandboxConfig
+	EnableCheckpoint         bool
+	checkpointPlan           *CheckpointDiskPlan
+	checkpointStorage        *artifact.ProcessStorage
+	checkpointOwner          *diffstore.DirectoryOwner
+	checkpointReleaseSources func() error
+	namedCheckpoint          bool
+	checkpointDir            string // runtime-owned checkpoint provenance; never serialized
+	usageSampler             *usage.Sampler
+	Cfg                      *config.SandboxConfig
 	// PortableConfig is immutable C0. nil selects projection from an explicit
 	// cold config; non-nil selects a Sandbox source and requires SourceBinding.
 	PortableConfig *config.PortableSandboxConfig
@@ -318,6 +319,7 @@ func Run(ctx context.Context, opts RunOptions) (code int, retErr error) {
 	shape.EnableCheckpoint = opts.EnableCheckpoint
 	shape.checkpointPlan = opts.checkpointPlan
 	shape.checkpointOwner = opts.checkpointOwner
+	shape.checkpointReleaseSources = opts.checkpointReleaseSources
 	shape.Console = opts.StdioMode.Console
 	shape.PingFatalThreshold = opts.PingFatalThreshold
 	shape.StatsJSONPath = opts.StatsJSONPath

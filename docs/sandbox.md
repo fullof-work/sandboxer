@@ -784,6 +784,24 @@ does not require this bitmap. Historical or
 cross-directory restore still materializes its selected version; its cost is not
 removed by lazy presence.
 
+Restore source readers are temporary. Same-directory hot restore and cold launch
+(CLI, SDK `Start`, and `StartRuntime` + `Launch`) retain the complete source set
+until the root and every data-disk writer have been opened and registered. They
+then close those source pins before reporting success. Historical/cross-directory
+restore, including a target without Checkpoint enabled, closes them after full
+materialization and its publisher Close succeed. The directory owner, active
+disks, borrowed storage access and materialized lower files keep their required
+runtime lifetimes. A pin-close failure fails startup; error cleanup also closes
+partially prepared resources, and repeated pin cleanup is safe.
+
+Releasing these readers does not delete a Checkpoint name or close another
+publisher's fixed view. Explicit Delete can remove name visibility while real
+export readers still protect its old pages. Once the last such reader closes,
+the existing GC can retire that protection and reclaim obsolete content without
+waiting for the resumed sandbox to exit. Until then, first writes to protected
+old pages may require CoW; already-private repeated overwrites do not. Delete is
+still not synchronous space reclamation.
+
 The expected benefit is largest when a large mapped index would otherwise be
 scanned but startup touches only a subset. A small sparse index is already cheap
 to scan, so lazy bookkeeping can instead increase the first workload's total
@@ -3102,7 +3120,10 @@ tests cover exact publication deletion, Bundle/external sources, rewriting,
 source-directory identity and same-directory versus materialized restore. The
 product case exercises root plus two data disks through cold boot, named capture,
 resume, concurrent fixed-version publication, historical/cross-directory restore
-and restoration after removing the original sources.
+and restoration after removing the original sources. It also queries the kernel
+OFD version-pin range after handoff, then exercises hot/cold restore, explicit
+Delete, continued writes, re-capture, publication and portable restore in plaintext
+and XTS modes. This distinguishes an empty List from an actually released reader.
 
 Lazy-presence regressions cover allocated zeros, unknown upper/base partial
 writes, accepted but unflushed overwrites, concurrent discard, cancellation,

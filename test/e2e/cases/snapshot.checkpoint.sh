@@ -168,6 +168,35 @@ for p in sorted(pathlib.Path(sys.argv[1]).glob('*.diff')):
     print(p.name, p.stat().st_ino)
 PY
 }
+assert_no_restore_pins() {
+    # Query the version-pin range on a new OFD without acquiring any lock.
+    # A live directory/writer owner must remain; only temporary source readers
+    # should have disappeared. A visible name alone cannot prove this handoff.
+    python3 - "$1/diffs" <<'PY'
+import fcntl, os, pathlib, struct, sys, time
+paths = sorted(pathlib.Path(sys.argv[1]).glob('*.diff.lock'))
+assert len(paths) >= 3, paths
+for path in paths:
+    fd = os.open(path, os.O_RDWR)
+    try:
+        query = struct.pack('hhqqii', fcntl.F_WRLCK, os.SEEK_SET, 16, 0, 0, 0)
+        deadline = time.monotonic() + 5
+        while True:
+            lock = fcntl.fcntl(fd, fcntl.F_OFD_GETLK, query)
+            kind = struct.unpack('hhqqii', lock)[0]
+            if kind == fcntl.F_UNLCK:
+                break
+            assert kind != fcntl.F_RDLCK, \
+                f'restore source pin still held after disk handoff: {path.name}'
+            # GC briefly probes the same range with a write lock. Wait for
+            # an unlocked observation; it must not hide a remaining reader.
+            assert kind == fcntl.F_WRLCK and time.monotonic() < deadline, \
+                f'version pin range remained locked after handoff: {path.name}'
+            time.sleep(0.01)
+    finally:
+        os.close(fd)
+PY
+}
 
 start cold "$PATH_ID" --config "$WORK/cold.yaml" --enable-checkpoint
 guest /bin/sh -c 'set -e; for f in /checkpoint-payload /scratch/checkpoint-payload /data/checkpoint-payload; do dd if=/dev/urandom of="$f" bs=1048576 count=16 2>/dev/null; done; sync'
@@ -232,6 +261,7 @@ guest /bin/sh -c 'set -e; for f in /checkpoint-payload /scratch/checkpoint-paylo
 wait "$PUB_B"
 wait "$PUB_A"
 PUBLISH_PIDS=()
+assert_no_restore_pins "$CP_DIR"
 assert_list "$PATH_ID" snapshot-b
 # Retry the original exact set after publication has already tombstoned it.
 DELETE_ARGS=()
@@ -251,6 +281,7 @@ stop_run
 # The active epoch changed, so a historical restore must allocate new identities.
 start historical "$PATH_ID" --config "$WORK/restore.yaml" --restore "$S_B" --enable-checkpoint
 check_hashes historical
+assert_no_restore_pins "$CP_DIR"
 capture snapshot historical-c
 finish_capture
 E_C="$(capture_path historical-c sandbox "$CP_DIR")"
@@ -278,6 +309,7 @@ stop_run
 # A different PathID also materializes versions, with checkpoint mode on or off.
 start cross-directory cross-slot --config "$WORK/restore.yaml" --restore "$S_B" --enable-checkpoint
 check_hashes cross-directory
+assert_no_restore_pins "$CP_DIR"
 capture snapshot cross-d
 finish_capture
 E_D="$(capture_path cross-d sandbox "$BASE_ROOT/cross-slot/checkpoint")"
@@ -288,6 +320,7 @@ check_hashes cross-recapture
 stop_run
 start mode-disabled legacy-slot --config "$WORK/restore.yaml" --restore "$S_B"
 check_hashes mode-disabled
+assert_no_restore_pins "$CP_DIR"
 set +e
 "$BIN/sandbox-ctl" export --path-id "$CURRENT_PATH" --run-root "$RUN_ROOT"     --checkpoint unsupported --resume >"$OUT/unsupported.log" 2>&1
 UNSUPPORTED_STATUS=$?
@@ -316,4 +349,55 @@ PY
 done
 mv "$BASE_ROOT/source-hidden" "$BASE_ROOT/$PATH_ID"
 mv "$WORK/root.img.hidden" "$WORK/root.img"
+
+# Explicit handoff/delete/re-capture flow through both hot and CLI cold restore.
+# Repeat with local XTS enabled; the runtime still owns the live disks after its
+# temporary restore readers disappear. Publication must produce a portable root.
+for policy in plain xts; do
+    PIN_PATH="pins-$policy"
+    CP_DIR="$BASE_ROOT/$PIN_PATH/checkpoint"
+    CRYPTO_ARGS=()
+    if [ "$policy" = xts ]; then
+        python3 - "$WORK/pins-crypto.yaml" <<'PY'
+import secrets, sys
+with open(sys.argv[1], 'w') as out:
+    out.write('manifest: { key: "' + secrets.token_hex(32) + '" }\n')
+    out.write('crypto: { chunk: aes, manifest: aes, local: auto }\n')
+PY
+        CRYPTO_ARGS=(--manifest-config "$WORK/pins-crypto.yaml")
+    fi
+    start "pins-cold-$policy" "$PIN_PATH" --config "$WORK/cold.yaml" --enable-checkpoint "${CRYPTO_ARGS[@]}"
+    guest /bin/sh -c 'for f in /handoff /scratch/handoff /data/handoff; do echo before-delete > "$f"; done; sync'
+    capture snapshot "pins-source-$policy"
+    finish_capture
+    PIN_S="$(capture_path "pins-source-$policy" snapshot "$CP_DIR")"
+    start "pins-hot-$policy" "$PIN_PATH" --config "$WORK/restore.yaml" --restore "$PIN_S" --enable-checkpoint "${CRYPTO_ARGS[@]}"
+    assert_no_restore_pins "$CP_DIR"
+    guest /bin/sh -c 'for f in /handoff /scratch/handoff /data/handoff; do grep -qx before-delete "$f" || exit 1; done'
+    capture snapshot "pins-cold-source-$policy"
+    finish_capture
+    PIN_E="$(capture_path "pins-cold-source-$policy" sandbox "$CP_DIR")"
+    start "pins-from-$policy" "$PIN_PATH" --config "$WORK/restore.yaml" --from "$PIN_E" --enable-checkpoint "${CRYPTO_ARGS[@]}"
+    assert_no_restore_pins "$CP_DIR"
+    for version in "pins-source-$policy" "pins-cold-source-$policy"; do
+        "$BIN/sandbox-ctl" checkpoint delete --path-id "$PIN_PATH" --run-root "$RUN_ROOT" \
+            --checkpoint "$version" --json >"$OUT/delete-$version.json"
+    done
+    assert_list "$PIN_PATH" ""
+    guest /bin/sh -c 'for f in /handoff /scratch/handoff /data/handoff; do grep -qx before-delete "$f" || exit 1; echo after-delete > "$f"; done; sync'
+    capture snapshot "pins-after-delete-$policy"
+    finish_capture
+    PIN_S="$(capture_path "pins-after-delete-$policy" snapshot "$CP_DIR")"
+    "$BIN/sandbox-ctl" publish --json "${CRYPTO_ARGS[@]}" \
+        --to-ref-location "portable=file://$WORK/pins-published-$policy" "$PIN_S" >"$OUT/pins-published-$policy.json"
+    PIN_REF="$(python3 - "$OUT/pins-published-$policy.json" <<'PY'
+import json, sys
+print(json.load(open(sys.argv[1]))['snapshotRef'])
+PY
+)"
+    start "pins-portable-$policy" "pins-portable-$policy" --config "$WORK/restore.yaml" --restore "$PIN_REF" \
+        --ref-location "portable=file://$WORK/pins-published-$policy" "${CRYPTO_ARGS[@]}"
+    guest /bin/sh -c 'for f in /handoff /scratch/handoff /data/handoff; do grep -qx after-delete "$f" || exit 1; done'
+    stop_run
+done
 echo "PASS snapshot.checkpoint.sh"
