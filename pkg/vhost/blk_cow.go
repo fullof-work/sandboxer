@@ -429,13 +429,11 @@ func (c *BlockCOW) writeAt(ctx context.Context, buf []byte, offset int64) (int, 
 // The worker never takes the caller's block stripe, including while it waits.
 func (c *BlockCOW) writeBlockLocked(ctx context.Context, buf []byte, offset, blk int64) (int, error) {
 	start := blk * c.blockSize
-	// A complete overwrite needs no old payload or presence lookup. Its accepted
-	// cache page becomes known-present; the store still protects retained roots
-	// when writeback commits the mapping.
-	if offset != start || int64(len(buf)) != c.blockSize {
-		if err := c.resolvePresenceLocked(ctx, blk, blk); err != nil {
-			return 0, err
-		}
+	// Validate unknown index metadata before accepting any mutation, including
+	// complete overwrites. Known blocks keep the fast path, and complete writes
+	// still initialize the cache page without reading the old payload.
+	if err := c.resolvePresenceLocked(ctx, blk, blk); err != nil {
+		return 0, err
 	}
 	upper := c.blockDirty(blk)
 	return c.cache.write(ctx, c, buf, offset, blk, upper, func(page []byte) error {
@@ -754,7 +752,11 @@ func (c *BlockCOW) Discard(offset, length int64) error {
 	for blk := startBlk; blk < endBlk; blk++ {
 		lock := c.blockLock(blk)
 		lock.Lock()
-		err := c.cache.discard(ctx, c, blk)
+		// A discarded mapping must pass the same metadata validation as a write.
+		err := c.resolvePresenceLocked(ctx, blk, blk)
+		if err == nil {
+			err = c.cache.discard(ctx, c, blk)
+		}
 		if err == nil {
 			c.markMaterialResolved(blk)
 		}

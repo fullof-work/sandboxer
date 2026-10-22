@@ -124,6 +124,11 @@ func openCheckpointDiff(path string, init DiffInit, options blockCOWOptions) (*d
 			return nil, nil, err
 		}
 		info := store.Info()
+		// Info resolves Current and records metadata failures in store health.
+		// Lazy presence no longer runs Scan/healthy before cache attachment.
+		if err := store.Err(); err != nil {
+			return nil, nil, errors.Join(fmt.Errorf("vhost: inspect checkpoint diff: %w", err), store.Close())
+		}
 		if info.DiffID != options.checkpoint.diffID || info.BaseID != options.checkpoint.baseID {
 			return nil, nil, errors.Join(fmt.Errorf("vhost: checkpoint identity/base mismatch"), store.Close())
 		}

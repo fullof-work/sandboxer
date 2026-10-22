@@ -149,8 +149,8 @@ func TestCheckpointLazyPresenceAcceptedWriteWins(t *testing.T) {
 	if _, err := cow.WriteAt(page, cowBlockSize); err != nil {
 		t.Fatal(err)
 	}
-	if calls.Load() != 0 {
-		t.Fatal("full overwrite queried old presence")
+	if calls.Load() != 1 {
+		t.Fatal("full overwrite did not validate unknown index metadata", calls.Load())
 	}
 	copy(want[cowBlockSize:], page)
 	// The query includes a known cached write between two unknown blocks. The
@@ -166,6 +166,63 @@ func TestCheckpointLazyPresenceAcceptedWriteWins(t *testing.T) {
 	upper, err := io.ReadAll(view)
 	if err != nil || !bytes.Equal(upper[cowBlockSize:2*cowBlockSize], page) || !bytes.Equal(upper[519*cowBlockSize:], want[519*cowBlockSize:]) {
 		t.Fatal("full scan hid accepted write or untouched tail", err)
+	}
+}
+
+func TestCheckpointLazyPresenceMutationMetadataOnly(t *testing.T) {
+	for _, encrypted := range []bool{false, true} {
+		for _, operation := range []string{"full-write", "discard"} {
+			t.Run(fmt.Sprintf("encrypted=%t/%s", encrypted, operation), func(t *testing.T) {
+				cow, _ := reopenPresenceCOW(t, encrypted)
+				base := &presenceCountedBase{fakeReader: *cow.base.(*fakeReader)}
+				cow.base = base
+				backend, err := cow.checkpointBackend()
+				if err != nil {
+					t.Fatal(err)
+				}
+				before := backend.store.Stats().DataRead
+				var calls atomic.Int64
+				cow.diff.backend = &presenceHookBackend{diffBackend: backend, hook: func(ctx context.Context, start uint64, present []bool) error {
+					calls.Add(1)
+					if len(present) != 1 {
+						t.Errorf("mutation queried %d blocks, want one", len(present))
+					}
+					return backend.presence(ctx, start, present)
+				}}
+				page := bytes.Repeat([]byte{0xc7}, cowBlockSize)
+				// Cover an unknown hole and an unknown upper page, then repeat each
+				// mutation to prove that known blocks need no further index query.
+				for _, block := range []int64{1, 2} {
+					for repeat := 0; repeat < 2; repeat++ {
+						if operation == "full-write" {
+							_, err = cow.WriteAt(page, block*cowBlockSize)
+						} else {
+							err = cow.Discard(block*cowBlockSize, cowBlockSize)
+						}
+						if err != nil {
+							t.Fatal(err)
+						}
+						if got := calls.Load(); got != block {
+							t.Fatalf("block %d repeat %d: presence queries=%d want=%d", block, repeat, got, block)
+						}
+					}
+				}
+				if err := cow.Drain(context.Background()); err != nil {
+					t.Fatal(err)
+				}
+				if got := backend.store.Stats().DataRead; got != before || base.reads.Load() != 0 {
+					t.Fatalf("%s read old payload: upper bytes=%d base reads=%d", operation, got-before, base.reads.Load())
+				}
+				want := bytes.Repeat([]byte{0x61}, 2*cowBlockSize)
+				if operation == "full-write" {
+					want = bytes.Repeat([]byte{0xc7}, 2*cowBlockSize)
+				}
+				got := make([]byte, len(want))
+				if _, err := cow.ReadAt(got, cowBlockSize); err != nil || !bytes.Equal(got, want) {
+					t.Fatal("mutation result differs", err)
+				}
+			})
+		}
 	}
 }
 

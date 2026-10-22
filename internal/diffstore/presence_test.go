@@ -142,7 +142,8 @@ func TestPresenceReadsOnlyRequestedIndexRange(t *testing.T) {
 		}
 	}
 	after := s.Stats()
-	if read := after.IndexRead - before.IndexRead; read > 3*PageSize {
+	// Three intersecting leaves plus the immediate successor boundary.
+	if read := after.IndexRead - before.IndexRead; read > 4*PageSize {
 		t.Fatalf("bounded range read %d index bytes", read)
 	}
 	if after.DataRead != 0 {

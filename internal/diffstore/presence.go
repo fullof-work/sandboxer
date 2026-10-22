@@ -69,6 +69,14 @@ func (s *Store) presenceRange(ctx context.Context, slot, start, end uint64, pres
 		return err
 	}
 	i := sort.Search(len(n.entries), func(i int) bool { return n.entries[i].key >= start })
+	if !n.leaf && i > 0 {
+		// A checksummed separator can still understate its child's maximum.
+		// Validate the skipped predecessor down to its rightmost leaf before
+		// trusting an absence, including searches beyond the final separator.
+		if err := s.presenceBoundary(ctx, n, i-1, lower, depth+1, true); err != nil {
+			return err
+		}
+	}
 	for ; i < len(n.entries); i++ {
 		e := n.entries[i]
 		if n.leaf {
@@ -89,7 +97,41 @@ func (s *Store) presenceRange(ctx context.Context, slot, start, end uint64, pres
 			return err
 		}
 	}
+	if !n.leaf && i < len(n.entries) {
+		// Likewise a successor's leftmost leaf must not hide mappings below
+		// its declared lower bound, inside the range just reported as holes.
+		if err := s.presenceBoundary(ctx, n, i, lower, depth+1, false); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+// presenceBoundary checks only an adjacent subtree's extreme path. Each visited
+// internal node checks at most two such paths, each capped by maxDepth;
+// this never expands into a whole-tree scan or reads payload pages.
+func (s *Store) presenceBoundary(ctx context.Context, parent node, index int, lower uint64, depth int, right bool) error {
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if index > 0 {
+			lower = parent.entries[index-1].key + 1
+		}
+		e := parent.entries[index]
+		n, err := s.activeRangeNode(e.slot, lower, e.key, depth)
+		if err != nil {
+			return err
+		}
+		if n.leaf {
+			return nil
+		}
+		parent, index = n, 0
+		if right {
+			index = len(n.entries) - 1
+		}
+		depth++
+	}
 }
 
 func (s *Store) activeRangeNode(slot, lower, upper uint64, depth int) (node, error) {

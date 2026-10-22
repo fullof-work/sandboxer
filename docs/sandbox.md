@@ -762,13 +762,22 @@ It does not promise constant total pause time, universal speedups, or guest-data
 durability across host crashes/power loss beyond the existing FLUSH contract.
 
 Reopening an existing v2 DIFF resolves upper presence on demand. Writer ownership,
-identity/key/capacity checks, committed redo replay and root-page validation finish
+identity/key/capacity checks, committed redo replay, root-page validation and
+current-checkpoint metadata health checks finish
 before Open returns; a full index scan is no longer on the same-directory resume
 path. Unknown blocks are distinct from holes. Reads and partial writes query the
-current index in ranges of at most 256 blocks (1 MiB); complete page overwrites
-publish their cached contents directly. Accepted writes and discards take priority
-over index answers. A discovered index error is fatal, never a fallback to base.
+current index in ranges of at most 256 blocks (1 MiB). Complete page overwrites
+also validate unknown metadata before publishing their cached contents, but do
+not read old payload; Discard validates unknown ranges before removing mappings.
+Accepted writes and discards take priority
+over index answers. Queries also validate the relevant predecessor/successor
+subtree boundaries through bounded edge paths, rejecting inconsistent adjacent
+bounds even when their page checksums are valid.
+A discovered index error is fatal, never a fallback to base.
 Child-node corruption may therefore be detected on first access rather than Open.
+This checks visited paths and adjacent boundaries, not the whole tree. Arbitrary
+logical corruption in unvisited subtrees can remain undetected until those paths
+are traversed or a full scan runs; lazy Open is not a full-tree integrity audit.
 
 There is no background full-disk prefetch. The first access to an unknown range
 pays its index lookup; locality and storage latency determine that cost. One extra
