@@ -35,12 +35,13 @@ type Quiescer interface {
 
 // Sources gathers the inputs Take needs.
 type Sources struct {
-	Context    context.Context
-	SandboxID  string // <sid> for output filename / symlink
-	APISock    string // CH api socket
-	MemfdFD    int    // memfd backing the zone (read-only here; CH is paused)
-	MemfdSize  int64  // ramSize
-	StagingDir string // CH /vm.snapshot dest for config.json/state.json (caller creates+removes)
+	CheckpointID string
+	Context      context.Context
+	SandboxID    string // <sid> for output filename / symlink
+	APISock      string // CH api socket
+	MemfdFD      int    // memfd backing the zone (read-only here; CH is paused)
+	MemfdSize    int64  // ramSize
+	StagingDir   string // CH /vm.snapshot dest for config.json/state.json (caller creates+removes)
 
 	// Diffs are the logical disks' writable diffs to capture, in order: Diffs[0]
 	// is the root, Diffs[1:] are the boot.disks[] data disks (boot.disks[]
@@ -87,10 +88,15 @@ type Sources struct {
 // re-export), is the parent's already-resolved, scheme-qualified local overlay
 // ref this disk's delta is flattened onto (replace, not stack).
 type DiskDiff struct {
-	Path         string
-	Owned        bool
-	MergeBase    string
-	SnapshotView func() (io.ReadSeeker, []sparse.Extent, error)
+	DiffID           string
+	Checkpoint       func(context.Context, string) error
+	DeleteCheckpoint func(context.Context, string) error
+	WaitMaterialized func(context.Context) error
+	Export           func(context.Context) (ExportView, error)
+	Path             string
+	Owned            bool
+	MergeBase        string
+	SnapshotView     func() (io.ReadSeeker, []sparse.Extent, error)
 	// WaitReady resolves transient writable-diff initialization before the VM is paused.
 	WaitReady func(context.Context) error
 	// CheckError rechecks asynchronous COW failures, including after the last read.
@@ -122,6 +128,8 @@ type Outputs struct {
 // sink (FileSink for --output, IngestSink for --upload, or BundleSink). Take
 // closes it on every return path.
 func Take(s Sources, sink ArtifactSink, resumeAfter bool) (_ *Outputs, retErr error) {
+	checkpointState := &checkpointCapture{id: s.CheckpointID}
+	defer func() { retErr = errors.Join(retErr, checkpointState.close()) }()
 	sinkOpen := sink != nil
 	defer func() {
 		if sinkOpen {
@@ -162,7 +170,7 @@ func Take(s Sources, sink ArtifactSink, resumeAfter bool) (_ *Outputs, retErr er
 	for i := range s.Diffs {
 		merged[i] = s.Diffs[i].MergeBase != ""
 	}
-	if err := ValidateExportGraph(s.PortableConfig, s.ParentSandboxRef, merged); err != nil {
+	if err := validateCaptureGraph(s.CheckpointID, s.PortableConfig, s.ParentSandboxRef, merged, s.Diffs); err != nil {
 		return nil, fmt.Errorf("snapshot prospective C1: %w", err)
 	}
 	if sink == nil {
@@ -224,6 +232,7 @@ func Take(s Sources, sink ArtifactSink, resumeAfter bool) (_ *Outputs, retErr er
 	// freeze remains held. E is a dependency, not yet the operation root.
 	dumpStart := time.Now()
 	sandboxOut, err := captureSandboxAtFreeze(ctx, ExportSources{
+		CheckpointID: s.CheckpointID, checkpointState: checkpointState,
 		SandboxID: s.SandboxID, PortableConfig: s.PortableConfig,
 		ParentSandboxRef: s.ParentSandboxRef, Diffs: s.Diffs,
 		LocalCodec: s.LocalCodec, LocalRequired: s.LocalRequired,
@@ -302,6 +311,7 @@ func Take(s Sources, sink ArtifactSink, resumeAfter bool) (_ *Outputs, retErr er
 	if err := checkDiskCapture(ctx, s.Diffs); err != nil {
 		return nil, err
 	}
+	checkpointState.retain = true
 	if err := sink.CommitSnapshot(ctx, out.SnapshotRef, out.SnapshotPath); err != nil {
 		return nil, fmt.Errorf("commit Snapshot S: %w", err)
 	}
@@ -346,13 +356,16 @@ func absorbOverlay(ctx context.Context, sink ArtifactSink, d DiskDiff, merging b
 	return absorbOverlayWithOpener(ctx, sink, d, merging, codec, required, nil)
 }
 
-func absorbOverlayWithOpener(ctx context.Context, sink ArtifactSink, d DiskDiff, merging bool, codec tarstream.Codec, required bool, opener MergeBaseOpener) (string, string, error) {
+func absorbOverlayWithOpener(ctx context.Context, sink ArtifactSink, d DiskDiff, merging bool, codec tarstream.Codec, required bool, opener MergeBaseOpener) (_ string, _ string, retErr error) {
 	if d.SnapshotView == nil {
 		return "", "", fmt.Errorf("snapshot diff %s has no snapshot view", d.Path)
 	}
 	diff, overlayHoles, err := d.SnapshotView()
 	if err != nil {
 		return "", "", fmt.Errorf("snapshot view %s: %w", d.Path, err)
+	}
+	if closer, ok := diff.(io.Closer); ok {
+		defer func() { retErr = errors.Join(retErr, closer.Close()) }()
 	}
 	size, err := seekerSize(diff)
 	if err != nil {

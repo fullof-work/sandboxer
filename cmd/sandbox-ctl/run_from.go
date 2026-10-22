@@ -62,6 +62,10 @@ func openSandboxRunSource(ctx context.Context, raw string, storage *artifact.Pro
 		source.PortableRef = ref.String()
 		source.RuntimeRef = ref.String()
 	case manifest.RefSchemeFile:
+		path, err = filepath.EvalSymlinks(path)
+		if err != nil {
+			return nil, fmt.Errorf("resolve Sandbox source: %w", err)
+		}
 		opened, err := storage.OpenFileWithLocations(ctx, path, ref, locations)
 		if err != nil {
 			return nil, fmt.Errorf("open Sandbox file: %w", err)

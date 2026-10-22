@@ -57,6 +57,7 @@ type Root struct {
 	RuntimeConfig []byte
 	Portable      *config.PortableSandboxConfig
 	ArchiveBase   uint64
+	Checkpoint    *Checkpoint
 
 	owner *streamOwner
 }
@@ -108,7 +109,12 @@ func Open(ctx context.Context, stream fetch.Stream) (*Root, error) {
 		return fail(err)
 	}
 	runtimeBytes := archive.bodies[config.SandboxRuntimeConfigName]
-	portable, err := config.ParsePortableSandboxConfig(runtimeBytes)
+	checkpointBytes, hasCheckpoint := archive.bodies[CheckpointName]
+	parseConfig := config.ParsePortableSandboxConfig
+	if hasCheckpoint {
+		parseConfig = config.ParseCheckpointSandboxConfig
+	}
+	portable, err := parseConfig(runtimeBytes)
 	if err != nil {
 		return fail(fmt.Errorf("sandbox %s: %w", config.SandboxRuntimeConfigName, err))
 	}
@@ -118,6 +124,16 @@ func Open(ctx context.Context, stream fetch.Stream) (*Root, error) {
 	}
 	if !bytes.Equal(canonical, runtimeBytes) {
 		return fail(fmt.Errorf("sandbox %s is not canonically encoded", config.SandboxRuntimeConfigName))
+	}
+	var checkpoint *Checkpoint
+	if hasCheckpoint {
+		checkpoint, err = ParseCheckpoint(checkpointBytes, portable)
+		if err != nil {
+			return fail(err)
+		}
+		if archive.base != 0 {
+			return fail(errors.New("sandbox Checkpoint layout must not contain a root payload"))
+		}
 	}
 	imageConfig, hasImage := archive.bodies[ImageConfigName]
 	if hasImage {
@@ -134,7 +150,7 @@ func Open(ctx context.Context, stream fetch.Stream) (*Root, error) {
 		if erofsSize != archive.base {
 			return fail(fmt.Errorf("sandbox EROFS payload size %d does not equal ZIP archive base %d", erofsSize, archive.base))
 		}
-	} else {
+	} else if !hasCheckpoint {
 		if portable.Boot.Root.Base == "self" && portable.Boot.Root.Overlay != nil && portable.Boot.Root.Overlay.Base == "" {
 			return fail(errors.New("sandbox direct EROFS graph is missing config.json"))
 		}
@@ -152,7 +168,7 @@ func Open(ctx context.Context, stream fetch.Stream) (*Root, error) {
 	return &Root{
 		FullStream: full, Payload: payload, ImageConfig: append([]byte(nil), imageConfig...),
 		RuntimeConfig: append([]byte(nil), runtimeBytes...), Portable: portable,
-		ArchiveBase: archive.base, owner: owner,
+		ArchiveBase: archive.base, Checkpoint: checkpoint, owner: owner,
 	}, nil
 }
 
@@ -184,6 +200,9 @@ func PayloadIfSandbox(ctx context.Context, stream fetch.Stream, required bool) (
 	root, err := Open(ctx, stream)
 	if err != nil {
 		return nil, false, err
+	}
+	if root.Checkpoint != nil {
+		return nil, true, errors.Join(errors.New("sandbox Checkpoint requires local version materialization"), root.Close())
 	}
 	return root.Payload, true, nil
 }
@@ -388,6 +407,12 @@ func exactEntryOrder(entries map[string][]byte) ([]string, error) {
 		return []string{config.SandboxRuntimeConfigName}, nil
 	}
 	if len(entries) == 2 {
+		if _, ok := entries[CheckpointName]; ok {
+			if _, ok := entries[config.SandboxRuntimeConfigName]; !ok {
+				return nil, errors.New("sandbox Checkpoint layout requires sandbox.runtime.cfg")
+			}
+			return []string{CheckpointName, config.SandboxRuntimeConfigName}, nil
+		}
 		if _, ok := entries[ImageConfigName]; !ok {
 			return nil, errors.New("sandbox ZIP EROFS layout is missing config.json")
 		}
@@ -413,11 +438,20 @@ func parseStrictArchive(ctx context.Context, stream fetch.Stream) (*parsedArchiv
 	switch footer.Count {
 	case 1:
 	case 2:
+		actual, _, err := tailzip.Names(ctx, tailReaderAt{ctx: ctx, stream: stream}, stream.Size(), 2, 128<<10)
+		if err != nil {
+			return nil, err
+		}
 		names = []string{ImageConfigName, config.SandboxRuntimeConfigName}
+		for _, name := range actual {
+			if name == CheckpointName {
+				names = []string{CheckpointName, config.SandboxRuntimeConfigName}
+			}
+		}
 	default:
 		return nil, fmt.Errorf("sandbox ZIP has %d entries (want 1 or 2)", footer.Count)
 	}
-	base, bodies, err := tailzip.ReadCanonical(ctx, tailReaderAt{ctx: ctx, stream: stream}, stream.Size(), names, map[string]int{ImageConfigName: MaxImageConfigBytes, config.SandboxRuntimeConfigName: config.MaxPortableConfigBytes})
+	base, bodies, err := tailzip.ReadCanonical(ctx, tailReaderAt{ctx: ctx, stream: stream}, stream.Size(), names, map[string]int{ImageConfigName: MaxImageConfigBytes, CheckpointName: MaxImageConfigBytes, config.SandboxRuntimeConfigName: config.MaxPortableConfigBytes})
 	if err != nil {
 		return nil, fmt.Errorf("sandbox ZIP: %w", err)
 	}

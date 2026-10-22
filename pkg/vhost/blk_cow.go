@@ -71,7 +71,21 @@ func OpenBlockCOW(diffPath string, base BlockReader, init DiffInit, rawOptions .
 	var diff *diffFile
 	var fresh *freshDiffInit
 	var bitmap []uint64
-	if !init.Existing && init.TemplatePath != "" {
+	if options.checkpoint != nil {
+		diff, fresh, err = openCheckpointDiff(diffPath, init, options)
+		if err != nil {
+			return nil, err
+		}
+		bitmap, err = diff.scanDirtyBlocks()
+		if err != nil {
+			if fresh != nil {
+				_ = fresh.abort()
+			} else {
+				_ = diff.Close()
+			}
+			return nil, fmt.Errorf("vhost: rebuild checkpoint bitmap: %w", err)
+		}
+	} else if !init.Existing && init.TemplatePath != "" {
 		fresh, err = createFreshDiffFile(diffPath, init, options.encryption)
 		if err != nil {
 			return nil, err
@@ -167,13 +181,17 @@ func (c *BlockCOW) DirtyCount() int {
 func (c *BlockCOW) BackendStats() map[string]any {
 	dirty := c.DirtyCount()
 	total := c.size / c.blockSize
-	return map[string]any{
+	stats := map[string]any{
 		"diff_dirty_blocks":  dirty,
 		"diff_cow_cache":     c.cache.Stats(),
 		"diff_total_blocks":  total,
 		"diff_block_bytes":   c.blockSize,
 		"diff_dirty_percent": fmt.Sprintf("%.2f", float64(dirty)*100/float64(total)),
 	}
+	if d, err := c.checkpointBackend(); err == nil {
+		stats["diff_checkpoint_store"] = d.store.Stats()
+	}
+	return stats
 }
 
 func popcount64(x uint64) int {
@@ -341,6 +359,11 @@ func (c *BlockCOW) writeAt(ctx context.Context, buf []byte, offset int64) (int, 
 	defer c.end(endOp)
 	if offset < 0 || offset > c.size || int64(len(buf)) > c.size-offset {
 		return 0, fmt.Errorf("vhost: write out of bounds: offset=%d len=%d size=%d", offset, len(buf), c.size)
+	}
+	if len(buf) != 0 {
+		if err := c.markModified(ctx); err != nil {
+			return 0, err
+		}
 	}
 	written := 0
 	for written < len(buf) {
@@ -528,6 +551,11 @@ func (c *BlockCOW) materializeTemplate(ctx context.Context) error {
 	}
 	block := make([]byte, cowBlockSize)
 	defer clear(block)
+	var checkpointStaging []byte
+	if c.diff.backend != nil {
+		checkpointStaging = make([]byte, maxWritebackPages*cowBlockSize)
+		defer clear(checkpointStaging)
+	}
 	for offset := uint64(0); offset < template.Size(); {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -543,6 +571,13 @@ func (c *BlockCOW) materializeTemplate(ctx context.Context) error {
 		if run.Kind() != sparse.Hole {
 			start := uint64(int64(offset) / cowBlockSize * cowBlockSize)
 			seedEnd := uint64(alignUp(int64(end), cowBlockSize))
+			if c.diff.backend != nil {
+				if err := c.materializeCheckpointRange(ctx, template, start, seedEnd, checkpointStaging); err != nil {
+					return err
+				}
+				offset = end
+				continue
+			}
 			for pos := start; pos < seedEnd; pos += cowBlockSize {
 				if err := ctx.Err(); err != nil {
 					return err
@@ -634,6 +669,11 @@ func (c *BlockCOW) Err() error {
 	if err := c.cache.Err(); err != nil {
 		return err
 	}
+	if c.diff.backend != nil {
+		if err := c.diff.backend.err(); err != nil {
+			return err
+		}
+	}
 	return c.lifeCtx.Err()
 }
 func (c *BlockCOW) SetFatalHandler(report func(error)) { c.cache.SetFatalHandler(report) }
@@ -670,6 +710,9 @@ func (c *BlockCOW) Discard(offset, length int64) error {
 		return nil
 	}
 
+	if err := c.markModified(ctx); err != nil {
+		return err
+	}
 	for blk := startBlk; blk < endBlk; blk++ {
 		lock := c.blockLock(blk)
 		lock.Lock()
@@ -693,7 +736,15 @@ func (c *BlockCOW) Discard(offset, length int64) error {
 // Snapshot orchestration calls this after quiescing every vhost backend, so the
 // dirty block contents stay stable for the view's lifetime.
 func (c *BlockCOW) SnapshotView() (io.ReadSeeker, []sparse.Extent, error) {
-	if err := c.WaitMaterialized(context.Background()); err != nil {
+	view, holes, err := c.activeView(context.Background())
+	if err != nil {
+		return nil, nil, err
+	}
+	return io.NewSectionReader(view, 0, c.size), holes, nil
+}
+
+func (c *BlockCOW) activeView(ctx context.Context) (*cowSnapshotReaderAt, []sparse.Extent, error) {
+	if err := c.WaitMaterialized(ctx); err != nil {
 		return nil, nil, err
 	}
 	_, endOp, err := c.begin(nil)
@@ -706,7 +757,7 @@ func (c *BlockCOW) SnapshotView() (io.ReadSeeker, []sparse.Extent, error) {
 	c.bitmapMu.RUnlock()
 
 	view := &cowSnapshotReaderAt{cow: c, bitmap: bitmap}
-	return io.NewSectionReader(view, 0, c.size), snapshotHoles(bitmap, c.size), nil
+	return view, snapshotHoles(bitmap, c.size), nil
 }
 
 type cowSnapshotReaderAt struct {

@@ -1,7 +1,10 @@
 package artifact
 
 import (
+	"context"
 	"encoding/hex"
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
+	"github.com/kuasar-sandbox/accelerator/pkg/store"
 	"strings"
 	"testing"
 
@@ -134,3 +137,84 @@ func TestProcessStorageLocalOnlyCloseDoesNotDialOrResolveKey(t *testing.T) {
 		t.Fatalf("second close: %v", err)
 	}
 }
+
+func TestProcessStorageExplicitLocalAccessWithoutManifest(t *testing.T) {
+	key := [32]byte{0x31}
+	codec, err := manifestcrypto.NewTarStreamCodec(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	storage, err := NewProcessStorageWithLocalAccess(nil, func() ([32]byte, error) { calls++; return key, nil }, codec, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer storage.Close()
+	if storage.Fetcher() != nil || storage.LocalCodec() != codec || !storage.LocalRequired() {
+		t.Fatal("explicit local access policy changed")
+	}
+	for range 2 {
+		got, err := storage.CustomerKeyFunc()()
+		if err != nil || got != key {
+			t.Fatalf("customer key: %x %v", got, err)
+		}
+	}
+	if calls != 1 {
+		t.Fatalf("key resolved %d times", calls)
+	}
+	if _, err := NewProcessStorageWithLocalAccess(nil, nil, codec, true); err == nil {
+		t.Fatal("codec accepted without key")
+	}
+	if _, err := NewProcessStorageWithLocalAccess(nil, nil, nil, true); err == nil {
+		t.Fatal("required accepted without codec")
+	}
+}
+
+type closeCountingFetcher struct {
+	fetch.Fetcher
+	closes int
+}
+
+func (f *closeCountingFetcher) Close() error { f.closes++; return nil }
+
+func TestProcessStorageBorrowPreservesAccessWithoutTakingOwnership(t *testing.T) {
+	cfg := &config.ManifestConfig{}
+	customer := func() ([32]byte, error) { return [32]byte{1}, nil }
+	external := &closeCountingFetcher{}
+	storage, err := NewProcessStorageWithLocalAccess(cfg, customer, nil, false, external)
+	if err != nil {
+		t.Fatal(err)
+	}
+	borrowed := storage.Borrow()
+	if borrowed.ManifestConfig() != cfg || borrowed.Fetcher() != external || borrowed.CustomerKeyFunc() == nil {
+		t.Fatal("borrow lost an opaque access capability")
+	}
+	if err := borrowed.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := storage.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if external.closes != 0 {
+		t.Fatal("borrowed client ownership was transferred")
+	}
+	owned := &closeCountingFetcher{}
+	original := &ProcessStorage{cfg: cfg, keyFn: customer, fetcher: &onDemandManifestFetcher{inner: owned, closer: owned}}
+	if err := original.Borrow().Close(); err != nil {
+		t.Fatal(err)
+	}
+	if owned.closes != 0 {
+		t.Fatal("borrower closed original storage client")
+	}
+	if err := original.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if owned.closes != 1 {
+		t.Fatal("original storage did not close its owned client")
+	}
+}
+
+// Compile-time coverage of the borrowed manifest access capability.
+var _ interface {
+	OpenManifest(context.Context, store.ContentKey) (fetch.Stream, error)
+} = (*closeCountingFetcher)(nil)

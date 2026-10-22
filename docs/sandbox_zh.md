@@ -85,6 +85,7 @@ sandbox-ctl config
 sandbox-ctl info
 sandbox-ctl publish
 sandbox-ctl upload-snapshot
+sandbox-ctl checkpoint list|delete
 ```
 
 `upload-snapshot` 是 `publish` 的 thin compatibility alias,两者调用同一 publisher 和 graph traversal.
@@ -588,6 +589,94 @@ native journal I/O 是同步的；这里不是异步队列，也不承诺非阻�
 协议参考：[Journal Native Protocol](https://systemd.io/JOURNAL_NATIVE_PROTOCOL/) 和
 [Go net/url](https://pkg.go.dev/net/url)。
 
+### 2.11 本地磁盘 Checkpoint
+
+本地磁盘 Checkpoint 需要显式启用。先在启动时选择存储后端，再逐次选择捕获方式：
+
+```bash
+sandbox-ctl run --config sandbox.yaml --sandbox-id demo --path-id worker \
+  --base-root /var/lib/sandbox --enable-checkpoint
+sandbox-ctl snapshot --path-id worker --checkpoint cp-001 --json
+# 只需磁盘和配置时改用 export；捕获后继续运行时添加 --resume。
+```
+
+`PathID` 默认等于 `SandboxID`。`--config`、`--from` 和 `--restore` 都沿用
+`CheckpointDir = BaseRoot/PathID/checkpoint`；根盘和数据盘的可写文件位于
+`CheckpointDir/diffs/<DiffID>.diff`，正常退出后保留。不增加第二个启动目录配置。
+新启动分配新的磁盘身份。已有 raw/v1 可写 DIFF 不会被隐式接管；需要其内容时按模板
+导入。显式指定派生目录之外的可写路径，或文件系统不支持所需锁操作，会在启动前失败。
+
+启用后端不会改变默认捕获：不带 `--checkpoint` 的 snapshot/export 仍复制磁盘内容。
+非空 `--checkpoint` 在同一捕获屏障内为全部可写磁盘创建这个 ID。允许
+`--mode local|bundle`，不允许与 `--upload` 或 `export --from` 组合。省略
+`--output` 时由运行 owner 提供目录；显式输出必须是同一派生目录。普通捕获仍必须
+指定 `--output` 或 `--upload`。默认结束 VM；`--resume` 继续原运行基线。
+运行实例不支持该能力时，CLI 返回专用状态码 **78**。
+
+返回的 `sandboxRef` 用于 `run --from`，`snapshotRef` 用于 `run --restore`。
+报告中只有文件名的引用必须相对真实输出目录解析。恢复先 pin 全部来源版本，再取得
+目标目录 owner。启用 `--enable-checkpoint` 且真实目录相同时，只有每个磁盘的身份、
+不可变 base 图、逻辑容量及活动 epoch 都仍与捕获相符，才重开已有 DIFF。捕获后发生
+写入、目标目录不同或未启用后端时，会先把固定版本物化为普通 lower 产物。冷启动保留
+调用者覆盖；内存恢复沿用已有执行状态规则。来源路径与目标 BaseRoot/PathID 相互独立。
+
+```bash
+sandbox-ctl checkpoint list --path-id worker --json
+sandbox-ctl checkpoint delete --path-id worker --checkpoint cp-001
+# 离线管理需要目录独占所有权；存在运行 owner 时明确报 busy。
+sandbox-ctl checkpoint list --checkpoint-dir /var/lib/sandbox/worker/checkpoint
+sandbox-ctl checkpoint delete --checkpoint-dir /var/lib/sandbox/worker/checkpoint \
+  --checkpoint cp-001 --diff-id ROOT_DIFF_ID --diff-id DATA_DIFF_ID
+```
+
+在线管理通过 `RunRoot/PathID/ctl.sock` 定位（也接受 `--sandbox-id` 和 `--run-root`）。
+List 一次返回当前及历史 DIFF 的全部可见版本，也包括捕获中断留下的版本；`--json` 输出
+精确的 `{diff_id,id}`。删除在修改前固定这组引用。部分失败后，使用重复的 `--diff-id`
+重试已报告的精确集合，不要重新查找可能变化的捕获名。逻辑删除后禁止新打开；已 pin
+的导出仍可完成，并延后分批空间回收。因此删除会使依赖版本的本地 E/S 失效，但不保证
+立即归还全部空间。
+
+```bash
+cd /var/lib/sandbox/worker/checkpoint
+sandbox-ctl publish --to-ref-location archive=file:///var/lib/sandbox/published \
+  --delete-checkpoint --json '<snapshotRef>'
+```
+
+全部 publish 分支（包括引用替换/归并及 Bundle 输入）都会物化所选磁盘版本；普通输出
+不含 `checkpoint.json`，输入产物保持不变。默认保留本地版本。`--delete-checkpoint`
+只在发布及 publisher 关闭成功、自身导出 view 已释放后，删除已选定的精确磁盘/版本
+集合，并核对原目录身份。存在运行 owner 时，通过本地 owner 身份路由转发。清理不重新
+解析输入别名，也不从 `removedRefs` 推断权限。发布成功但清理失败时，CLI 返回 **79**，
+同时保留有效的普通结果或 JSON；应重试清理，不应丢弃发布结果。
+
+SDK 使用同一契约：`RuntimeSpec.EnableCheckpoint`、`RunOptions.EnableCheckpoint`、
+`restore.Options.EnableCheckpoint`、`ctl.Request.CheckpointID`、
+`Runtime.ListCheckpoints/DeleteCheckpoint` 和
+`ProcessStorage.ListDiffCheckpoints/DeleteDiffCheckpoint`。在
+`Publisher.PublishWithOptions` 与 `Publisher.Close` 均成功后，可调用
+`ProcessStorage.DeletePublishedDiffCheckpoints(ctx, result)`，独立处理其错误，最后
+关闭 storage。离线元数据管理及固定版本发布都无需打开 BlockCOW。
+
+嵌入调用方可在 `LaunchSpec` 中提供不透明的 `ProcessStorage`；Checkpoint 物化会
+保留它的 manifest fetcher 与本地加密策略。`NewProcessStorageWithLocalAccess`
+可以借用 fetcher，`Borrow` 保留完整存储访问能力。关闭借用对象不会关闭原始
+客户端；所有借用方结束前，资源 owner 必须保持打开。
+
+块层的 `BlockCOW.Checkpoint(ctx, id)`、`ListCheckpoints(ctx)`、
+`DeleteCheckpoint(ctx, id)` 和 `Export(ctx, id)` 使用 `vhost.CheckpointID`。
+命名 `Export` 返回持有 reader pin 的 sparse source 和 closer，用完后必须关闭。
+`Export(ctx, vhost.ActiveDiff)` 则要求调用者保持活动磁盘静止。raw/v1 后端的
+命名版本操作返回 `vhost.ErrCheckpointUnsupported`。
+
+Checkpoint DIFF v2 每盘使用一个本地文件保存稀疏 4 KiB 映射及保留根；物理文件长度
+不是磁盘容量。Hole 向下读取不可变 base，显式写零覆盖 lower 数据。加密沿用本地
+crypto policy 和进程 customer key；读取磁盘内容需要 key，列举/删除元数据不解密
+guest 数据。目录只有一个 writer owner，固定版本的独立 read pin 可与恢复后的活动
+写入并存。这是本地 Linux 文件系统能力，不是分布式共享存储。创建版本仍需排空在途
+写入并提交元数据；首次模板导入和内存捕获仍有耗时。保留版本占用空间，捕获后首写
+可能增加索引和数据 COW。不承诺整个 pause 恒定耗时、所有负载都更快，也不扩大既有
+FLUSH 契约之外的宿主崩溃或掉电 guest 数据持久性保证。
+
 ## 3. 配置与制品格式
 
 ### 3.1 `sandbox.yaml`
@@ -895,7 +984,7 @@ Memory restore另持有 `MemorySourceBinding`,其中 Snapshot S identity 与 `fr
 
 ### 3.8 `self` 与 disk provenance
 
-Portable graph 必须恰好出现一次保留值 `self`,且只能位于:
+普通 Portable graph 必须恰好出现一次保留值 `self`,且只能位于:
 
 ```text
 boot.root.base
@@ -945,7 +1034,7 @@ Local merge 分两类:
 
 ### 3.9 `.sandbox` logical format
 
-只接受两种 layout.
+接受三种 layout。普通 payload 布局要求恰好一个 `self`；本地磁盘 Checkpoint 布局要求零个。
 
 Live ext4/sparse root export:
 
@@ -972,7 +1061,7 @@ Reader 从 ZIP structure 推导 `[0, archiveBase)` payload,不信任第二个 `p
 
 - EOCD 必须位于 logical EOF且 comment 为空;
 - 拒绝 ZIP64 和 multi-disk ZIP;
-- exact entry set只能是 `{sandbox.runtime.cfg}` 或 `{config.json,sandbox.runtime.cfg}`;
+- exact entry set只能是 `{sandbox.runtime.cfg}`、`{config.json,sandbox.runtime.cfg}` 或 `{checkpoint.json,sandbox.runtime.cfg}`;
 - duplicate、unknown、directory、path traversal entry 均拒绝;
 - method固定 Store;
 - fixed order/time/metadata;
@@ -988,12 +1077,22 @@ type Root struct {
     Payload       fetch.Stream
     ImageConfig   []byte
     RuntimeConfig []byte
+    Checkpoint    *Checkpoint
 }
 ```
 
-`Payload` 是保留 sparse `RunAt`/`ReadAt` 的 section view. Shared close owner保证 FullStream/Payload/Root 任一 close 最终只释放 carrier 一次. Vhost 只能看到 Payload,不能看到 ZIP tail.
+`Payload` 是保留 sparse `RunAt`/`ReadAt` 的 section view. Shared close owner保证 FullStream/Payload/Root 任一 close 最终只释放 carrier 一次. Vhost 只能看到普通 Payload，不能看到 ZIP tail。Checkpoint root 另外提供已解析的 `Checkpoint` 元数据；通用 payload 读取会拒绝此布局，要求先显式物化版本。
 
 Live BlockCOW SnapshotView 是 upper-only sparse delta,ext4 superblock offset 可以是 Hole,所以不能要求每个 live payload独立通过 ext4 magic. Reader 校验 logical size、graph/self 关系和最终 composition. Direct EROFS payload则严格校验 EROFS logical size/magic.
+
+本地磁盘 Checkpoint E 没有根盘 payload，ZIP 恰好包含 `checkpoint.json` 和
+`sandbox.runtime.cfg`。前者是 canonical JSON，包含 `version: 1`、`checkpoint_id`、
+`root: {diff_id}` 和 `disks: [{name,diff_id}, ...]`；数据盘按名称与 portable config
+精确对应，不允许重复名称或 DiffID。捕获 ID 为非空 UTF-8、最多 128 字节且无控制字符；DiffID 必须是
+安全文件名 token。不允许主机路径、第二份磁盘图、容量字段、`config.json` 或数据
+payload。runtime config 只保留不可变图；reader 根据外层布局选择零 self 解析器。
+DIFF 从真实本地 carrier（包括所选 Bundle 成员）所在目录解析。发布会转换为普通
+单 self E。
 
 <a id="snapshot-format"></a>
 
@@ -1520,6 +1619,12 @@ root carrier物化为`.image`;只有需要作为独立dependency保存的root/da
 
 #### 6.1.2 托管 checkpoint 历史合并与选择性清理
 
+对本地磁盘 Checkpoint E，keep plan 还记录它精确引用的 DIFF 版本。只有当前 E
+贡献磁盘版本：为内存保留历史 S 不会顺带保留其旧磁盘 Checkpoint。清理先取得目录
+owner，验证完整保留集，再通过 metadata backend 分批删除无用版本、retire 不再
+需要的 DIFF。已有 read pin 延后物理回收。此过程不打开活动 BlockCOW，也不解密
+guest 页；保留集或目录身份检查失败时不会开始修改。
+
 `merge_ref=false` 独立记录本轮驻留工作集。已有 `S1 -> S0` 时，下一次捕获先流式生成新的
 不可变历史 Snapshot `S1′ = S1(memory) 覆盖 S0(memory)`，再写出
 `S2(当前工作集) -> S1′`。后续本地捕获重复该组合，最新 S 下最多保留一个本沙箱拥有的本地
@@ -1642,7 +1747,22 @@ export_request   -> export_done   | error
 exec_request     -> exec_ack      | error
 usage_request    -> usage_response | error
 resource_stats_request -> resource_stats_response | error
+checkpoint_snapshot_request -> snapshot_done | error
+checkpoint_export_request   -> export_done | error
+checkpoint_list_request     -> checkpoint_list_chunk* -> checkpoint_list_done | error
+checkpoint_delete_request   -> checkpoint_delete_done | error
 ```
+
+命名捕获使用专用 checkpoint request type 和非空 `checkpoint_id`，复用既有捕获
+response 及输出字段；不能仅给普通捕获请求添加字段来判断能力。不支持的 owner 返回
+`code: "checkpoint_unsupported"`；客户端也识别旧服务端针对这两个捕获类型返回的
+unknown-type 错误。两种情况都不会静默退回磁盘复制捕获。
+
+List chunk 的 `checkpoints` 最多携带 128 个精确 `{diff_id,id}` 引用；最终帧包含
+`checkpoint_count`，空列表的计数为零。未收到最终匹配计数就 EOF，属于列表不完整，
+不能把已收前缀当成功结果。Delete request 的 `checkpoint_refs` 使用已固定的引用集合，
+每批最多 128 项。清理转发另带 `checkpoint_owner` 并核对运行 owner token；此路由
+不向显式离线管理授予所有权。部分进展后的重试仍使用同一组精确引用。
 
 唯一 reaper 在 `waitid(WEXITED|WNOWAIT)` 确认 VMM 退出后立即撤销 resource 的 live 观测,然后按既有顺序执行 usage 最后采样与 `cmd.Wait`. usage 关闭时也使用同一退出通知;不增加采样或改变停止/保存语义. 退出期间仅保留有效规格字段,不为已退出 VMM 返回新的宿主观测时间.
 
@@ -2200,9 +2320,93 @@ private heap/fork 风险。任意调用者切片和子页读取经过这些 buff
 缓存整页回写避免读改写。短写报错，不重试未对齐余下切片；参见
 [write(2)](https://man7.org/linux/man-pages/man2/write.2.html)。
 
+### 11.4.5 多版本 DIFF v2 存储与恢复
+
+可选后端位于 [`internal/diffstore`](../internal/diffstore)。每个逻辑 4 KiB 块经
+B+ 树映射到物理槽。4 KiB 索引页包含 16 字节页头和最多 255 个 16 字节项；
+叶项保存逻辑块到数据槽的映射，内部项保存子树最大逻辑 key 及对应子索引槽。
+项中的整数使用 little-endian；数据槽与索引槽独立。header 绑定 DiffID、不可变 BaseID、
+逻辑容量和加密策略；control 页保存活动根、epoch、当前捕获标记、版本链、空闲/垃圾链
+和持久 GC cursor。版本记录保存 ID、根、epoch、前驱/后继及 visible/retained 状态；
+槽 descriptor 保存出生 epoch、种类和链指针。512 页有界元数据缓存不为全部版本
+建立全盘逻辑块映射。原始页和解码节点共用此预算，每个 owner/view 约 4 MiB。
+四个共享匿名 8 MiB direct-I/O 工作区将进程级对齐暂存空间固定为 32 MiB，
+不随版本数增加；共享映射可安全跨越并发 fork。XTS 使用 512 字节逻辑扇区编号，
+不随 COW 选择的物理槽改变。
+
+物理页号与 guest 逻辑块号不同：
+
+| 物理页 | 内容 |
+| --- | --- |
+| 0 | 不可变 header：既有 DIFF magic、big-endian version 2 前缀、身份/容量和封装密钥 |
+| 1 | 可变 control 页 |
+| 2 | redo commit descriptor |
+| 3–5 | redo home-address 索引，不是 B+ 索引页 |
+| 6–1541 | 最多 1,536 个已有元数据页镜像 |
+| 2048 起 | 每组一页 descriptor，随后 128 个槽 |
+
+创建时预留 0–1541 页（6,316,032 字节），使新 payload 分配遇到空间不足时仍能写
+redo 和既有 control 页。初始稀疏文件长度为 8 MiB，不是 guest 容量。元数据页包含
+校验和；加密 header 使用 AES-GCM 封装随机 64 字节 XTS key，不可变 header 字段
+作为 associated data，并使用 v2 专用 header-key 派生域。
+
+创建版本只登记活动根并推进 epoch，不扫描或复制 payload。出生时间晚于最新 retained
+epoch 的槽属于活动版本私有；反复覆盖可原位写入，不改索引、不产生元数据 redo。
+共享的数据槽及其共享索引路径通过 COW 保护。guest 写入修改明文 COW cache 之前，
+`MarkModified` 每个捕获周期先清除一次当前捕获标记；直接后端写入也执行相同屏障。
+仅比较根指针相等不能证明磁盘未变化。
+
+写入批次最多 64 页。元数据事务在任何数据或元数据落盘之前检查固定 redo 预算：
+最多 1,536 个已有元数据页镜像，由三页 redo home-address 索引寻址。先为新的不可达数据/索引槽
+预留空间并写入，再发布 redo；只有已有元数据页进入 redo 镜像。带校验的 commit
+descriptor 授权重放，随后更新 home metadata 并清除 descriptor。不能为了适应预算
+拆开一次结构变更。分配空间不足时可执行有界前台 GC 后重试，不能覆盖保留版本的数据。
+私有 payload 覆盖在一次 epoch 屏障之后无需索引事务。guest FLUSH 仍是非持久化
+健康检查，不触发 writeback、Drain 或文件系统 sync。初次发布使用显式内部 Sync。
+进程被杀后的元数据重放不承诺主机掉电时 guest payload 原子性或 checkpoint 持久化。
+
+Linux OFD 锁范围分别承担 DIFF writer 所有权（byte 0）、短期元数据串行化
+（byte 1）、整文件 reader 生命周期（byte 2）及各版本 pin（`16 + record slot`）。
+目录 writer 使用独立稳定的 `diffs/.owner.lock`。导出持有自己的文件描述符和版本
+read pin，可以跨越原 writer 退出及 owner 交接。删除先隐藏版本；已有 pin 仍使其
+retained 并继续强制 COW。整盘 retire 先禁止新 reader，再在全部旧 reader 退出后
+unlink 数据文件；锁 inode 保持稳定。
+已有 reader 未退出时 `Retire` 返回 busy；后续 `OpenMetadata` owner 可重试删除。
+固定导出通过只读 overlay 解释已提交但尚未应用到 home 的 redo，不取得 writer 所有权，
+也不执行恢复写入。模板发布可以重命名数据文件，同时保留最终稳定 lock 路径；导出
+独立重开已拥有的 inode。同一 DIFF 内已删除的 Checkpoint ID 不可复用。
+`Export(ActiveDiff)` 是由调用者保证静止的活动视图；命名导出则拥有不可变保留根。
+
+GC 处理持久退休链，而不是遍历所有保留树。删除版本时寻找最近的 retained 前驱：
+仅当前驱 epoch 仍可能引用某槽的出生时间时转移该槽，否则放入可回收垃圾链。批量删除
+先撤销整组选中版本，再运行 GC，避免链反复转移到同批待删版本。cursor 与链变更共同
+提交，中断后可继续。槽先打洞，再进入可复用 free list，复用前使相关缓存失效。
+单次及 owner 后台回收都有预算；pin 释放后无需新的 guest 写入也能继续推进。
+每轮 GC 对回收、版本访问、前驱探索分别限制为 64 步。跨越已撤销前驱时持久化路径
+压缩；找到真实前驱之前保留保守的 protected epoch，只会导致额外 COW。
+GCRead/GCWritten 统计归因于 GC 的已完成索引/redo 物理字节，与相应总量重叠。
+
+命名捕获收集本地依赖时保留原内容身份，包括作为磁盘 lower 的普通 E。必要时复制完整
+原 carrier，不将其剥成 payload 或转换哈希域；已归本目录所有的载体直接复用。
+Bundle checkpoint 可以引用相邻 tarstream，后续普通 publish 再生成可移植图。
+因此 DIFF 的 BaseID 在捕获前后稳定，成功捕获收集完依赖后可在运行退出时清理临时
+恢复物化文件。
+
 ### 11.5 Quiesce / Resume
 
 Quiesce等待in-flight block request退出并阻止新request. 所有data/root views在同一quiesce窗口读取. Recovery顺序先恢复backend可服务状态,再恢复CH和guest连接,避免VM恢复后block request永久阻塞.
+
+命名磁盘捕获先等待所有磁盘模板 `WaitReady`，再暂停 CH 并冻结后端。在同一冻结
+屏障内，各盘排空已准入的 cache 写入，等待最终 `Materialized` 发布（包括初始
+Sync/rename），然后登记指定 ID。所有磁盘成功后才生成无 payload 的 E，并提交操作
+根：export 提交 E，snapshot 则在内存捕获后提交 S。前端准入冻结时，writer 和
+materializer 仍可完成工作，避免排空与模板物化互相等待。
+
+尝试根 Commit 之前失败，会删除已知由本次创建的版本，并沿用正常捕获恢复流程。
+一旦尝试 Commit，结果就可能不确定：后续 Commit、Close、Resume 或响应错误都
+保守保留磁盘版本，不将已有产物或运行基线回滚到历史根。捕获中断可能留下可见版本；
+应列举并删除它们的精确身份，重试捕获时使用新 ID。仅客户端传输失败不能证明没有
+产物或版本提交。
 
 底层 Discard 在对完整块打洞并清除 upper 归属前，与写入及在途回写同步。部分边缘不变。
 Discard 使 base 再次可见，不是能遮蔽 base 的显式零。Wire profile 仍拒绝 DISCARD 和
@@ -2486,6 +2690,66 @@ CH/KVM 证据. PR 和证据产物保留实际测量的提交、环境和限制,
 ### 12.7 源读取恢复验证
 
 回归覆盖 ring/completion 不变量、COW materialization、EOF/EAGAIN 包装、后端取消、仅成功初始化缓存、队列/冻结关闭, 以及真实内核 REMOVE/COPY 的页内容. owner E2E 进一步使用匹配的组件二进制、runtime image 和 native 依赖验证 CH/KVM 行为. 前置条件缺失代表缺少验证, 不代表测试通过. Pinger 回归将响应 EOF 严格安排在捕获开始等待已入场探测之后，验证健康检查失败仍被记录，并要求单独取得 quiesce 确认。反例覆盖 CONNECT EOF、取消、截断或无效响应，以及有界排空到期。读取恢复用例在失败时保留有界且隐藏密钥的运行时和错误日志尾部，以区分 quiesce 前的 ping 排空错误与 guest quiesce 失败。
+
+### 12.8 Checkpoint 验证与测量
+
+源码检查与预构建产物 E2E 分开执行。direct I/O 和空间回收检查应使用原生 Linux ext4
+scratch；Windows 挂载目录、仅 tmpfs 测试或跳过特权用例不能证明这些性质。
+
+```bash
+# 准备好的 Go 源码环境；TMPDIR 应位于待测文件系统：
+CGO_ENABLED=0 go test -count=1 ./internal/diffstore ./pkg/vhost ./pkg/artifact \
+  ./pkg/config ./pkg/sandboxfile ./pkg/snapshot ./pkg/restore ./pkg/sandbox ./pkg/ctl ./cmd/sandbox-ctl
+CGO_ENABLED=1 go test -race -count=1 ./internal/diffstore ./pkg/vhost ./pkg/artifact ./pkg/restore
+# Workbench system mode，具备 mount/namespace 权限的完整源码 gate：
+bash scripts/ci-source-checks.sh
+
+# 独占、可丢弃的 64 MiB ext4 文件系统；不要使用共享开发挂载点：
+DIFFSTORE_FULL_FS=/path/to/owned/finite-ext4 go test ./internal/diffstore \
+  -run '^TestRealFilesystemFullRecovery$' -count=1 -v
+
+# root shell；PREPARED 包含准确构建的产物与平台 E2E runner：
+python3 "$PREPARED/test/e2e/e2e" run --workdir "$PREPARED" \
+  --suite snapshot --include snapshot.checkpoint.sh
+
+# 实际 payload 历史；默认规模为 0、1、10 GiB：
+go test -c -o /path/to/compiled-vhost.test ./pkg/vhost
+go run ./test/perf/diffstore --directory /path/to/new-owned-directory \
+  --sizes-gib 0,1,10 --rounds 5 \
+  --vhost-test-binary /path/to/compiled-vhost.test
+
+python3 test/perf/checkpoint_cow.py --tmpdir /path/to/native-ext4/scratch \
+  --output /path/to/results --rounds 3 --operations 32768 \
+  --modes 'raw|v1|v2-no-version|v2-shared|v2-private|v2-xts-no-version|v2-xts-shared|v2-xts-private'
+
+python3 test/perf/checkpoint_template.py --tmpdir /path/to/native-ext4/scratch \
+  --output /path/to/template-results
+```
+
+源码测试覆盖独立进程 pin 和 writer 交接、杀死 owner 后 redo 重开、真实短写、空间
+预留失败、树分裂/合并、retire/GC 中断恢复、零覆盖、加密及 metadata-only 操作。
+artifact 测试覆盖精确发布后删除、Bundle/外部来源、重写、来源目录身份和同目录重开/
+跨目录物化。产物用例使用根盘加两个数据盘，串起冷启动、命名捕获、继续运行、并发
+固定版本发布、历史/跨目录恢复以及移除原来源后的恢复。
+
+性能 driver 记录主机、文件系统、构建身份、原始日志、前端及 checkpoint 的
+p50/p95/p99、包含最终 Drain 的吞吐、数据/索引/redo/GC 物理字节计数、cache hit
+及进程 CPU/RSS。工作集 64 MiB 大于 32 MiB COW cache；有意设计的 hot 用例为
+4 MiB。至少运行三轮，每轮覆盖两次工作集。plaintext v2 与 raw、encrypted v2 与
+v1 分别比较，并区分无版本、共享首写、已私有覆盖。这些命令提供复现方法，不代表
+性能门槛或全部特权测试已经通过。
+
+模板驱动单独测量三轮全新 64 MiB raw、v1 XTS、v2 明文与 v2 XTS 初始化。
+它记录 Open、Ready、Materialized 和总耗时，总耗时包含首次同步及正式发布，
+随后在计时窗口之外验证全量 payload SHA256。来源准备不计入耗时；进程峰值
+RSS 仍包含这部分准备阶段。
+
+规模 driver 在进入下一档前删除上一档历史，分别报告 checkpoint 注册、control 重开
+和 presence 重建。完整 resume 包含重建位图，耗时会随映射页数增长。vhost helper
+在回写前固定恰好 32 个脏页（128 KiB），分别记录模板 readiness、Drain、最终
+materialization、元数据登记、捕获总耗时和重开。不使用 helper 时，登记样本的待写
+payload 为零。捕获总耗时不含最初 open 和 guest 写入准入，也不含 VM 内存捕获。
+更大规模（如 30 GiB）可显式通过 `--sizes-gib` 启用。
 
 ## 13. Reliability、performance 与兼容边界
 

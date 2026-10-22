@@ -22,6 +22,8 @@ import (
 // memfd or CH snapshot staging fields, making calls to /vm.snapshot and memory
 // scanning structurally impossible.
 type ExportSources struct {
+	CheckpointID     string
+	checkpointState  *checkpointCapture
 	SandboxID        string
 	APISock          string
 	CHApiDeadline    time.Duration
@@ -49,6 +51,8 @@ type SandboxOutput struct {
 // commits E as the operation root. The entire sink read stays inside the
 // quiesced window so BlockCOW SnapshotView cannot change underneath it.
 func Export(ctx context.Context, sources ExportSources, sink ArtifactSink, resumeAfter bool) (_ *SandboxOutput, retErr error) {
+	sources.checkpointState = &checkpointCapture{id: sources.CheckpointID}
+	defer func() { retErr = errors.Join(retErr, sources.checkpointState.close()) }()
 	sinkOpen := sink != nil
 	defer func() {
 		if sinkOpen {
@@ -165,7 +169,7 @@ func validateExportSources(sources ExportSources, sink ArtifactSink) error {
 	for i := range sources.Diffs {
 		merged[i] = sources.Diffs[i].MergeBase != ""
 	}
-	if err := ValidateExportGraph(sources.PortableConfig, sources.ParentSandboxRef, merged); err != nil {
+	if err := validateCaptureGraph(sources.CheckpointID, sources.PortableConfig, sources.ParentSandboxRef, merged, sources.Diffs); err != nil {
 		return fmt.Errorf("export prospective C1: %w", err)
 	}
 	if sources.Quiescer == nil {
@@ -245,16 +249,29 @@ func captureSandboxAtFreeze(ctx context.Context, sources ExportSources, sink Art
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	if sources.CheckpointID != "" {
+		return captureCheckpointAtFreeze(ctx, sources, sink, commitRoot)
+	}
 	out := &SandboxOutput{
 		DataRefs:  make([]string, max(0, len(sources.Diffs)-1)),
 		DataPaths: make([]string, max(0, len(sources.Diffs)-1)),
 	}
 	for i := 1; i < len(sources.Diffs); i++ {
-		view, holes, cleanup, err := prepareDiskCapture(ctx, sources.Diffs[i], sources.LocalCodec, sources.LocalRequired, sources.MergeBaseOpener)
+		view, cleanup, err := prepareDiskSource(ctx, sources.Diffs[i], func() (io.ReadSeeker, []sparse.Extent, func() error, error) {
+			return prepareDiskCapture(ctx, sources.Diffs[i], sources.LocalCodec, sources.LocalRequired, sources.MergeBaseOpener)
+		})
 		if err != nil {
 			return nil, fmt.Errorf("export data disk %d SnapshotView: %w", i-1, err)
 		}
-		ref, path, err := sink.AbsorbOverlay(ctx, view, holes)
+		var ref, path string
+		if sources.Diffs[i].Export == nil {
+			// Keep legacy sink adapters working while native BlockCOW captures use
+			// the closeable sparse source path.
+			legacy := view.(*seekerSource)
+			ref, path, err = sink.AbsorbOverlay(ctx, legacy.rs, legacy.holes)
+		} else {
+			ref, path, err = sink.AbsorbOverlaySource(ctx, view)
+		}
 		cleanupErr := cleanup()
 		if err != nil {
 			return nil, fmt.Errorf("export data disk %d: %w", i-1, errors.Join(err, cleanupErr))
@@ -276,7 +293,9 @@ func captureSandboxAtFreeze(ctx context.Context, sources ExportSources, sink Art
 	if err != nil {
 		return nil, err
 	}
-	rootView, rootHoles, rootCleanup, err := prepareDiskCapture(ctx, sources.Diffs[0], sources.LocalCodec, sources.LocalRequired, sources.MergeBaseOpener)
+	rootSource, rootCleanup, err := prepareDiskSource(ctx, sources.Diffs[0], func() (io.ReadSeeker, []sparse.Extent, func() error, error) {
+		return prepareDiskCapture(ctx, sources.Diffs[0], sources.LocalCodec, sources.LocalRequired, sources.MergeBaseOpener)
+	})
 	if err != nil {
 		return nil, fmt.Errorf("export root SnapshotView: %w", err)
 	}
@@ -286,10 +305,6 @@ func captureSandboxAtFreeze(ctx context.Context, sources ExportSources, sink Art
 			retErr = errors.Join(retErr, rootCleanup())
 		}
 	}()
-	rootSource, err := newSeekerSource(rootView, rootHoles)
-	if err != nil {
-		return nil, fmt.Errorf("export root source: %w", err)
-	}
 	sandboxSource, err := sandboxfile.BuildSourceContext(ctx, rootSource, nil, runtimeConfig)
 	if err != nil {
 		return nil, err
@@ -330,20 +345,25 @@ func prepareDiskCapture(ctx context.Context, d DiskDiff, codec tarstream.Codec, 
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	cleanup := func() error { return nil }
+	cleanup := func() error {
+		if c, ok := diff.(io.Closer); ok {
+			return c.Close()
+		}
+		return nil
+	}
 	if d.MergeBase == "" {
 		return diff, holes, cleanup, nil
 	}
 	size, err := seekerSize(diff)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, errors.Join(err, cleanup())
 	}
 	base, baseHoles, err := openMergeBaseWithOpener(ctx, d.MergeBase, size, codec, required, opener)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, errors.Join(err, cleanup())
 	}
 	merged, mergedHoles := mergeSparse(diff, holes, base, baseHoles, size)
-	return merged, mergedHoles, base.Close, nil
+	return merged, mergedHoles, func() error { return errors.Join(base.Close(), cleanup()) }, nil
 }
 
 func newSeekerSource(reader io.ReadSeeker, holes []sparse.Extent) (sparse.Source, error) {

@@ -84,6 +84,7 @@ sandbox-ctl config
 sandbox-ctl info
 sandbox-ctl publish
 sandbox-ctl upload-snapshot
+sandbox-ctl checkpoint list|delete
 ```
 
 `upload-snapshot` is a thin compatibility alias for `publish`; both call the same publisher and graph traversal.
@@ -650,6 +651,116 @@ collector or access to the other nodes' journals; no exporter is added here.
 Protocol references: [Journal Native Protocol](https://systemd.io/JOURNAL_NATIVE_PROTOCOL/)
 and [Go net/url](https://pkg.go.dev/net/url).
 
+### 2.11 Local disk Checkpoints
+
+Local disk Checkpoints are opt-in. Enable the storage backend at launch, then
+choose each capture explicitly:
+
+```bash
+sandbox-ctl run --config sandbox.yaml --sandbox-id demo --path-id worker \
+  --base-root /var/lib/sandbox --enable-checkpoint
+sandbox-ctl snapshot --path-id worker --checkpoint cp-001 --json
+# Use export instead of snapshot for disk/config only; add --resume to keep running.
+```
+
+`PathID` defaults to `SandboxID`. All three launch modes (`--config`, `--from`,
+`--restore`) derive `CheckpointDir = BaseRoot/PathID/checkpoint`; writable root
+and data disks live in `CheckpointDir/diffs/<DiffID>.diff`. These files survive
+normal exit. There is no second launch directory setting. A fresh run assigns
+new disk identities. An existing raw/v1 writable DIFF is never implicitly adopted;
+import its contents as a template. An explicit writable path outside this derived
+directory, or a filesystem without the required locking, fails before launch.
+
+Enabling the backend does not change the default capture: without `--checkpoint`,
+snapshot/export still copies disk contents. A nonempty `--checkpoint` creates that
+ID on every writable disk at the same capture barrier. It accepts `--mode local`
+or `--mode bundle`, but not `--upload` or `export --from`. The running owner supplies
+its directory when `--output` is omitted; an explicit output must name that same
+derived directory. Ordinary captures still require `--output` or `--upload`.
+The default stops the VM; `--resume` retains the original running baseline.
+An unsupported instance returns the dedicated CLI status **78**.
+
+Use the returned `sandboxRef` with `run --from` or `snapshotRef` with
+`run --restore`. Resolve basename-only reports relative to their actual output
+directory. Restore pins all source versions before acquiring the target directory
+owner. With `--enable-checkpoint`, the same physical directory can reopen its
+existing DIFFs only when every disk's identity, immutable base graph, logical
+capacity and active epoch still match the capture. A later write, another target
+directory, or a launch without the enable flag instead materializes the pinned
+versions into ordinary lower artifacts. Cold start preserves caller overrides;
+memory restore retains its existing execution-state rules. Source paths and the
+target's BaseRoot/PathID are independent.
+
+```bash
+sandbox-ctl checkpoint list --path-id worker --json
+sandbox-ctl checkpoint delete --path-id worker --checkpoint cp-001
+# Offline management takes exclusive directory ownership; a live owner means busy.
+sandbox-ctl checkpoint list --checkpoint-dir /var/lib/sandbox/worker/checkpoint
+sandbox-ctl checkpoint delete --checkpoint-dir /var/lib/sandbox/worker/checkpoint \
+  --checkpoint cp-001 --diff-id ROOT_DIFF_ID --diff-id DATA_DIFF_ID
+```
+
+Online management selects `RunRoot/PathID/ctl.sock` (also accepts `--sandbox-id`
+and `--run-root`). List returns all visible versions across current and historical DIFFs,
+including versions left by interrupted captures; `--json` emits exact
+`{diff_id,id}` pairs. Deletion selects that fixed set before making changes.
+For a partial deletion, retry the reported identities with repeatable `--diff-id`;
+do not rediscover a changed capture name. New opens fail after logical deletion,
+while already pinned exports finish and delay bounded reclamation. Deletion can
+therefore invalidate a local E/S without immediately returning all space.
+
+```bash
+cd /var/lib/sandbox/worker/checkpoint
+sandbox-ctl publish --to-ref-location archive=file:///var/lib/sandbox/published \
+  --delete-checkpoint --json '<snapshotRef>'
+```
+
+Every publish path, including reference replacement/reduction and Bundle inputs,
+materializes selected disk versions into ordinary output with no `checkpoint.json`.
+The input artifacts stay unchanged. Default publication retains local versions.
+`--delete-checkpoint` waits for successful publication, successful publisher close
+and release of its export views, then deletes only the exact selected disk/version
+set and checked source-directory identity. A live owner receives the request
+through its owner-token-checked local route. Cleanup never re-resolves input
+aliases and is independent of `removedRefs`. If publication succeeds but cleanup
+fails, CLI status **79** accompanies the still-valid ordinary result/JSON; retry
+cleanup without discarding that result.
+
+SDK entry points use the same rules: `RuntimeSpec.EnableCheckpoint`,
+`RunOptions.EnableCheckpoint`, `restore.Options.EnableCheckpoint`,
+`ctl.Request.CheckpointID`, `Runtime.ListCheckpoints/DeleteCheckpoint`, and
+`ProcessStorage.ListDiffCheckpoints/DeleteDiffCheckpoint`. After both
+`Publisher.PublishWithOptions` and `Publisher.Close` succeed, callers may invoke
+`ProcessStorage.DeletePublishedDiffCheckpoints(ctx, result)` and report that error
+separately before closing storage. No caller needs to open a BlockCOW to manage
+offline metadata or publish a fixed version.
+
+Embedding callers may supply an opaque `ProcessStorage` in `LaunchSpec`;
+Checkpoint materialization preserves its manifest fetcher and local encryption
+policy. `NewProcessStorageWithLocalAccess` can borrow a fetcher, and `Borrow`
+retains the complete storage access capability. Closing a borrower does not
+close the original clients; the owner must remain open until borrowers finish.
+
+At the block layer, `BlockCOW.Checkpoint(ctx, id)`, `ListCheckpoints(ctx)`,
+`DeleteCheckpoint(ctx, id)` and `Export(ctx, id)` use `vhost.CheckpointID`.
+A named `Export` returns a sparse source and closer that owns its reader pin;
+close it when finished. `Export(ctx, vhost.ActiveDiff)` instead requires the
+caller to keep the active disk quiescent. Raw/v1 backends report
+`vhost.ErrCheckpointUnsupported` for named checkpoint operations.
+
+Checkpoint DIFF v2 stores sparse 4 KiB mappings and retained roots in one local
+file per disk. Its physical length is not disk capacity. Hole falls through to
+the immutable lower graph; an explicitly written zero masks that lower data.
+Encryption uses the process customer key under the existing local-crypto policy;
+opening data needs the key, while listing/deleting metadata does not decrypt guest
+data. A directory has one writer owner, but fixed-version exports hold independent
+read pins and can coexist with resumed writes. This is a local Linux filesystem
+feature, not distributed shared storage. Creating a checkpoint drains writes and
+commits metadata; initial template import and memory capture still take time.
+Retained versions cost space and post-capture writes may incur index/data COW.
+It does not promise constant total pause time, universal speedups, or guest-data
+durability across host crashes/power loss beyond the existing FLUSH contract.
+
 ## 3. Configuration and artifact formats
 
 ### 3.1 `sandbox.yaml`
@@ -970,7 +1081,7 @@ Memory restore additionally holds `MemorySourceBinding`; its Snapshot S identity
 
 ### 3.8 `self` and disk provenance
 
-The portable graph must contain the reserved value `self` exactly once, and only at:
+An ordinary portable graph must contain the reserved value `self` exactly once, and only at:
 
 ```text
 boot.root.base
@@ -1020,7 +1131,7 @@ Three-state sparse semantics remain `Hole`, `Zero`, and `Data`. Holes come only 
 
 ### 3.9 `.sandbox` logical format
 
-Only two layouts are accepted.
+Three layouts are accepted. Ordinary payload layouts require exactly one `self`; the local disk Checkpoint layout requires zero.
 
 Live ext4/sparse-root export:
 
@@ -1041,13 +1152,33 @@ Top-level Sandbox E with a direct EROFS layout:
 ]
 ```
 
+Local disk Checkpoint layout (no root payload):
+
+```text
+[ZIP:
+  checkpoint.json
+  sandbox.runtime.cfg
+]
+```
+
+`checkpoint.json` is canonical JSON with `version: 1`, `checkpoint_id`,
+`root: {diff_id}`, and `disks: [{name,diff_id}, ...]`. The disk list corresponds
+exactly to the portable data disks by name, without duplicate names or DiffIDs.
+IDs are nonempty; the capture ID is at most
+128 UTF-8 bytes without control characters, and DiffIDs are safe filename tokens.
+No host path, second disk graph, disk capacity, `config.json`, or data payload is
+accepted in this layout. The runtime config retains only the immutable graph;
+the reader selects its zero-self parser from the enclosing layout. DIFF sources
+resolve beside the actual local carrier, including a selected Bundle member.
+Publish converts this layout back into an ordinary one-self E.
+
 Image-to-Sandbox-E assembly locates the archive base of the original `EROFS + ZIP(config.json)`, preserves the EROFS prefix and validated `config.json` bytes, then rebuilds one canonical two-entry ZIP. `ZIP(config.json) + ZIP(sandbox.runtime.cfg)` is an invalid double ZIP.
 
 The reader derives payload `[0, archiveBase)` from ZIP structure and does not trust a second `payload_size`. The strict ZIP contract requires:
 
 - EOCD at logical EOF with an empty comment.
 - No ZIP64 or multidisk ZIP.
-- Exactly `{sandbox.runtime.cfg}` or `{config.json,sandbox.runtime.cfg}`.
+- Exactly `{sandbox.runtime.cfg}`, `{config.json,sandbox.runtime.cfg}`, or `{checkpoint.json,sandbox.runtime.cfg}`.
 - No duplicate, unknown, directory, or path-traversal entries.
 - Store compression method.
 - Fixed order, timestamps, and metadata.
@@ -1063,10 +1194,11 @@ type Root struct {
     Payload       fetch.Stream
     ImageConfig   []byte
     RuntimeConfig []byte
+    Checkpoint    *Checkpoint
 }
 ```
 
-Payload is a section view preserving sparse `RunAt`/`ReadAt`. A shared close owner ensures that closing FullStream, Payload, or Root ultimately releases the carrier exactly once. Vhost sees only Payload, never the ZIP tail.
+Payload is a section view preserving sparse `RunAt`/`ReadAt`. A shared close owner ensures that closing FullStream, Payload, or Root ultimately releases the carrier exactly once. Vhost sees only ordinary Payload, never the ZIP tail. A Checkpoint root additionally exposes parsed `Checkpoint` metadata; generic payload consumers reject it and require explicit version materialization.
 
 A live BlockCOW SnapshotView is an upper-only sparse delta. Its ext4-superblock offset can be a Hole, so not every live payload can be required to pass an independent ext4-magic check. The reader checks logical size, graph/self relationships, and the final composition. Direct EROFS payloads undergo strict EROFS logical-size/magic checks.
 
@@ -1714,6 +1846,14 @@ short-lived `node-ctl checkpoint-cleanup` tool. Portable Export continues to use
 its stored pair without reading artifacts. No token, public result, base format,
 or persistent cleanup schema changes.
 
+For local disk Checkpoint E, the keep plan also records its exact DIFF versions.
+Only the current E contributes disk versions: retaining an ancestor S for memory
+does not retain that ancestor's disk Checkpoints. Cleanup obtains the directory
+owner, validates the complete keep set, deletes unused versions in batches, and
+retires DIFFs not needed by that set through the metadata backend. Existing read
+pins defer physical reclamation. It does not open an active BlockCOW or decrypt
+guest pages. A keep-plan or identity error prevents this mutation.
+
 The keep set contains current S/E, memory-history carriers, and current disk,
 upper and immutable-base carriers, including reused files. A historical S's old
 E is not a disk dependency. Any needed Bundle member retains its whole physical
@@ -1823,7 +1963,27 @@ export_request   -> export_done   | error
 exec_request     -> exec_ack      | error
 usage_request    -> usage_response | error
 resource_stats_request -> resource_stats_response | error
+checkpoint_snapshot_request -> snapshot_done | error
+checkpoint_export_request   -> export_done | error
+checkpoint_list_request     -> checkpoint_list_chunk* -> checkpoint_list_done | error
+checkpoint_delete_request   -> checkpoint_delete_done | error
 ```
+
+Named captures use the dedicated checkpoint request types and a nonempty
+`checkpoint_id`. They reuse the existing capture responses and output fields;
+they do not negotiate support by adding a field to an ordinary capture request.
+An unsupported owner reports `code: "checkpoint_unsupported"`; the client also
+recognizes an older server's unknown-type reply for these two capture types.
+Neither case silently falls back to a disk-copy capture.
+
+A list chunk contains at most 128 exact `{diff_id,id}` references in
+`checkpoints`; the final frame carries `checkpoint_count`, including zero for an
+empty list. EOF without the final matching count is an incomplete list, not a
+successful prefix. Delete requests contain the already selected
+`checkpoint_refs` in batches of at most 128. Cleanup forwarding also supplies
+`checkpoint_owner`, checked against the live owner's token; this route does not
+grant ownership to explicit offline management. Retries retain the same exact
+reference set after partial progress.
 
 The sole reaper ends live resource observations as soon as `waitid(WEXITED|WNOWAIT)` confirms VMM exit, before the existing final usage sample and `cmd.Wait`. The same exit notification applies when usage is disabled, without adding samples or changing stop/save behavior. During exit, only effective specification fields remain; an exited VMM receives no fresh host observation timestamp.
 
@@ -2394,9 +2554,125 @@ and subpage reads are copied through these buffers; large operations are chunked
 Full-page cache writeback avoids read/modify/write. Short writes fail rather than
 retrying an unaligned remainder; see [write(2)](https://man7.org/linux/man-pages/man2/write.2.html).
 
+### 11.4.5 Versioned DIFF v2 storage and recovery
+
+The optional backend lives in [`internal/diffstore`](../internal/diffstore).
+Each logical 4 KiB block maps through a B+ tree to a physical slot. A 4 KiB index
+page has a 16-byte header and at most 255 16-byte entries. Leaves map logical
+block numbers to data slots; internal entries pair each child's maximum logical
+key with its slot. Entry integers are little-endian. Data and index slots are distinct.
+The header binds DiffID, immutable BaseID, logical capacity and encryption policy;
+the control page names the active root, epoch, current-capture marker, checkpoint
+chain, free/garbage lists and persistent GC cursor. Each checkpoint record stores
+its ID, root, epoch, predecessor/successor and visible/retained state. Slot
+descriptors record birth epoch, kind and chain linkage. The 512-page bounded
+metadata cache does not build an all-block in-memory map of every version.
+Raw and decoded pages share this budget (about 4 MiB per owner/view). Four shared
+anonymous 8 MiB direct-I/O workspaces bound process-wide aligned scratch at
+32 MiB, independently of checkpoint count; shared mappings remain safe across
+concurrent fork. XTS uses 512-byte logical sector numbers, regardless of the
+physical slot selected by COW.
+
+Physical page numbers are distinct from guest logical block numbers:
+
+| Physical pages | Contents |
+| --- | --- |
+| 0 | Immutable header: existing DIFF magic, big-endian version 2 prefix, identity/capacity and wrapped key |
+| 1 | Mutable control page |
+| 2 | Redo commit descriptor |
+| 3–5 | Redo home-address index, not B+ index pages |
+| 6–1541 | Up to 1,536 existing metadata page images |
+| 2048 onward | Groups of one descriptor page followed by 128 slots |
+
+Creation reserves pages 0–1541 (6,316,032 bytes), so redo and existing control
+pages remain writable when new payload allocation runs out of space. The initial
+sparse file length is 8 MiB, not the guest capacity. Metadata pages carry
+checksums. An encrypted header wraps a random 64-byte XTS key with AES-GCM,
+using the immutable header fields as associated data and the v2-specific
+header-key derivation domain.
+
+Snapshot creation records the active root and advances the epoch without scanning
+or copying its payload. A slot born after the latest retained epoch is private;
+repeated overwrites can update that slot in place without rewriting the index or
+emitting metadata redo. Shared data slots and their shared index path use COW.
+Before a guest write can dirty the plaintext COW cache, `MarkModified` clears the
+current-capture marker once per capture cycle. The same fence applies to direct
+backend writes: root-pointer equality alone never proves an unchanged disk.
+
+Writes use bounded batches of up to 64 pages. Metadata transactions preflight a
+fixed redo budget of 1,536 existing metadata page images, addressed by three
+redo home-address pages,
+before any data/metadata write. New reserved, unreachable data/index slots are
+written before publishing redo; only existing metadata pages enter the redo
+images. A checksummed commit descriptor authorizes replay, then home metadata
+is applied and the descriptor cleared. The transaction cannot split a structural
+change merely to fit the budget. Fresh slots are reserved before writes; ENOSPC
+can drive bounded foreground GC and retry without overwriting retained data.
+Private payload overwrite has no index transaction after its one-time epoch
+fence. Guest FLUSH remains a non-durable health check and does not start
+writeback, Drain or filesystem sync. Explicit internal Sync is used for initial
+publication. Metadata replay after a killed process does not promise atomic
+guest payload writes or checkpoint durability across host power failure.
+
+Linux OFD lock ranges separate DIFF writer ownership (byte 0), short metadata
+serialization (byte 1), whole-file reader lifetime (byte 2), and each checkpoint
+pin (byte `16 + record slot`). The directory writer uses a separate stable
+`diffs/.owner.lock`. An export holds its own descriptor and per-version read pin;
+it can outlive the original writer and survive owner handoff. Deletion hides a
+version before reclamation, while a pin keeps it retained and continues to force
+COW. Retiring an entire DIFF first prohibits new readers and unlinks its data
+file only after existing reader locks are released; lock inodes remain stable.
+`Retire` reports busy while readers remain; a later `OpenMetadata` owner can retry
+removal. A fixed export interprets committed but unapplied redo without taking
+writer ownership or applying recovery. Template publication may rename the data
+file while retaining the final stable lock path; exports reopen the owned inode
+independently. Deleted checkpoint IDs cannot be reused within the same DIFF.
+`Export(ActiveDiff)` is a caller-quiescent active view, while a named export owns
+an immutable retained root.
+
+GC operates on persisted retirement chains instead of walking every retained
+tree. For a deleted version it finds the nearest retained predecessor, transfers
+each slot only when that predecessor's epoch can still reference the slot's birth,
+and otherwise moves it to reclaimable garbage. Batch withdrawal occurs before
+GC, so chains do not repeatedly migrate through other versions being deleted.
+The cursor and chain updates commit together; work resumes after interruption.
+A slot is punched before joining the reusable free list, and its metadata cache
+entry is invalidated before reuse. Per-call work and owner background work are
+bounded; a released pin therefore permits progress without a new guest write.
+A GC round separately limits reclamation, version visits and predecessor
+discovery to 64 steps. It persists shortcuts across withdrawn predecessors and
+keeps a conservative protected epoch until discovery completes, causing extra
+COW rather than reclaiming a possibly retained slot. GCRead/GCWritten count
+completed physical index/redo bytes attributable to GC and overlap those totals.
+
+Named capture preserves immutable dependency identities when collecting local
+sources. It copies the original carrier when necessary, including an ordinary E
+used as a disk lower, instead of converting its payload or changing hash domains.
+Already owned carriers are reused. A Bundle checkpoint may reference neighboring
+tarstreams; later ordinary publication materializes a portable graph. This keeps
+the DIFF BaseID stable across capture and permits temporary restore materialization
+files to be removed after the completed capture has collected their dependencies.
+
 ### 11.5 Quiesce / Resume
 
 Quiesce waits for in-flight block requests to leave and prevents new ones. All data/root views are read within the same quiesce window. Recovery makes backends serviceable before resuming CH and guest connections, avoiding permanent blocking of block requests after VM resume.
+
+Named disk capture first waits for every disk's template `WaitReady`, before
+pausing CH and freezing the backends. Under that common freeze, each disk drains
+admitted cache writes, waits for final `Materialized` publication (including the
+initial Sync/rename), and registers the requested ID. Only after all disks
+succeed does capture emit the zero-payload E and commit the operation root: E for
+export, or S after memory capture for snapshot. The writer/materializer can finish
+while frontend admission is frozen, avoiding a drain/materialization deadlock.
+
+Before the root Commit is attempted, failure deletes versions known to have been
+created by that attempt and follows normal capture recovery. Once Commit is
+attempted, its outcome may be uncertain: subsequent Commit, Close, Resume, or
+response errors retain the disk versions conservatively. Existing artifacts and
+the running baseline are not rolled back to a historical root. An interrupted
+capture may leave visible versions; list and delete their exact identities, and
+use a new capture ID when retrying. A client transport error alone does not prove
+that no artifact or version was committed.
 
 Low-level Discard serializes with writes and in-flight writeback before punching
 complete blocks and clearing upper presence. Partial edges retain contents.
@@ -2742,6 +3018,76 @@ artifacts; no benchmark number here is inferred from the design.
 ### 12.7 Source read recovery validation
 
 Regression coverage includes ring/completion invariants, COW materialization, EOF/EAGAIN wrappers, backend cancellation, success-only initialization, queue/pause shutdown and real kernel REMOVE/COPY page contents. Owner E2E additionally checks CH/KVM behavior with matching component binaries, runtime image and native dependencies. An unavailable prerequisite is missing validation, not a passed test. The pinger regression orders response EOF after capture joins the admitted probe, checks that health failure remains visible, and requires a separate quiesce acknowledgment. Negative controls cover CONNECT EOF, cancellation, truncated/invalid replies and bounded drain expiry. The read-recovery case retains bounded, key-redacted runtime/error log tails on failure so a pre-quiesce ping-drain error can be distinguished from guest quiesce failure.
+
+### 12.8 Checkpoint validation and measurement
+
+Run source checks separately from prebuilt-product E2E. Use a native Linux ext4
+scratch directory for direct I/O and space-reclamation checks; a Windows-mounted
+path, tmpfs-only run or skipped privileged test does not establish those results.
+
+```bash
+# In the prepared Go source environment, with TMPDIR on the filesystem under test:
+CGO_ENABLED=0 go test -count=1 ./internal/diffstore ./pkg/vhost ./pkg/artifact \
+  ./pkg/config ./pkg/sandboxfile ./pkg/snapshot ./pkg/restore ./pkg/sandbox ./pkg/ctl ./cmd/sandbox-ctl
+CGO_ENABLED=1 go test -race -count=1 ./internal/diffstore ./pkg/vhost ./pkg/artifact ./pkg/restore
+# Required full source gate in Workbench system mode with mount/namespace capability:
+bash scripts/ci-source-checks.sh
+
+# Dedicated, disposable 64 MiB ext4 filesystem; never a shared developer mount:
+DIFFSTORE_FULL_FS=/path/to/owned/finite-ext4 go test ./internal/diffstore \
+  -run '^TestRealFilesystemFullRecovery$' -count=1 -v
+
+# Root shell; PREPARED contains exact built artifacts and the platform E2E runner:
+python3 "$PREPARED/test/e2e/e2e" run --workdir "$PREPARED" \
+  --suite snapshot --include snapshot.checkpoint.sh
+
+# Actual payload histories; default sizes are 0,1,10 GiB:
+go test -c -o /path/to/compiled-vhost.test ./pkg/vhost
+go run ./test/perf/diffstore --directory /path/to/new-owned-directory \
+  --sizes-gib 0,1,10 --rounds 5 \
+  --vhost-test-binary /path/to/compiled-vhost.test
+
+python3 test/perf/checkpoint_cow.py --tmpdir /path/to/native-ext4/scratch \
+  --output /path/to/results --rounds 3 --operations 32768 \
+  --modes 'raw|v1|v2-no-version|v2-shared|v2-private|v2-xts-no-version|v2-xts-shared|v2-xts-private'
+
+python3 test/perf/checkpoint_template.py --tmpdir /path/to/native-ext4/scratch \
+  --output /path/to/template-results
+```
+
+The source suite checks independent-process pins and writer handoff, killed-owner
+redo reopening, real short writes, failed reservations, split/merge boundaries,
+retirement/GC restart, zero masking, encryption and metadata-only access. Artifact
+tests cover exact publication deletion, Bundle/external sources, rewriting,
+source-directory identity and same-directory versus materialized restore. The
+product case exercises root plus two data disks through cold boot, named capture,
+resume, concurrent fixed-version publication, historical/cross-directory restore
+and restoration after removing the original sources.
+
+The benchmark driver records host/filesystem/build identity, raw logs, frontend
+and checkpoint p50/p95/p99, throughput including final Drain, physical data/index/
+redo/GC byte counters, cache hits and process CPU/RSS. Its 64 MiB working set
+exceeds the 32 MiB COW cache, except the intentional 4 MiB hot case. At least three
+runs and two working-set traversals are required. Compare raw versus plaintext
+v2 and v1 versus encrypted v2 separately, including no-version, protected first
+write and already-private overwrite. These commands describe reproducible checks;
+they do not claim that performance targets or every privileged test passed.
+
+The template driver separately measures three rounds of fresh 64 MiB raw, v1
+XTS, v2 plaintext and v2 XTS initialization. It records Open, Ready,
+Materialized and total time, including initial synchronization and publication,
+then verifies the entire payload SHA256 outside the timing window. Source
+preparation is excluded; process peak RSS still includes that setup.
+
+The scaling driver removes each history before the next size. It reports
+checkpoint registration, control reopen and presence reconstruction separately;
+full resume includes rebuilding the presence bitmap and scales with mapped pages.
+The vhost helper freezes exactly 32 dirty pages (128 KiB) before writeback and
+reports template readiness, Drain, final materialization, metadata registration,
+capture total and reopen separately. Without the helper, registration samples
+have zero queued payload. The capture total excludes initial open and guest-write
+admission; it does not include VM memory capture. Larger sizes, such as 30 GiB,
+can be requested explicitly with `--sizes-gib`.
 
 ## 13. Reliability, performance, and compatibility boundaries
 

@@ -22,6 +22,7 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/ingest"
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
+	"github.com/kuasar-sandbox/sandboxer/internal/diffstore"
 	"github.com/kuasar-sandbox/sandboxer/internal/runidentity"
 	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
@@ -44,6 +45,9 @@ type RuntimeDiskSpec struct {
 
 // RuntimeSpec fixes the base VM shape. It contains no workload or credentials.
 type RuntimeSpec struct {
+	EnableCheckpoint                bool
+	checkpointPlan                  *CheckpointDiskPlan
+	checkpointOwner                 *diffstore.DirectoryOwner
 	Kernel, Bundle, Cmdline         string
 	Resources                       config.ResourcesConfig
 	Network                         NetworkDeviceSpec
@@ -139,6 +143,10 @@ type runtimeOwnedDisk struct {
 // Runtime owns one VM and its service goroutines. Wait observes cleanup;
 // Close requests graceful shutdown and waits for the same retained result.
 type Runtime struct {
+	checkpointCleanup                  func() error
+	checkpointOwner                    *diffstore.DirectoryOwner
+	listCheckpoints                    func(context.Context) ([]artifact.DiffCheckpointRef, error)
+	deleteCheckpoint                   func(context.Context, artifact.DiffCheckpointRef) error
 	consoleTTY                         atomic.Bool
 	mu                                 sync.Mutex
 	opsWG                              sync.WaitGroup
@@ -579,12 +587,32 @@ func (r *Runtime) Launch(ctx context.Context, spec LaunchSpec) error {
 		r.ownStorage = true
 	}
 	r.storage = spec.Storage
+	if spec.legacyAccess == nil && (r.spec.EnableCheckpoint || (spec.SourceBinding != nil && spec.SourceBinding.Checkpoint != nil)) {
+		checkpointStorage := opaqueLaunchStorage(spec)
+		prepared, release, err := prepareColdCheckpoint(ctx, RunOptions{checkpointStorage: checkpointStorage, EnableCheckpoint: r.spec.EnableCheckpoint, Cfg: cfg, PortableConfig: spec.PortableConfig, SourceBinding: spec.SourceBinding, ManifestCfg: spec.ManifestConfig, Fetcher: launchFetcher(spec), BundleReader: spec.BundleReader, BundleFetcher: spec.BundleFetcher, RefLocations: spec.RefLocations, CustomerKeyFn: launchKey(spec), LocalCodec: launchCodec(spec), LocalRequired: launchRequired(spec), SandboxID: r.sandboxID, PathID: r.pathID, BaseRoot: r.spec.BaseRoot})
+		if err != nil {
+			return fail(err)
+		}
+		r.checkpointCleanup = release
+		r.spec.checkpointOwner = prepared.checkpointOwner
+		r.spec.checkpointPlan = prepared.checkpointPlan
+		cfg = prepared.Cfg
+		spec.PortableConfig = prepared.PortableConfig
+		spec.SourceBinding = prepared.SourceBinding
+		if checkpointStorage == nil {
+			spec.Fetcher = prepared.Fetcher
+		}
+		// An opaque Storage remains authoritative for subsequent file/Bundle
+		// access too; introducing a public Fetcher override would discard it.
+		spec.BundleReader = prepared.BundleReader
+		spec.BundleFetcher = prepared.BundleFetcher
+	}
 	// Legacy Run already materializes a --from portable graph before deriving
 	// the runtime shape. Keep SourceBinding as provenance, but do not bind the
 	// same graph a second time during the SDK Launch adapter. Native SDK callers
 	// still bind their portable graph exactly once here.
 	if spec.SourceBinding != nil && spec.legacyAccess == nil {
-		if err := config.BindPortableDiskGraph(cfg, spec.SourceBinding.RuntimeRef, spec.SourceBinding.RelativeDir); err != nil {
+		if err := bindRuntimeDiskGraph(cfg, spec.PortableConfig, spec.SourceBinding); err != nil {
 			return fail(err)
 		}
 	}
@@ -626,7 +654,23 @@ func (r *Runtime) Launch(ctx context.Context, spec LaunchSpec) error {
 			return fail(err)
 		}
 	}
-	defaults, err := preflightColdArtifacts(ctx, cfg, launchFetcher(spec), spec.RefLocations, r.baseDir, r.sandboxID, launchCodec(spec), diffKey, launchRequired(spec), opener)
+	if r.spec.EnableCheckpoint {
+		directory := filepath.Join(r.baseDir, "checkpoint")
+		r.checkpointOwner = r.spec.checkpointOwner
+		if r.checkpointOwner == nil {
+			r.checkpointOwner, err = diffstore.LockDirectory(directory)
+		}
+		if err != nil {
+			return fail(err)
+		}
+		if r.spec.checkpointPlan == nil {
+			r.spec.checkpointPlan, err = PrepareCheckpointDiskPlan(cfg, nil, directory, nil)
+			if err != nil {
+				return fail(err)
+			}
+		}
+	}
+	defaults, err := preflightColdArtifacts(ctx, cfg, launchFetcher(spec), spec.RefLocations, r.baseDir, r.sandboxID, launchCodec(spec), diffKey, launchRequired(spec), opener, r.spec.checkpointPlan)
 	if err != nil {
 		return fail(err)
 	}
@@ -661,6 +705,19 @@ func (r *Runtime) Launch(ctx context.Context, spec LaunchSpec) error {
 	}
 	if err != nil {
 		return fail(err)
+	}
+	if r.spec.EnableCheckpoint {
+		parent := ""
+		if spec.SourceBinding != nil {
+			parent = spec.SourceBinding.SandboxRef
+		}
+		bases, e := portable.Checkpointed(parent)
+		if e != nil {
+			return fail(e)
+		}
+		if e = r.spec.checkpointPlan.Bind(bases); e != nil {
+			return fail(e)
+		}
 	}
 	cacheSize, dirtySize, err := cfg.Resources.DiffCOW.Bytes()
 	if err != nil {
@@ -722,7 +779,7 @@ func (r *Runtime) Launch(ctx context.Context, spec LaunchSpec) error {
 				base = x
 			}
 		}
-		owned := diffURI == ""
+		owned := diffURI == "" && !r.spec.EnableCheckpoint
 		if owned {
 			if err := os.MkdirAll(r.baseDir, 0755); err != nil {
 				return DiskBackend{}, err
@@ -753,6 +810,10 @@ func (r *Runtime) Launch(ctx context.Context, spec LaunchSpec) error {
 			return DiskBackend{}, err
 		}
 		opts := []vhost.BlockCOWOption{vhost.WithCOWCache(cache)}
+		if r.spec.EnableCheckpoint {
+			binding := r.spec.checkpointPlan.Disks[index]
+			opts = append(opts, vhost.WithCheckpoint(binding.DiffID, binding.BaseID))
+		}
 		if owned {
 			opts = append(opts, vhost.WithDiscardOnClose())
 		}
@@ -867,10 +928,17 @@ func openLaunchFile(ctx context.Context, s LaunchSpec, path string, ref manifest
 	// manifest configuration, customer key, codec, and lazy clients. Preserve
 	// that configuration instead of reconstructing it from public LaunchSpec
 	// fields when the caller did not explicitly override access.
-	if s.legacyAccess == nil && s.Storage != nil && s.ManifestConfig == nil && s.Fetcher == nil && s.Credentials == nil {
-		return s.Storage.OpenFileWithLocations(ctx, path, ref, locations)
+	if storage := opaqueLaunchStorage(s); storage != nil {
+		return storage.OpenFileWithLocations(ctx, path, ref, locations)
 	}
 	return artifact.OpenFileWithLocations(ctx, path, ref, s.ManifestConfig, launchKey(s), launchFetcher(s), locations, launchCodec(s), launchRequired(s))
+}
+
+func opaqueLaunchStorage(s LaunchSpec) *artifact.ProcessStorage {
+	if s.legacyAccess == nil && s.Storage != nil && s.ManifestConfig == nil && s.Fetcher == nil && s.Credentials == nil {
+		return s.Storage
+	}
+	return nil
 }
 
 func launchFetcher(s LaunchSpec) fetch.Fetcher {
@@ -1011,6 +1079,12 @@ func (r *Runtime) cleanupResources() (retErr error) {
 		if d.ownedDiff {
 			_ = os.Remove(d.diffPath)
 		}
+	}
+	if r.checkpointOwner != nil {
+		retErr = errors.Join(retErr, r.checkpointOwner.Close())
+	}
+	if r.checkpointCleanup != nil {
+		retErr = errors.Join(retErr, r.checkpointCleanup())
 	}
 	// Automatic diffs are the only reason an otherwise-empty baseDir may have
 	// been created. Preserve retained files by using non-recursive Remove.

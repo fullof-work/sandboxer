@@ -29,11 +29,12 @@ import (
 // artifact access. Manifest clients are allocated only when Fetcher is first
 // used, so file-only operations do not connect to cache or store.
 type ProcessStorage struct {
-	cfg           *config.ManifestConfig
-	keyFn         ingest.CustomerKeyFunc
-	localCodec    tarstream.Codec
-	localRequired bool
-	fetcher       *onDemandManifestFetcher
+	cfg             *config.ManifestConfig
+	keyFn           ingest.CustomerKeyFunc
+	localCodec      tarstream.Codec
+	localRequired   bool
+	fetcher         *onDemandManifestFetcher
+	borrowedFetcher fetch.Fetcher
 }
 
 // NewProcessStorage initializes process-local artifact access from cfg and the
@@ -52,14 +53,73 @@ func NewProcessStorage(cfg *config.ManifestConfig) (*ProcessStorage, error) {
 // resolver is evaluated at most once and its result is fixed for every fetch,
 // ingest, and local-codec operation owned by the returned storage.
 func NewProcessStorageWithCustomerKey(cfg *config.ManifestConfig, customerKey ingest.CustomerKeyFunc) (*ProcessStorage, error) {
+	s, err := newProcessStorage(cfg, customerKey)
+	if err != nil || cfg == nil {
+		return s, err
+	}
+	policy, err := cfg.Crypto.LocalPolicy()
+	if err != nil {
+		return nil, err
+	}
+	if policy != crypto.LocalOff {
+		key, err := s.keyFn()
+		if err != nil {
+			return nil, err
+		}
+		s.localCodec, err = crypto.NewTarStreamCodec(key)
+		clear(key[:])
+		if err != nil {
+			return nil, err
+		}
+		s.localRequired = policy == crypto.LocalRequired
+	}
+	return s, nil
+}
+
+// NewProcessStorageWithLocalAccess preserves an embedding caller's explicit
+// local codec and plaintext policy, including when no manifest config exists.
+// The optional Fetcher is borrowed and remains owned by the caller. The customer
+// key is fixed on first use, just as for manifest-backed storage.
+func NewProcessStorageWithLocalAccess(cfg *config.ManifestConfig, customerKey ingest.CustomerKeyFunc, codec tarstream.Codec, required bool, borrowed ...fetch.Fetcher) (*ProcessStorage, error) {
+	if len(borrowed) > 1 {
+		return nil, fmt.Errorf("artifact storage: at most one borrowed fetcher is allowed")
+	}
+	if required && codec == nil {
+		return nil, fmt.Errorf("artifact storage: local required policy requires a codec")
+	}
+	if codec != nil && customerKey == nil {
+		return nil, fmt.Errorf("artifact storage: local codec requires a customer key resolver")
+	}
+	s, err := newProcessStorage(cfg, customerKey)
+	if err != nil {
+		return nil, err
+	}
+	s.localCodec, s.localRequired = codec, required
+	if len(borrowed) == 1 {
+		s.borrowedFetcher = borrowed[0]
+	}
+	return s, nil
+}
+
+// Borrow preserves the complete artifact-access capability without transferring
+// ownership. Closing the result never closes the original storage or its client.
+// The caller must keep the original storage open until the borrower is released.
+func (s *ProcessStorage) Borrow() *ProcessStorage {
+	if s == nil {
+		return nil
+	}
+	return &ProcessStorage{cfg: s.cfg, keyFn: s.keyFn, localCodec: s.localCodec,
+		localRequired: s.localRequired, borrowedFetcher: s.Fetcher()}
+}
+
+func newProcessStorage(cfg *config.ManifestConfig, customerKey ingest.CustomerKeyFunc) (*ProcessStorage, error) {
 	s := &ProcessStorage{cfg: cfg}
-	if cfg == nil {
+	if customerKey == nil {
+		if cfg != nil {
+			return nil, fmt.Errorf("artifact storage: customer key resolver is required")
+		}
 		return s, nil
 	}
-	if customerKey == nil {
-		return nil, fmt.Errorf("artifact storage: customer key resolver is required")
-	}
-
 	var (
 		once   sync.Once
 		key    [32]byte
@@ -69,27 +129,13 @@ func NewProcessStorageWithCustomerKey(cfg *config.ManifestConfig, customerKey in
 		once.Do(func() { key, keyErr = customerKey() })
 		return key, keyErr
 	}
-
-	policy, err := cfg.Crypto.LocalPolicy()
-	if err != nil {
-		return nil, err
-	}
-	if policy != crypto.LocalOff {
-		key, err = s.keyFn()
-		if err != nil {
-			return nil, err
+	if cfg != nil {
+		s.fetcher = &onDemandManifestFetcher{cfg: cfg, keyFn: s.keyFn}
+		if !verificationOptions(cfg).VerifyContent {
+			warnVerificationDisabled.Do(func() {
+				log.Printf("WARNING: manifest.verify_content=false; ordinary remote and Bundle Manifest/Chunk SHA-256 verification is disabled")
+			})
 		}
-		s.localCodec, err = crypto.NewTarStreamCodec(key)
-		if err != nil {
-			return nil, err
-		}
-		s.localRequired = policy == crypto.LocalRequired
-	}
-	s.fetcher = &onDemandManifestFetcher{cfg: cfg, keyFn: s.keyFn}
-	if !verificationOptions(cfg).VerifyContent {
-		warnVerificationDisabled.Do(func() {
-			log.Printf("WARNING: manifest.verify_content=false; ordinary remote and Bundle Manifest/Chunk SHA-256 verification is disabled")
-		})
 	}
 	return s, nil
 }
@@ -112,7 +158,7 @@ func (s *ProcessStorage) ManifestConfig() *config.ManifestConfig {
 }
 
 // CustomerKeyFunc returns the process-fixed key resolver used by manifest
-// fetch and ingest operations. It is nil when no manifest config was supplied.
+// fetch, ingest, and local DIFF operations. It is nil when no resolver was supplied.
 func (s *ProcessStorage) CustomerKeyFunc() ingest.CustomerKeyFunc {
 	if s == nil {
 		return nil
@@ -120,16 +166,22 @@ func (s *ProcessStorage) CustomerKeyFunc() ingest.CustomerKeyFunc {
 	return s.keyFn
 }
 
-// Fetcher returns the process-owned lazy manifest fetcher. It is nil when no
-// manifest config was supplied.
+// Fetcher returns the borrowed access capability or the process-owned lazy
+// manifest fetcher. It is nil when neither was supplied.
 func (s *ProcessStorage) Fetcher() fetch.Fetcher {
-	if s == nil || s.fetcher == nil {
+	if s == nil {
+		return nil
+	}
+	if s.borrowedFetcher != nil {
+		return s.borrowedFetcher
+	}
+	if s.fetcher == nil {
 		return nil
 	}
 	return s.fetcher
 }
 
-// LocalCodec returns the codec selected by crypto.local.
+// LocalCodec returns the configured or explicitly supplied local codec.
 func (s *ProcessStorage) LocalCodec() tarstream.Codec {
 	if s == nil {
 		return nil

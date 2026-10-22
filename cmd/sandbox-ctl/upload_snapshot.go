@@ -37,6 +37,7 @@ func publishArtifactCmd(command string, args []string) int {
 	fs.Var(&reduceRefs, "reduce-ref", "reduce a complete reference chain A=X, A, or any (disjoint from replacement rules)")
 	skipVerifyRef := fs.Bool("skip-verify-ref", false, "skip replacement equivalence proof (identity and I/O checks remain enabled)")
 	jsonOutput := fs.Bool("json", false, "print final root references and removedRefs as JSON")
+	deleteCheckpoint := fs.Bool("delete-checkpoint", false, "delete the exact local versions after successful publication")
 	quiet := fs.Bool("quiet", false, "suppress progress logs on stderr")
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -98,10 +99,26 @@ func publishArtifactCmd(command string, args []string) int {
 	ctx, stopSignals := commandContext()
 	defer stopSignals()
 	result, publishErr := publisher.PublishWithOptions(ctx, input, rewrite)
-	closeErr := errors.Join(publisher.Close(), storage.Close())
+	closeErr := publisher.Close()
 	if err := errors.Join(publishErr, closeErr); err != nil {
-		fmt.Fprintln(os.Stderr, err)
+		fmt.Fprintln(os.Stderr, errors.Join(err, storage.Close()))
 		return 1
+	}
+	cleanupErr := error(nil)
+	if *deleteCheckpoint {
+		cleanupErr = storage.DeletePublishedDiffCheckpoints(ctx, result)
+	}
+	storageCloseErr := storage.Close()
+	exitCode := 0
+	if cleanupErr != nil {
+		fmt.Fprintf(os.Stderr, "publication succeeded; checkpoint cleanup failed: %v\n", cleanupErr)
+		exitCode = 79
+	}
+	if storageCloseErr != nil {
+		fmt.Fprintln(os.Stderr, storageCloseErr)
+		if exitCode == 0 {
+			exitCode = 1
+		}
 	}
 	if *jsonOutput {
 		report, err := result.Report()
@@ -112,11 +129,11 @@ func publishArtifactCmd(command string, args []string) int {
 			fmt.Fprintln(os.Stderr, err)
 			return 1
 		}
-		return 0
+		return exitCode
 	}
 	if _, err := fmt.Fprintln(os.Stdout, result.Ref); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
-	return 0
+	return exitCode
 }

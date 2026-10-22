@@ -60,6 +60,8 @@ class ReadRecoveryFatalCauseTests(unittest.TestCase):
             Path(directory, "recovered.snapshot.log").write_text(error + "\n")
             Path(directory, "recovered.log").write_text(
                 "old log\n" * 10000 + "source manifest://" + key + "\n" + error + "\n")
+            Path(directory, "cow.app.log").write_text(
+                "old app log\n" * 10000 + "manifest://" + key + "\nDISK-READ-BEGIN\n")
             Path(directory, "manifest.yaml").write_text("must-not-read-config")
             result = subprocess.run([sys.executable, "-c", diagnostic, directory],
                                     text=True, capture_output=True)
@@ -67,6 +69,8 @@ class ReadRecoveryFatalCauseTests(unittest.TestCase):
             self.assertIn(error, result.stderr)
             self.assertIn("snapshot: seed capture failed", result.stderr)
             self.assertIn("seed capture reached", result.stderr)
+            self.assertIn("read-recovery diagnostic cow.app.log bytes=", result.stderr)
+            self.assertIn("DISK-READ-BEGIN", result.stderr)
             self.assertIn("<redacted>", result.stderr)
             self.assertNotIn(key, result.stderr)
             self.assertNotIn("must-not-read-config", result.stderr)
@@ -99,6 +103,140 @@ class ReadRecoveryFatalCauseTests(unittest.TestCase):
                         env={**os.environ, "WORK": directory})
                     self.assertEqual(result.returncode, 0 if expected else 1,
                                      result.stdout + result.stderr)
+
+
+
+class ReadRecoveryMarkerTests(unittest.TestCase):
+    @staticmethod
+    def case_source():
+        return (ROOT / "test/e2e/cases/snapshot.read-recovery.sh").read_text()
+
+    @staticmethod
+    def function(source, name):
+        return name + "() {" + source.split(name + "() {", 1)[1].split("\n}\n", 1)[0] + "\n}\n"
+
+    def run_launch(self, payload, probe, *, merged=False, sid="cow", existing=b"",
+                   diagnostic=b"[sandbox-init][T+412ms] exec: session done pid=76 code=0"):
+        source = self.case_source()
+        launch = self.function(source, "launch")
+        if merged:
+            # Negative control: restore the former shared stdout/stderr sink.
+            self.assertIn(' --stdout-to "$app_log"', launch)
+            launch = launch.replace(' --stdout-to "$app_log"', '', 1)
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            app = work / (sid + ".app.log")
+            app.write_bytes(existing)
+            fake = work / "sandbox-ctl"
+            # Match the existing --stdout-to append semantics. A split console
+            # message surrounds the guest payload, deterministically recreating
+            # the ARM CI interleaving without a VM or scheduling assumptions.
+            fake.write_text("#!" + sys.executable + "\n" + r"""
+import os, pathlib, sys, time
+args = sys.argv[1:]
+out = 1
+if '--stdout-to' in args:
+    out = os.open(args[args.index('--stdout-to') + 1], os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+os.write(2, bytes.fromhex(os.environ['FAKE_DIAGNOSTIC']))
+payload = bytes.fromhex(os.environ['FAKE_PAYLOAD'])
+half = len(payload) // 2
+os.write(out, payload[:half])
+os.write(out, payload[half:])
+os.write(2, b'\n')
+if out != 1:
+    os.close(out)
+ready = int(next(arg.split('=', 1)[1] for arg in args if arg.startswith('--ready-fd=')))
+os.write(ready, b'control_ready\nready\n')
+os.close(ready)
+end = time.monotonic() + 5
+while not pathlib.Path(os.environ['WORK'], 'fake.release').exists():
+    if time.monotonic() >= end:
+        sys.exit(3)
+    time.sleep(.01)
+""")
+            fake.chmod(0o755)
+            script = '\n'.join([
+                'set -euo pipefail',
+                'source "$READINESS_HELPER"',
+                'SESSIONS=()',
+                self.function(source, "wait_file"),
+                self.function(source, "wait_file_count"),
+                launch,
+                'e2e_fail() { echo "$*" >&2; return 1; }',
+                'launch "$TEST_SID" --config "$WORK/unused.yaml"',
+                'LAUNCHED_PID=$RUN_PID',
+                """trap 'status=$?; touch "$WORK/fake.release"; wait "$LAUNCHED_PID" || true; exit "$status"' EXIT""",
+                # Negative predicates fail immediately after checking the file;
+                # the production marker expression and comparison are unchanged.
+                'RUN_PID=999999999',
+                probe,
+            ])
+            result = subprocess.run(['bash', '-c', script], text=True, capture_output=True,
+                                    timeout=10, env={**os.environ, 'WORK': directory,
+                                        'BIN': directory, 'TEST_SID': sid,
+                                        'READINESS_HELPER': str(LIB / 'readiness_helpers.sh'),
+                                        'FAKE_PAYLOAD': payload.hex(),
+                                        'FAKE_DIAGNOSTIC': diagnostic.hex()})
+            return result, app.read_bytes(), (work / (sid + '.log')).read_bytes()
+
+    def begin_wait(self):
+        return next(line for line in self.case_source().splitlines()
+                    if line.startswith('wait_file ') and "'^DISK-READ-BEGIN$'" in line)
+
+    def test_console_interleaving_cannot_hide_application_marker(self):
+        result, app, diagnostic = self.run_launch(b'DISK-READ-BEGIN\n', self.begin_wait())
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(app, b'DISK-READ-BEGIN\n')
+        self.assertNotIn(b'DISK-READ-BEGIN', diagnostic)
+
+    def test_merged_stream_negative_control_loses_exact_marker(self):
+        result, app, diagnostic = self.run_launch(
+            b'DISK-READ-BEGIN\n', self.begin_wait().replace('cow.app.log', 'cow.log'), merged=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(app, b'')
+        self.assertIn(b'code=0DISK-READ-BEGIN\n\n', diagnostic)
+
+    def test_marker_must_be_exact_and_from_this_application_run(self):
+        for name, payload, existing in (
+                ('prefix', b'prefixDISK-READ-BEGIN\n', b''),
+                ('suffix', b'DISK-READ-BEGINsuffix\n', b''),
+                ('carriage-return', b'DISK-READ-BEGIN\r\n', b''),
+                ('partial', b'DISK-READ-', b''),
+                ('diagnostic-only', b'', b''),
+                ('stale-file', b'', b'DISK-READ-BEGIN\n')):
+            with self.subTest(name=name):
+                result, app, _ = self.run_launch(payload, self.begin_wait(), existing=existing,
+                                                diagnostic=b'DISK-READ-BEGIN\n')
+                self.assertNotEqual(result.returncode, 0, name)
+                self.assertEqual(app, payload)
+
+    def test_premature_recovery_still_fails_with_interleaved_diagnostics(self):
+        source = self.case_source()
+        for marker in ('COW-RECOVERED', 'DISK-READ-RECOVERED'):
+            with self.subTest(marker=marker):
+                start = "if grep -q '^" + marker + "$'"
+                guard = start + source.split(start, 1)[1].split('\nfi\n', 1)[0] + '\nfi\n'
+                result, app, _ = self.run_launch((marker + '\n').encode(), guard)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('while its', result.stderr)
+                self.assertEqual(app, (marker + '\n').encode())
+
+    def test_idle_wait_requires_a_new_application_occurrence(self):
+        lines = self.case_source().splitlines()
+        baseline = next(line for line in lines if line.startswith('VERIFIED_IDLE_BASE='))
+        waiter = next(line for line in lines if line.startswith('wait_file_count '))
+        probe = '\n'.join([
+            baseline,
+            '[ "$VERIFIED_IDLE_BASE" = 1 ]',
+            'if ' + waiter + '; then e2e_fail "replayed idle marker accepted"; fi',
+            'printf "RECOVERY-IDLE\\n" >>"$WORK/verified.app.log"',
+            waiter,
+        ])
+        result, app, _ = self.run_launch(b'RECOVERY-IDLE\n', probe, sid='verified',
+                                        existing=b'RECOVERY-IDLE\n',
+                                        diagnostic=b'RECOVERY-IDLE\nRECOVERY-IDLE\n')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(app, b'RECOVERY-IDLE\nRECOVERY-IDLE\n')
 
 
 class HarnessProcessTests(unittest.TestCase):
@@ -434,6 +572,173 @@ class SourceFaultTests(unittest.TestCase):
             mutate(changed)
             with self.assertRaises(AssertionError):
                 usage_sources.validate_old_epoch(changed, "old", "new")
+
+
+class SourceFaultFilesystemRecoveryBoundaryTests(unittest.TestCase):
+    """Drive filesystem_case's real assertions without a VM or wall-clock waits."""
+
+    def run_case(self, work, delay=3.2, fault=None):
+        state = SimpleNamespace(now=0.0, held_at=None, statfs_done=False,
+                                release_at=None, records={}, anchor_reads=0,
+                                used=100, other_used=100, held_value=None)
+        clock = SimpleNamespace(
+            monotonic=lambda: state.now,
+            sleep=lambda seconds: setattr(state, "now", state.now + seconds))
+        case_dir = work / "filesystem"
+        case_dir.mkdir()
+        finished = SimpleNamespace(returncode=0, poll=lambda: 0, wait=lambda timeout: None)
+
+        def trace_poll():
+            if fault == "tracer_exited" and state.statfs_done:
+                return 1
+            return None if state.release_at is None else 0
+
+        trace = SimpleNamespace(returncode=0, poll=trace_poll, wait=lambda timeout: None)
+
+        def popen(command, stdout, **kwargs):
+            if "trace-fs" in command:
+                state.held_at, state.held_value = state.now, state.used
+                stdout.write("fstatfs(3</data>, ...) = 0\n")
+                return trace
+            if "init-resources-stream" in command:
+                for _ in range(3):
+                    stdout.write('{"fds": 5}\n')
+                return finished
+            if "trace-stop" in command:
+                state.release_at = state.now
+                return finished
+            raise AssertionError(("unexpected process", command))
+
+        def cli(*args):
+            if args[-1] == "inspect":
+                return json.dumps({"sandbox_init_sha256": "digest",
+                                   "balloon_proc_field": "false",
+                                   "zoneinfo": "pagesets count:"})
+            if "write" in args:
+                field = "used" if args[-2].startswith("/data/") else "other_used"
+                setattr(state, field, getattr(state, field) + 8 * 1024 * 1024)
+                return ""
+            if "statfs" in args:
+                # Real guest exec is synchronous; valid blocked request IDs
+                # keep advancing while this caller cannot observe them.
+                state.now += delay
+                state.statfs_done = True
+                return json.dumps({"Blocks": state.used, "Bfree": 0,
+                                   "Frsize": 1, "Bsize": 1})
+            raise AssertionError(("unexpected CLI call", args))
+
+        def view():
+            tick = int(state.now + 1e-7)
+            request_id = 100 + tick
+            held = state.held_at is not None
+            hold_tick = int(state.held_at + 1e-7) if held else tick
+            disk = dict(name="filesystem.disk-0", last_request_id=str(request_id),
+                        covered_total_ns=str(hold_tick * 1_000_000_000),
+                        integral_total_byte_ns=str(hold_tick * 10_000_000_000),
+                        last_value_bytes=str(state.held_value if held else state.used),
+                        span_total_ns=str(tick * 1_000_000_000),
+                        status=("timeout" if tick == hold_tick else "busy") if held else "ok",
+                        continuous=not held)
+            epoch = "run-1"
+            if state.statfs_done and state.release_at is None:
+                state.anchor_reads += 1
+                if fault in ("covered_total_ns", "integral_total_byte_ns", "last_value_bytes"):
+                    disk[fault] = str(int(disk[fault]) + 1)
+                elif fault == "anchor_ok":
+                    disk["status"] = "ok"
+                elif fault == "anchor_continuous":
+                    disk["continuous"] = True
+                elif fault == "anchor_regression":
+                    disk["last_request_id"] = "1"
+                elif fault == "anchor_epoch":
+                    epoch = "run-2"
+            if state.release_at is not None:
+                step = tick - int(state.release_at + 1e-7)
+                if step >= 1:
+                    if fault != "never_recovers":
+                        disk.update(status="ok", continuous=True,
+                                    last_value_bytes=str(state.used),
+                                    covered_total_ns=str((hold_tick + step - 1) * 1_000_000_000),
+                                    integral_total_byte_ns=str(hold_tick * 10_000_000_000 +
+                                                              (step - 1) * state.used * 1_000_000_000))
+                        if step == 1:
+                            if fault == "late_raw":
+                                disk["last_value_bytes"] = str(state.held_value)
+                            elif fault == "integrates_gap":
+                                disk["covered_total_ns"] = str(int(disk["covered_total_ns"]) + 1)
+                            elif fault == "integrates_area":
+                                disk["integral_total_byte_ns"] = str(int(disk["integral_total_byte_ns"]) + 1)
+                    if fault == "post_release_gap":
+                        disk["last_request_id"] = str(request_id + 1)
+            others = [dict(name=name, status="ok", last_request_id=str(request_id),
+                           covered_total_ns=str(tick * 1_000_000_000),
+                           last_value_bytes=str(state.other_used))
+                      for name in ("guest.memory", "filesystem.root", "filesystem.disk-1",
+                                   "ch.rss_anon", "ch.rss_file",
+                                   "sandbox_ctl.rss_anon", "sandbox_ctl.rss_file")]
+            return {"live": {"run_epoch": epoch, "gauges": [disk, *others]}}
+
+        sandbox = SimpleNamespace(dir=case_dir, runroot=case_dir / "run", name="sample",
+                                  ready=lambda: None, cli=cli, view=view)
+        with patch.object(usage_sources, "Sandbox", return_value=sandbox), \
+             patch.object(usage_sources, "filesystem_config", return_value={}), \
+             patch.object(usage_sources, "digest", return_value="digest"), \
+             patch.object(usage_sources, "runtime_init_digest", return_value="digest"), \
+             patch.object(usage_sources, "resources", return_value={"fds": 5}), \
+             patch.object(usage_sources, "subprocess", SimpleNamespace(Popen=popen, STDOUT=subprocess.STDOUT)), \
+             patch.object(usage_sources, "time", clock), \
+             patch.object(usage_sources, "cleanup_sources"), \
+             patch.object(usage_sources, "write_json",
+                          side_effect=lambda path, value: state.records.__setitem__(
+                              path.name, copy.deepcopy(value))), \
+             patch.object(sys, "stdout", io.StringIO()):
+            usage_sources.filesystem_case(work, "ref", 15)
+        return state
+
+    def test_synchronous_statfs_can_span_blocked_rounds_before_release(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = self.run_case(Path(directory))
+            previous = usage.metric(state.records["during.json"][-1]["live"], "gauges", "filesystem.disk-0")
+            anchor = usage.metric(state.records["recovery-baseline.json"]["live"], "gauges", "filesystem.disk-0")
+            first = usage.metric(state.records["recovered.json"][0]["live"], "gauges", "filesystem.disk-0")
+            self.assertGreater(int(anchor["last_request_id"]), int(previous["last_request_id"]) + 1)
+            self.assertEqual(int(first["last_request_id"]), int(anchor["last_request_id"]) + 1)
+            self.assertEqual(state.anchor_reads, 1)
+
+    def test_no_synchronous_delay_still_passes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.run_case(Path(directory), delay=0.0)
+
+    def test_anchor_requires_live_tracer_and_blocked_noncontinuous_sample(self):
+        for fault, message in (("tracer_exited", "Guest tracer exited before recovery baseline"),
+                               ("anchor_ok", "filesystem recovery baseline is not blocked"),
+                               ("anchor_continuous", "filesystem recovery baseline is not blocked")):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as directory:
+                with self.assertRaisesRegex(AssertionError, message):
+                    self.run_case(Path(directory), fault=fault)
+
+    def test_anchor_rejects_epoch_change_and_request_regression(self):
+        for fault, message in (("anchor_epoch", "filesystem recovery epoch changed"),
+                               ("anchor_regression", "filesystem recovery request regressed")):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as directory:
+                with self.assertRaisesRegex(AssertionError, message):
+                    self.run_case(Path(directory), fault=fault)
+
+    def test_anchor_cannot_change_accounting_or_last_known_value(self):
+        for field in ("covered_total_ns", "integral_total_byte_ns", "last_value_bytes"):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as directory:
+                with self.assertRaisesRegex(AssertionError, "blocked filesystem recovery baseline changed"):
+                    self.run_case(Path(directory), fault=field)
+
+    def test_released_rounds_still_require_complete_fresh_recovery(self):
+        for fault, message in (("post_release_gap", "unobserved recovery round"),
+                               ("late_raw", "late raw buffer was replayed"),
+                               ("integrates_gap", "missing interval was integrated"),
+                               ("integrates_area", "missing interval was integrated"),
+                               ("never_recovers", "fresh sampling did not resume")):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as directory:
+                with self.assertRaisesRegex(AssertionError, message):
+                    self.run_case(Path(directory), fault=fault)
 
 
 class CHRecoveryObservationTests(unittest.TestCase):

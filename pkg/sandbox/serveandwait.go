@@ -23,6 +23,7 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/ingest"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
+	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/ctl"
 	"github.com/kuasar-sandbox/sandboxer/pkg/guestlink"
@@ -30,6 +31,7 @@ import (
 	"github.com/kuasar-sandbox/sandboxer/pkg/mux"
 	"github.com/kuasar-sandbox/sandboxer/pkg/proto"
 	"github.com/kuasar-sandbox/sandboxer/pkg/resctl"
+	"github.com/kuasar-sandbox/sandboxer/pkg/snapshot"
 	"github.com/kuasar-sandbox/sandboxer/pkg/stdio"
 	"github.com/kuasar-sandbox/sandboxer/pkg/uffd"
 	"github.com/kuasar-sandbox/sandboxer/pkg/usage"
@@ -93,6 +95,7 @@ type PostSpawnCtx struct {
 // callers (sandbox.Run / restore.Run) keep their own thin front-half
 // (config resolution, cgroup, controller admit) and converge here.
 type VMParams struct {
+	EnableCheckpoint   bool
 	owner              *Runtime
 	Ctx                context.Context
 	SandboxID          string
@@ -214,12 +217,19 @@ type DiskArg struct {
 // upper-only logical view; Size supports predictable preflight checks without
 // constructing that view, and DiffPath remains for diagnostics and cleanup.
 type SnapDiskRef struct {
-	DiffPath     string
-	OwnedDiff    bool
-	Size         int64
-	SnapshotView func() (io.ReadSeeker, []sparse.Extent, error)
-	WaitReady    func(context.Context) error
-	CheckError   func() error
+	DiffID            string
+	Checkpoint        func(context.Context, string) error
+	DeleteCheckpoint  func(context.Context, string) error
+	DeleteCheckpoints func(context.Context, []string) error
+	ListCheckpoints   func(context.Context) ([]string, error)
+	WaitMaterialized  func(context.Context) error
+	Export            func(context.Context) (snapshot.ExportView, error)
+	DiffPath          string
+	OwnedDiff         bool
+	Size              int64
+	SnapshotView      func() (io.ReadSeeker, []sparse.Extent, error)
+	WaitReady         func(context.Context) error
+	CheckError        func() error
 }
 
 // ServeAndWait owns the half of the sandbox lifecycle that is identical
@@ -654,36 +664,89 @@ func ServeAndWait(p VMParams) (int, error) {
 
 	// ctl.sock server for snapshot requests. SnapshotHandler is the
 	// shared bundle both Run and restore.Run use.
-	snapHandler := &SnapshotHandler{
-		CheckpointDir:  filepath.Join(p.BaseDir, "checkpoint"),
-		Cfg:            p.SnapCfg,
-		PortableConfig: p.PortableConfig,
-		SourceBinding:  p.SourceBinding,
-		MemoryBinding:  p.MemoryBinding,
-		ManifestCfg:    p.ManifestCfg,
-		Fetcher:        p.Fetcher,
-		BundleReader:   p.BundleReader,
-		BundleFetcher:  p.BundleFetcher,
-		RefLocations:   p.RefLocations,
-		CustomerKeyFn:  p.CustomerKeyFn,
-		LocalCodec:     p.LocalCodec,
-		LocalRequired:  p.LocalRequired,
-		SandboxID:      p.SandboxID,
-		Memfd:          memfd,
-		Disks:          snapDisks,
-		Servers:        servers,
-		CHSock:         chSock,
-		RunDir:         runDir,
-		Pinger:         pinger,
-		Forwarder:      forwarder,
-		Reattach:       reattach,
-		Memory:         p.Memory,
-		usageSampler:   usageSampler,
-		CHProcess:      currentCHProcess,
-		Context:        backendCtx,
-		Logf:           logf,
+	enabled := p.EnableCheckpoint
+	if p.owner != nil {
+		enabled = enabled || p.owner.spec.EnableCheckpoint
 	}
+	snapDisks = bindCheckpointDisks(snapDisks, p.Disks)
+	snapHandler := &SnapshotHandler{
+		EnableCheckpoint: enabled,
+		CheckpointDir:    filepath.Join(p.BaseDir, "checkpoint"),
+		Cfg:              p.SnapCfg,
+		PortableConfig:   p.PortableConfig,
+		SourceBinding:    p.SourceBinding,
+		MemoryBinding:    p.MemoryBinding,
+		ManifestCfg:      p.ManifestCfg,
+		Fetcher:          p.Fetcher,
+		BundleReader:     p.BundleReader,
+		BundleFetcher:    p.BundleFetcher,
+		RefLocations:     p.RefLocations,
+		CustomerKeyFn:    p.CustomerKeyFn,
+		LocalCodec:       p.LocalCodec,
+		LocalRequired:    p.LocalRequired,
+		SandboxID:        p.SandboxID,
+		Memfd:            memfd,
+		Disks:            snapDisks,
+		Servers:          servers,
+		CHSock:           chSock,
+		RunDir:           runDir,
+		Pinger:           pinger,
+		Forwarder:        forwarder,
+		Reattach:         reattach,
+		Memory:           p.Memory,
+		usageSampler:     usageSampler,
+		CHProcess:        currentCHProcess,
+		Context:          backendCtx,
+		Logf:             logf,
+	}
+	var checkpointOwner ctl.CheckpointOwner
+	var checkpointOwnerMu sync.RWMutex
+	publishCheckpointOwner := func() error {
+		checkpointOwnerMu.Lock()
+		defer checkpointOwnerMu.Unlock()
+		if checkpointOwner.ID != "" {
+			return nil
+		}
+		var err error
+		checkpointOwner, err = ctl.PublishCheckpointOwner(snapHandler.CheckpointDir, ctlSockPath)
+		return err
+	}
+	defer func() {
+		checkpointOwnerMu.Lock()
+		defer checkpointOwnerMu.Unlock()
+		if checkpointOwner.ID != "" {
+			_ = ctl.RemoveCheckpointOwner(snapHandler.CheckpointDir, checkpointOwner)
+		}
+	}()
+
 	ctlSrv := &ctl.Server{
+		CheckpointListHandler: func(req ctl.Request) ([]ctl.DiffCheckpointRef, error) {
+			if p.owner != nil {
+				if err := p.owner.requireRunning(); err != nil {
+					return nil, err
+				}
+			}
+			refs, err := snapHandler.listDiffCheckpoints(backendCtx)
+			out := make([]ctl.DiffCheckpointRef, len(refs))
+			for i, r := range refs {
+				out[i] = ctl.DiffCheckpointRef{DiffID: r.DiffID, ID: r.ID}
+			}
+			return out, err
+		},
+		CheckpointDeleteHandler: func(req ctl.Request) error {
+			if p.owner != nil {
+				if err := p.owner.requireRunning(); err != nil {
+					return err
+				}
+			}
+			checkpointOwnerMu.RLock()
+			ownerID := checkpointOwner.ID
+			checkpointOwnerMu.RUnlock()
+			if req.CheckpointOwner != "" && req.CheckpointOwner != ownerID {
+				return errors.New("checkpoint owner changed")
+			}
+			return snapHandler.deleteDiffCheckpoints(backendCtx, req.CheckpointRefs)
+		},
 		Path: ctlSockPath,
 		Logf: logf,
 		ResourceStatsHandler: func(_ ctl.Request) (ctl.Response, error) {
@@ -750,6 +813,10 @@ func ServeAndWait(p VMParams) (int, error) {
 		r.mu.Lock()
 		r.launch = launch
 		r.runDir = runDir
+		r.listCheckpoints = snapHandler.listDiffCheckpoints
+		r.deleteCheckpoint = func(ctx context.Context, ref artifact.DiffCheckpointRef) error {
+			return snapHandler.deleteDiffCheckpoints(ctx, []ctl.DiffCheckpointRef{{DiffID: ref.DiffID, ID: ref.ID}})
+		}
 		r.stats = func() (ctl.Response, error) { return ctlSrv.ResourceStatsHandler(ctl.Request{}) }
 		r.snapshot = func(ctx context.Context, req ctl.Request) (ctl.Response, error) {
 			op, cancel := context.WithCancel(ctx)
@@ -813,7 +880,7 @@ func ServeAndWait(p VMParams) (int, error) {
 			snapHandler.CustomerKeyFn = launchKey(spec)
 			snapHandler.LocalCodec = launchCodec(spec)
 			snapHandler.LocalRequired = launchRequired(spec)
-			snapHandler.Disks = refs
+			snapHandler.Disks = bindCheckpointDisks(refs, disks)
 			stdioMu.Lock()
 			stdioMode = spec.Stdio
 			r.consoleTTY.Store(spec.Stdio.TTY)
@@ -835,6 +902,11 @@ func ServeAndWait(p VMParams) (int, error) {
 				index++
 			}
 			// Publish launch only after every backend and its capture provenance exists.
+			if enabled {
+				if err := publishCheckpointOwner(); err != nil {
+					return err
+				}
+			}
 			return launch.SetSpec(ls)
 		}
 		r.mu.Unlock()
@@ -845,6 +917,13 @@ func ServeAndWait(p VMParams) (int, error) {
 		stopServers()
 		return -1, fmt.Errorf("ctl.sock listen: %w", err)
 	}
+	if enabled && (p.owner == nil || p.EnableCheckpoint) {
+		if err := publishCheckpointOwner(); err != nil {
+			ctlSrv.Stop()
+			return -1, err
+		}
+	}
+
 	defer ctlSrv.Stop()
 	// Listen has completed and cleanup is registered. A connection made now
 	// can wait in the kernel accept queue until ctlSrv.Serve starts below.

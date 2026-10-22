@@ -245,10 +245,22 @@ def filesystem_case(work, ref, seconds):
             # Keep sampling while the stop request and tracer detach run.
             # Waiting for either first would miss a transient replayed round.
             with (sb.dir / "release.log").open("w") as release_output:
+                # The synchronous statfs/checks can span more blocked rounds.
+                # Re-anchor before detach; every subsequent round must still
+                # be observed so a transient replay cannot escape validation.
+                recovery_view = sb.view()
+                recovery_baseline = metric(recovery_view["live"], "gauges", "filesystem.disk-0")
+                previous = metric(faults[-1]["live"], "gauges", "filesystem.disk-0")
+                assert trace.poll() is None, "Guest tracer exited before recovery baseline"
+                assert recovery_view["live"]["run_epoch"] == faults[-1]["live"]["run_epoch"], "filesystem recovery epoch changed"
+                assert recovery_baseline["status"] == "busy" and not recovery_baseline["continuous"], "filesystem recovery baseline is not blocked"
+                assert int(recovery_baseline["last_request_id"]) >= int(previous["last_request_id"]), "filesystem recovery request regressed"
+                for field in ("covered_total_ns", "integral_total_byte_ns", "last_value_bytes"):
+                    assert recovery_baseline[field] == previous[field], "blocked filesystem recovery baseline changed"
+                recovery_start = last = int(recovery_baseline["last_request_id"])
                 release = subprocess.Popen([str(BIN / "sandbox-ctl"), "exec", "--sandbox-id", sb.name,
                     "--path-id", "instance", "--run-root", str(sb.runroot), "--", "/probe", "trace-stop"],
                     stdout=release_output, stderr=subprocess.STDOUT)
-                recovery_start = last
                 recovered, end = [], time.monotonic() + 5
                 while time.monotonic() < end:
                     view = sb.view()
@@ -263,8 +275,9 @@ def filesystem_case(work, ref, seconds):
             assert trace.returncode == 0
         trace_text = (sb.dir / "guest-trace.log").read_text()
         assert len(re.findall(r"fstatfs\(\d+<", trace_text)) == 1, trace_text
+        write_json(sb.dir / "recovery-baseline.json", recovery_view)
         write_json(sb.dir / "recovered.json", recovered)
-        validate_recovery(recovered, recovery_start, metric(faults[-1]["live"], "gauges", "filesystem.disk-0"), expected)
+        validate_recovery(recovered, recovery_start, recovery_baseline, expected)
         observer.wait(timeout=10)
         assert observer.returncode == 0
         guest_resources = [json.loads(line) for line in (sb.dir / "guest-resources.log").read_text().splitlines()]

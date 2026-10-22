@@ -55,6 +55,9 @@ import (
 // Disk refs in the referenced Sandbox E likewise support manifest:// when
 // Fetcher is set. Parent .sandbox refs are always narrowed to their Payload.
 type Options struct {
+	EnableCheckpoint    bool // persistent multi-version writable disks
+	checkpointPlan      *sandbox.CheckpointDiskPlan
+	checkpointReopen    []string
 	SnapshotPath        string                 // file path; mutually exclusive with SnapshotManifestKey
 	SnapshotManifestKey string                 // hex content key; mutually exclusive with SnapshotPath
 	SnapshotRef         string                 // canonical portable root ref; empty for a node-local file
@@ -174,6 +177,16 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 	}
 	defer sandboxSource.Root.Close()
 	opts = sandboxSource.opts
+	opts, sandboxSource, releaseCheckpoint, err := prepareRestoreCheckpoint(ctx, opts, sandboxSource)
+	if err != nil {
+		return -1, err
+	}
+	defer func() {
+		retErr = errors.Join(retErr, releaseCheckpoint())
+		if retErr != nil {
+			code = -1
+		}
+	}()
 	opts.ArtifactRelativeDir = sandboxSource.RelativeDir
 	applyDefaultRestoreArtifactBindings(opts.HostCfg, sandboxSource.Root.Portable, sandboxSource.RelativeDir)
 	merged, c0, err := config.ApplyRestoreRules(sandboxSource.Root.Portable, opts.HostCfg, opts.HostPresence)
@@ -194,8 +207,24 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 		return -1, err
 	}
 	snapCfg.Boot.Runtime = "file://" + runtimePath
-	if err := config.BindPortableDiskGraph(&snapCfg, sandboxSource.RuntimeRef, sandboxSource.RelativeDir); err != nil {
+	if c0.IsCheckpoint() {
+		err = config.BindCheckpointDiskGraph(&snapCfg, sandboxSource.RelativeDir)
+	} else {
+		err = config.BindPortableDiskGraph(&snapCfg, sandboxSource.RuntimeRef, sandboxSource.RelativeDir)
+	}
+	if err != nil {
 		return -1, fmt.Errorf("Sandbox source binding: %w", err)
+	}
+
+	if opts.EnableCheckpoint {
+		bases, err := c0.Checkpointed(sandboxSource.PortableRef)
+		if err != nil {
+			return -1, err
+		}
+		opts.checkpointPlan, err = sandbox.PrepareCheckpointDiskPlan(&snapCfg, bases, filepath.Join(sandbox.DefaultBaseDir(opts.BaseRoot, opts.PathID), "checkpoint"), opts.checkpointReopen)
+		if err != nil {
+			return -1, err
+		}
 	}
 	if err := preflightRestoreDiskGraph(ctx, &snapCfg, opts, sandboxSource.RelativeDir, diffCustomerKey); err != nil {
 		return -1, fmt.Errorf("restore disk graph preflight: %w", err)
@@ -544,6 +573,7 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 	// waitAPI → /vm.resume → restore{epoch} → local restore normalization.
 	return sandbox.ServeAndWait(sandbox.VMParams{
 		BaseDir:            sandbox.DefaultBaseDir(opts.BaseRoot, opts.PathID),
+		EnableCheckpoint:   opts.EnableCheckpoint,
 		Balloon:            balloonCtl,
 		Ctx:                ctx,
 		SandboxID:          opts.SandboxID,
@@ -732,13 +762,17 @@ func reconstructDisk(ctx context.Context, opts Options, diffCustomerKey [32]byte
 	// Layered ro base: [captured top] ++ chain.
 	logf("disk %s image: opening captured top", diskKey)
 	refs := append([]string{capturedTop}, chain...)
-	baseReader, err := openLayeredDiskBase(ctx, refs, func(ctx context.Context, raw string) (fetch.Stream, error) {
-		return openDiskRefStream(ctx, raw, opts)
-	})
-	if err != nil {
-		return fail(fmt.Errorf("%s: open base: %w", diskKey, err))
+	var baseReader vhost.BlockReader
+	var err error
+	if capturedTop != "" {
+		baseReader, err = openLayeredDiskBase(ctx, refs, func(ctx context.Context, raw string) (fetch.Stream, error) { return openDiskRefStream(ctx, raw, opts) })
+		if err != nil {
+			return fail(fmt.Errorf("%s: open base: %w", diskKey, err))
+		}
+		closers = append(closers, baseReader.Close)
+	} else if opts.checkpointPlan == nil || len(opts.checkpointReopen) == 0 {
+		return fail(errors.New("restore disk has no captured base"))
 	}
-	closers = append(closers, baseReader.Close)
 
 	// Fresh writable diff. Empty URI → auto-default (ours to remove).
 	if diffURI == "" {
@@ -755,11 +789,29 @@ func reconstructDisk(ctx context.Context, opts Options, diffCustomerKey [32]byte
 	if !ok {
 		return fail(fmt.Errorf("%s: bad diff uri: %s", diskKey, diffURI))
 	}
-	diffInit, err := sandbox.PrepareDiff(diffPath, diffTemplate, baseReader.Size())
+	var baseSize int64
+	if baseReader != nil {
+		baseSize = baseReader.Size()
+	}
+	diffInit, err := sandbox.PrepareDiff(diffPath, diffTemplate, baseSize)
 	if err != nil {
 		return fail(fmt.Errorf("%s: prepare diff: %w", diskKey, err))
 	}
 	cowOptions := []vhost.BlockCOWOption{vhost.WithCOWCache(cowCache)}
+	if opts.checkpointPlan != nil {
+		found := false
+		for _, binding := range opts.checkpointPlan.Disks {
+			if binding.Path == diffPath {
+				cowOptions = append(cowOptions, vhost.WithCheckpoint(binding.DiffID, binding.BaseID))
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fail(errors.New("restore disk absent from checkpoint plan"))
+		}
+		diffInit.Existing = len(opts.checkpointReopen) != 0
+	}
 	if db.OwnedDiff {
 		cowOptions = append(cowOptions, vhost.WithDiscardOnClose())
 	}
@@ -1043,6 +1095,19 @@ func openReferencedSandbox(ctx context.Context, raw string, opts Options) (*open
 				}
 				physical.DigestScheme, physical.Digest = "manifest", ref.Path
 				source.SelectedRef = physical.String()
+				path, resolveErr := opts.RefLocations.ResolveFile(physical, filepath.Dir(opts.SnapshotPath))
+				if resolveErr != nil {
+					return nil, resolveErr
+				}
+				path, resolveErr = filepath.Abs(path)
+				if resolveErr != nil {
+					return nil, resolveErr
+				}
+				path, resolveErr = filepath.EvalSymlinks(path)
+				if resolveErr != nil {
+					return nil, resolveErr
+				}
+				source.RelativeDir = filepath.Dir(path)
 			}
 			stream, err = readretry.Open(ctx, func() (fetch.Stream, error) {
 				return selected.OpenManifest(ctx, key)
@@ -1067,6 +1132,10 @@ func openReferencedSandbox(ctx context.Context, raw string, opts Options) (*open
 			if err != nil {
 				return nil, err
 			}
+		}
+		path, err = filepath.EvalSymlinks(path)
+		if err != nil {
+			return nil, err
 		}
 		opened, err := artifact.OpenFileWithLocations(ctx, path, ref, opts.ManifestCfg, opts.CustomerKeyFn,
 			opts.Fetcher, opts.RefLocations, opts.LocalCodec, opts.LocalRequired)
@@ -1247,6 +1316,9 @@ func preflightRestoreDiskGraph(ctx context.Context, cfg *config.SandboxConfig, o
 		return uint64(size), nil
 	}
 	checkLayers := func(field, top string, lowers []string) error {
+		if top == "" && len(lowers) == 0 && opts.checkpointPlan != nil && len(opts.checkpointReopen) != 0 {
+			return nil
+		}
 		want, err := open(field, top)
 		if err != nil {
 			return err
@@ -1263,6 +1335,9 @@ func preflightRestoreDiskGraph(ctx context.Context, cfg *config.SandboxConfig, o
 		return nil
 	}
 	openLayers := func(field, top string, lowers []string) (vhost.BlockReader, error) {
+		if top == "" && len(lowers) == 0 && opts.checkpointPlan != nil && len(opts.checkpointReopen) != 0 {
+			return nil, nil
+		}
 		refs := append([]string{top}, lowers...)
 		streams := make([]fetch.Stream, 0, len(refs))
 		var logicalSize uint64
@@ -1303,7 +1378,9 @@ func preflightRestoreDiskGraph(ctx context.Context, cfg *config.SandboxConfig, o
 		if err != nil {
 			return err
 		}
-		defer func() { retErr = errors.Join(retErr, base.Close()) }()
+		if base != nil {
+			defer func() { retErr = errors.Join(retErr, base.Close()) }()
+		}
 		if diffURI == "" {
 			diffURI = sandbox.DefaultDiskDiffURI(
 				sandbox.DefaultBaseDir(opts.BaseRoot, opts.PathID), opts.SandboxID, diskKey)
@@ -1313,6 +1390,19 @@ func preflightRestoreDiskGraph(ctx context.Context, cfg *config.SandboxConfig, o
 			return fmt.Errorf("%s writable diff invalid URI: %s", field, diffURI)
 		}
 		var cowOptions []vhost.BlockCOWOption
+		if opts.checkpointPlan != nil {
+			found := false
+			for _, binding := range opts.checkpointPlan.Disks {
+				if binding.Path == diffPath {
+					cowOptions = append(cowOptions, vhost.WithCheckpoint(binding.DiffID, binding.BaseID))
+					found = true
+					break
+				}
+			}
+			if !found {
+				return errors.New("restore preflight disk absent from checkpoint plan")
+			}
+		}
 		if opts.LocalCodec != nil {
 			cowOptions = append(cowOptions, vhost.WithDiffEncryption(diffCustomerKey, opts.LocalRequired))
 		}
