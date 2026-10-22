@@ -12,7 +12,7 @@ import (
 // Four bounded shared mappings are sufficient for overlapping owner and
 // publisher I/O. MAP_SHARED is essential: private Go-heap DIO buffers are not
 // safe while another goroutine forks a guest/helper process. No borrowed buffer
-// escapes a syscall; index caches hold ordinary copies. The pool lives for the
+// escapes its callback; index caches hold ordinary copies. The pool lives for the
 // process lifetime and never exceeds 32 MiB, irrespective of version count.
 const directBufferSize = 8 << 20
 
@@ -80,4 +80,36 @@ func directWrite(f *os.File, p []byte, off int64) error {
 		}
 		return nil
 	})
+}
+
+// readData consumes one bounded physical run while Store.mu protects its active
+// mappings. Plaintext is copied directly from the shared DIO buffer and cleared
+// before returning it to the pool; no payload copy is allocated on the Go heap.
+func (s *Store) readData(p []byte, page, block uint64, pages, inner int) (done int, err error) {
+	err = withDirectBuffer(pages*PageSize, func(b []byte) error {
+		read := unix.Pread
+		if s.preadData != nil {
+			read = s.preadData
+		}
+		n, readErr := read(int(s.file.Fd()), b, int64(page)*PageSize)
+		// Preserve the page-at-a-time contract on short I/O: only complete
+		// data pages can be decrypted and delivered; a partial page is invalid.
+		complete := max(0, n) / PageSize
+		for i := 0; i < complete; i++ {
+			s.crypt(b[i*PageSize:(i+1)*PageSize], block+uint64(i), false)
+		}
+		s.stats.DataRead += uint64(complete * PageSize)
+		done = min(len(p), max(0, complete*PageSize-inner))
+		if done != 0 {
+			copy(p[:done], b[inner:inner+done])
+		}
+		if readErr != nil {
+			return readErr
+		}
+		if n != len(b) {
+			return io.ErrUnexpectedEOF
+		}
+		return nil
+	})
+	return done, err
 }

@@ -20,9 +20,11 @@ import (
 )
 
 // BenchmarkCheckpointCOWWriteback includes Drain in elapsed throughput. The
-// 64 MiB working set exceeds the 32 MiB cache; frontend percentiles are reported
+// Default 64 MiB working set exceeds the 32 MiB cache; frontend percentiles are reported
 // separately and do not stand in for storage completion. Run on a recorded
 // native filesystem with -benchtime=32768x (two complete traversals) or longer.
+// CHECKPOINT_BENCH_MIB optionally selects a larger working set (for example,
+// 128 with -benchtime=32768x touches every page once). Seed/setup is untimed.
 func BenchmarkCheckpointCOWWriteback(b *testing.B) {
 	for _, mode := range []string{"raw", "v1", "v2-no-version", "v2-shared", "v2-private", "v2-xts-no-version", "v2-xts-shared", "v2-xts-private"} {
 		for _, workload := range []string{"sequential", "random", "partial", "hot", "mixed", "cold-read", "frequent-checkpoint"} {
@@ -35,8 +37,15 @@ func BenchmarkCheckpointCOWWriteback(b *testing.B) {
 }
 
 func benchmarkCheckpointWriteback(b *testing.B, mode, workload string) {
-	const size = 64 << 20
-	const blocks = size / cowBlockSize
+	size := int64(64 << 20)
+	if value := os.Getenv("CHECKPOINT_BENCH_MIB"); value != "" {
+		mib, err := strconv.Atoi(value)
+		if err != nil || mib < 64 || mib > 4096 {
+			b.Fatal("CHECKPOINT_BENCH_MIB must be an integer from 64 to 4096")
+		}
+		size = int64(mib) << 20
+	}
+	blocks := int(size / cowBlockSize)
 	ctx := context.Background()
 	encrypted := mode == "v1" || strings.Contains(mode, "-xts-")
 	mode = strings.Replace(mode, "-xts-", "-", 1)
@@ -105,6 +114,10 @@ func benchmarkCheckpointWriteback(b *testing.B, mode, workload string) {
 	b.ReportAllocs()
 	b.SetBytes(int64(length))
 	b.ResetTimer()
+	var cpuBefore, cpuAfter unix.Rusage
+	if err := unix.Getrusage(unix.RUSAGE_SELF, &cpuBefore); err != nil {
+		b.Fatal(err)
+	}
 	for i := 0; i < b.N; i++ {
 		block := i % blocks
 		if workload == "random" || workload == "partial" || workload == "mixed" || workload == "cold-read" {
@@ -153,7 +166,13 @@ func benchmarkCheckpointWriteback(b *testing.B, mode, workload string) {
 		b.Fatal(err)
 	}
 	drainTime := time.Since(drainStart)
+	if err := unix.Getrusage(unix.RUSAGE_SELF, &cpuAfter); err != nil {
+		b.Fatal(err)
+	}
 	b.StopTimer()
+	b.ReportMetric(float64(cpuAfter.Utime.Nano()-cpuBefore.Utime.Nano())/1e9, "process-user-s")
+	b.ReportMetric(float64(cpuAfter.Stime.Nano()-cpuBefore.Stime.Nano())/1e9, "process-system-s")
+	b.ReportMetric(float64(size), "working-set-B")
 	var memory runtime.MemStats
 	runtime.ReadMemStats(&memory)
 	b.ReportMetric(float64(memory.HeapAlloc), "heap-alloc-B")

@@ -2374,6 +2374,15 @@ B+ 树映射到物理槽。4 KiB 索引页包含 16 字节页头和最多 255 �
 不随版本数增加；共享映射可安全跨越并发 fork。XTS 使用 512 字节逻辑扇区编号，
 不随 COW 选择的物理槽改变。
 
+活动读取仅在相邻逻辑页对应的物理数据页连续时合并，每次 direct read 最多
+256 页（1 MiB）。分配器 descriptor 页、元数据槽、孔洞和碎片映射会截断连续段。
+活动 owner 在查询、读取、解密及复制期间一直持有 Store 锁，防止并发写入和 GC
+改变槽的生命周期。payload 直接从既有共享工作区复制，该工作区归还前会清零，
+不再为每页 payload 分配 Go 堆副本。短读只交付完整页前缀，未完成后缀保持原样。
+此优化不改变 DIFF 格式或回写、持久化语义。较大的冷连续读取可获益；单页随机
+读取、碎片数据及 COW cache 命中几乎没有合并机会。XTS 仍需逐逻辑扇区解密，
+整次调用持锁也仍会使并发存储操作串行执行。
+
 物理页号与 guest 逻辑块号不同：
 
 | 物理页 | 内容 |
@@ -2775,6 +2784,16 @@ CHECKPOINT_PRESENCE_DIR=/path/to/owned/native-ext4/fixtures \
 CHECKPOINT_PRESENCE_CASE=dense-plain CHECKPOINT_PRESENCE_PHASE=measure \
 CHECKPOINT_PRESENCE_LABEL=candidate \
   go test ./pkg/vhost -run '^TestCheckpointPresencePhases$' -count=1 -v
+
+# 活动密集读取：两版二进制共用 fixture，交替执行至少三轮。
+# CASE：plain-shared、plain-private、xts-shared、xts-private。
+CHECKPOINT_READ_DIR=/path/to/owned/native-ext4/dense-fixtures \
+CHECKPOINT_READ_CASE=plain-shared CHECKPOINT_READ_PHASE=seed \
+  go test ./pkg/vhost -run '^TestCheckpointDenseReadPhases$' -count=1 -v
+CHECKPOINT_READ_DIR=/path/to/owned/native-ext4/dense-fixtures \
+CHECKPOINT_READ_CASE=plain-shared CHECKPOINT_READ_PHASE=measure \
+CHECKPOINT_READ_LABEL=candidate \
+  go test ./pkg/vhost -run '^TestCheckpointDenseReadPhases$' -count=1 -v
 ```
 
 源码测试覆盖独立进程 pin 和 writer 交接、杀死 owner 后 redo 重开、真实短写、空间
@@ -2792,6 +2811,15 @@ artifact 测试覆盖精确发布后删除、Bundle/外部来源、重写、来�
 活动 `SnapshotView` 构建。应比较 Open 加首批负载的总时间，不能只比较 Open；这些
 是块层测量，并非 VM 到业务就绪的耗时。稀疏 30 GiB 逻辑样本不能代表实际 30 GiB
 payload 的验证。
+
+密集读取探针使用实际 128 MiB payload 和 32 MiB COW cache，逐字节验证内容，
+分别报告冷顺序读、全量重复读、16 MiB 尾部热读、冷随机 4 KiB 读及其缓存重复读。
+`api_MiB_s` 为字节数除以 ReadAt 累计服务时间，`wall_with_validation_ns` 还包含
+内容校验。CPU 字段包含校验；结束时 RSS、进程生命周期峰值 RSS 和 Go 累计分配量
+是不同指标。应以相同测试源码、相同构建环境比较准确的基线/候选生产源码。
+只初始化一次，每个用例重新打开，保留原始样本及工作集大小，不能把短时热读称为
+冷盘吞吐。写入 driver 支持 `--working-set-mib`（默认 64）；增大工作集时，
+`--operations` 至少为 `working-set-mib * 512`，以保留两次遍历。
 
 性能 driver 记录主机、文件系统、构建身份、原始日志、前端及 checkpoint 的
 p50/p95/p99、包含最终 Drain 的吞吐、数据/索引/redo/GC 物理字节计数、cache hit

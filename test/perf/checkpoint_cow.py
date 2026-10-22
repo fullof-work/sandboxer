@@ -4,7 +4,7 @@
 Run from the repository in a prepared Go environment, with --tmpdir on the
 filesystem under test. Builds once, then runs the same binary at least three
 times. Every timed throughput includes the final Drain; frontend and Checkpoint
-percentiles are separate. The 64 MiB write/read working set exceeds the 32 MiB
+percentiles are separate. The default 64 MiB write/read working set exceeds the 32 MiB
 COW cache. The dedicated hot case intentionally uses only 4 MiB. v1 and all
 v2-xts variants use the same local encryption policy. Results are observations,
 not an automatic performance acceptance claim.
@@ -33,11 +33,14 @@ def main():
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--rounds', type=int, default=3)
     parser.add_argument('--operations', type=int, default=32768)
+    parser.add_argument('--working-set-mib', type=int, default=64)
     parser.add_argument('--modes', default='raw|v1|v2-no-version|v2-shared|v2-private|v2-xts-no-version|v2-xts-shared|v2-xts-private')
     parser.add_argument('--workloads', default='sequential|random|partial|hot|mixed|cold-read|frequent-checkpoint')
     args = parser.parse_args()
-    if args.rounds < 3 or args.operations < 32768:
-        parser.error('use at least three rounds and 32768 operations (two working-set traversals)')
+    if not 64 <= args.working_set_mib <= 4096:
+        parser.error('working-set-mib must be between 64 and 4096')
+    if args.rounds < 3 or args.operations < args.working_set_mib * 512:
+        parser.error('use at least three rounds and two working-set traversals (working-set-mib * 512 operations)')
     args.tmpdir = args.tmpdir.resolve()
     args.output = args.output.resolve()
     args.tmpdir.mkdir(parents=True, exist_ok=True)
@@ -46,6 +49,7 @@ def main():
     os.chdir(repo)
     env = os.environ.copy()
     env['TMPDIR'] = str(args.tmpdir)
+    env['CHECKPOINT_BENCH_MIB'] = str(args.working_set_mib)
     modes = args.modes.split('|')
     workloads = args.workloads.split('|')
     known_modes = {'raw', 'v1', 'v2-no-version', 'v2-shared', 'v2-private', 'v2-xts-no-version', 'v2-xts-shared', 'v2-xts-private'}
@@ -61,7 +65,7 @@ def main():
         'source_sha256': {str(path.relative_to(repo)): hashlib.sha256(path.read_bytes()).hexdigest() for path in sources},
         'order': 'round 1 supplied order, round 2 reverse, round 3 rotated; each workload interleaves all selected modes',
         'started_unix': time.time(), 'host': platform.uname()._asdict(),
-        'working_set_bytes': 64 << 20, 'cow_cache_bytes': 32 << 20,
+        'working_set_bytes': args.working_set_mib << 20, 'cow_cache_bytes': 32 << 20,
         'operations': args.operations, 'rounds': args.rounds,
         'tmpdir': str(args.tmpdir), 'modes': args.modes, 'workloads': args.workloads,
         'go_environment': {name: env.get(name) for name in ('GOMAXPROCS', 'GOMEMLIMIT', 'GOGC', 'GOAMD64', 'GOOS', 'GOARCH')},
