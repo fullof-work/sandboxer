@@ -60,7 +60,7 @@ def main():
     modes = args.modes.split('|')
     workloads = args.workloads.split('|')
     known_modes = {'raw', 'v1', 'v2-no-version', 'v2-shared', 'v2-private', 'v2-xts-no-version', 'v2-xts-shared', 'v2-xts-private'}
-    known_workloads = {'sequential', 'random', 'partial', 'hot', 'mixed', 'cold-read', 'frequent-checkpoint', 'gc-write', 'reclamation', 'discard'}
+    known_workloads = {'sequential', 'random', 'partial', 'hot', 'mixed', 'cold-read', 'frequent-checkpoint', 'gc-write', 'reclamation', 'background-gc', 'discard'}
     if len(set(modes)) != len(modes) or set(modes) - known_modes:
         parser.error('modes must be unique exact names separated by |')
     if len(set(workloads)) != len(workloads) or set(workloads) - known_workloads:
@@ -76,6 +76,8 @@ def main():
         'operations': args.operations, 'rounds': args.rounds,
         'gc_cycles': args.gc_cycles,
         'workload_parameters': {
+            'background-gc': {'backlog_payload_bytes': 4 << 20, 'cycles_per_round': 1,
+                              'time': 'worker startup through Complete, including scheduling gaps'},
             'discard': {'range_bytes': 4 << 20, 'cow_cache_bytes': 1 << 20,
                         'background_gc': True, 'commits': 'total, including concurrent GC'},
             'reclamation': {'working_set_bytes': args.working_set_mib << 20,
@@ -97,21 +99,24 @@ def main():
         binary = str(Path(build) / 'vhost.test')
         subprocess.run(['go', 'test', '-c', '-o', binary, './pkg/diffstore'], env=env, check=True)
         gc_binary = str(Path(build) / 'versioned.test')
-        if 'reclamation' in workloads:
+        if set(workloads) & {'reclamation', 'background-gc'}:
             subprocess.run(['go', 'test', '-c', '-o', gc_binary, './pkg/diffstore/internal/versioned'], env=env, check=True)
         metrics = []
         for iteration in range(1, args.rounds + 1):
             order = list(reversed(modes)) if iteration % 2 == 0 else modes[(iteration - 1) // 2:] + modes[:(iteration - 1) // 2]
             for workload in workloads:
                 for mode in order:
-                    if workload in ('frequent-checkpoint', 'gc-write', 'reclamation') and mode in ('raw', 'v1'):
+                    if workload in ('frequent-checkpoint', 'gc-write', 'reclamation', 'background-gc') and mode in ('raw', 'v1'):
                         continue
-                    if workload in ('discard', 'reclamation') and mode not in ('raw', 'v1', 'v2-no-version', 'v2-xts-no-version'):
+                    if workload in ('discard', 'reclamation', 'background-gc') and mode not in ('raw', 'v1', 'v2-no-version', 'v2-xts-no-version'):
                         continue
                     name, executable, operations = 'BenchmarkCheckpointCOWWriteback', binary, args.operations
                     bench = '^' + name + '$/' + re.escape(mode) + '$/' + re.escape(workload) + '$'
                     if workload == 'reclamation':
                         name, executable, operations = 'BenchmarkCheckpointReclamation', gc_binary, args.gc_cycles
+                        bench = '^' + name + '$/' + ('xts' if '-xts-' in mode else 'plain') + '$'
+                    elif workload == 'background-gc':
+                        name, executable, operations = 'BenchmarkCheckpointBackgroundGC', gc_binary, 1
                         bench = '^' + name + '$/' + ('xts' if '-xts-' in mode else 'plain') + '$'
                     elif workload == 'discard':
                         name, operations = 'BenchmarkCheckpointDiscard', args.gc_cycles

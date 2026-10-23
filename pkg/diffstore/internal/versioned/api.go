@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -270,9 +269,16 @@ func (s *Store) startGC() {
 					}
 					break
 				}
-				// GC released mu. Yield between finite batches so foreground work
-				// can run; zero freed slots does not mean traversal has completed.
-				runtime.Gosched()
+				// GC released mu. Leave a short scheduling window for foreground
+				// work instead of immediately competing for the store lock again.
+				// Explicit GC/allocation assistance never incurs this worker delay.
+				// Zero freed slots still continues, and shutdown interrupts the wait.
+				timer.Reset(time.Millisecond)
+				select {
+				case <-s.stop:
+					return
+				case <-timer.C:
+				}
 			}
 			timer.Reset(delay)
 		}

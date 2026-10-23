@@ -156,6 +156,10 @@ to the reusable free list, never scans, transfers or punch attempts.
 Version visits, predecessor discovery and ownership transfers have bounded work;
 global release and version work take turns using full bounded batches, including
 budget 1, avoiding two half-sized metadata commits when both are ready.
+The active worker waits 1 ms outside the store lock between `More` batches,
+interruptibly on shutdown, to reduce competition with foreground work. Explicit
+GC and bounded foreground allocation assistance do not incur this delay; the
+tradeoff is lower peak background reclamation throughput.
 Pure cursors and predecessor search progress live in memory, not redo. A round
 captures its tail; new Checkpoints cannot extend it indefinitely. Ordinary writes
 do not reset it, and new deletion invalidates a stale blocked conclusion. Reopen

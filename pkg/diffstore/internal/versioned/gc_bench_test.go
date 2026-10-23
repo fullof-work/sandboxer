@@ -204,3 +204,86 @@ func BenchmarkCheckpointReclamation(b *testing.B) {
 		})
 	}
 }
+
+// Measure the real worker separately from explicit GC calls. A 4 MiB backlog
+// keeps the legacy one-batch-per-tick comparison short enough to repeat.
+func BenchmarkCheckpointBackgroundGC(b *testing.B) {
+	for _, encrypted := range []bool{false, true} {
+		name := "plain"
+		if encrypted {
+			name = "xts"
+		}
+		b.Run(name, func(b *testing.B) {
+			const size = 4 << 20
+			var freed, metadata uint64
+			b.SetBytes(size)
+			b.ResetTimer()
+			b.StopTimer()
+			for cycle := range b.N {
+				opts := Options{DiffID: "background", LogicalSize: size}
+				if encrypted {
+					opts.Key = &[32]byte{7}
+				}
+				s, err := Create(fmt.Sprintf("%s/%d.diff", b.TempDir(), cycle), opts)
+				if err != nil {
+					b.Fatal(err)
+				}
+				b.Cleanup(func() { _ = s.Close() })
+				stopTestGC(s)
+				payload := bytes.Repeat([]byte{0x41}, size)
+				for _, id := range []string{"keep", "delete"} {
+					if _, err = s.WriteAt(payload, 0); err != nil {
+						b.Fatal(err)
+					}
+					if err = s.Checkpoint(ctx, id); err != nil {
+						b.Fatal(err)
+					}
+				}
+				if _, err = s.WriteAt(payload, 0); err != nil {
+					b.Fatal(err)
+				}
+				if err = s.DeleteCheckpoint(ctx, "delete"); err != nil {
+					b.Fatal(err)
+				}
+				before := s.Stats()
+				deadline := time.Now().Add(time.Minute)
+				b.StartTimer()
+				s.startGC()
+				for {
+					s.mu.Lock()
+					complete, fatal := s.ctrl.Pending == 0 && s.ctrl.Garbage == 0, s.fatal
+					s.mu.Unlock()
+					if fatal != nil {
+						b.Fatal(fatal)
+					}
+					if complete {
+						break
+					}
+					if time.Now().After(deadline) {
+						b.Fatal("background reclamation did not complete")
+					}
+					time.Sleep(time.Millisecond)
+				}
+				b.StopTimer()
+				stopTestGC(s)
+				after := s.Stats()
+				metadata += after.IndexWritten - before.IndexWritten + after.RedoWritten - before.RedoWritten
+				tx := &transaction{store: s, ctrl: s.ctrl, pages: map[uint64][]byte{}}
+				for slot := s.ctrl.Free; slot != 0; {
+					d, err := tx.desc(slot)
+					if err != nil || d.Kind != kindFree {
+						b.Fatal("invalid committed free slot", err)
+					}
+					freed++
+					slot = d.Next
+				}
+				if err = s.Close(); err != nil {
+					b.Fatal(err)
+				}
+			}
+			b.ReportMetric(float64(size), "backlog-payload-B")
+			b.ReportMetric(float64(freed)/float64(b.N), "freed-slots/cycle")
+			b.ReportMetric(float64(metadata)/float64(b.N), "metadata-B/cycle")
+		})
+	}
+}

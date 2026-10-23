@@ -2802,7 +2802,7 @@ python3 test/perf/checkpoint_template.py --tmpdir /path/to/native-ext4/scratch \
 python3 test/perf/checkpoint_cow.py --tmpdir /path/to/native-ext4/scratch \
   --output /path/to/reclamation-results --rounds 3 --gc-cycles 3 \
   --modes 'v2-no-version|v2-xts-no-version' \
-  --workloads 'sequential|gc-write|reclamation|discard'
+  --workloads 'sequential|gc-write|reclamation|background-gc|discard'
 
 # 基线/候选二进制共用同一 fixture，交替执行至少三轮。
 # CASE：dense-plain/dense-xts（1 GiB payload），sparse-plain/sparse-xts
@@ -2889,7 +2889,11 @@ reclamation 工作负载停止独立 GC worker，测量已提交的空闲位置�
 还包含观察已提交空闲链的开销。顺序读取和当前版本导出读取观察复用后的局部性；
 保留版本导出读取是数据未移动的控制项。文件长度与实际占用分别报告：保留的描述
 记录和管理页不回收。`gc-write` 在普通后台 GC 运行时写入并保留最近四个版本，
-报告前台尾延迟及索引/redo 写放大。Discard 固定使用 4 MiB 范围和 1 MiB 缓存；
+报告前台尾延迟及索引/redo 写放大。`background-gc` 使用固定 4 MiB payload 积压，
+每轮一次，测量真实 worker 从启动到完成的耗时，包括轮询与调度间隔。
+活动 worker 在可继续推进的批次之间留出可取消的 1 ms 间隔，以降低前台争抢；
+显式 GC 不增加间隔。这以峰值后台吞吐换取调度机会，不构成前台延迟保证。
+Discard 固定使用 4 MiB 范围和 1 MiB 缓存；
 后端调用数可以归因于 Discard，但 `total-commits/range` 包含并发 GC 提交。
 专用 reclamation 和 Discard 用例会略过不支持的 shared/private 模式组合。
 各轮原始结果及准确的基线/候选身份保留在 PR 或 Issue；这些负载提供实测观察，

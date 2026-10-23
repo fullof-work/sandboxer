@@ -3155,7 +3155,7 @@ python3 test/perf/checkpoint_template.py --tmpdir /path/to/native-ext4/scratch \
 python3 test/perf/checkpoint_cow.py --tmpdir /path/to/native-ext4/scratch \
   --output /path/to/reclamation-results --rounds 3 --gc-cycles 3 \
   --modes 'v2-no-version|v2-xts-no-version' \
-  --workloads 'sequential|gc-write|reclamation|discard'
+  --workloads 'sequential|gc-write|reclamation|background-gc|discard'
 
 # Reuse the same fixture for baseline/candidate binaries; alternate >=3 rounds.
 # Cases: dense-plain/dense-xts (1 GiB payload), sparse-plain/sparse-xts
@@ -3258,6 +3258,11 @@ the reader without another deletion. `gc-ns/cycle` sums GC calls;
 and current-version export reads measure locality after reuse; retained-version
 export reads are an unchanged-data control. File length and allocated blocks are
 reported separately: retained descriptors and management pages are not reclaimed.
+`background-gc` measures actual worker startup through completion for a fixed
+4 MiB payload backlog, one cycle per round, including polling and scheduling gaps.
+The active worker leaves a cancellable 1 ms gap between progressing batches to
+reduce foreground contention; explicit GC remains unpaced. The gap trades peak
+background throughput for scheduling opportunities, not a foreground latency guarantee.
 `gc-write` keeps four recent versions while writing with normal background GC and
 reports frontend tail latency and index/redo amplification. Discard uses a fixed
 4 MiB range and 1 MiB cache; its backend-call count is attributable to Discard,

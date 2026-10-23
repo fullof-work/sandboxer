@@ -322,6 +322,54 @@ func TestGCBudgetOneFairWithContinuouslyAddedGarbage(t *testing.T) {
 	checkActive(t, s, map[uint64][]byte{1: pageFor(1, 2), 2: pageFor(2, 2), 3: pageFor(3, 2)})
 }
 
+func TestBackgroundGCDrainsMoreAfterReaderCloses(t *testing.T) {
+	s, _ := newTestStore(t, 256, nil)
+	stopTestGC(s)
+	pages := make([]uint64, 256)
+	for i := range pages {
+		pages[i] = uint64(i)
+	}
+	putPages(t, s, pages, 1)
+	if err := s.Checkpoint(ctx, "reader"); err != nil {
+		t.Fatal(err)
+	}
+	v, err := s.Export(ctx, "reader")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer v.Close()
+	putPages(t, s, pages, 2)
+	if err = s.DeleteCheckpoint(ctx, "reader"); err != nil {
+		t.Fatal(err)
+	}
+	if r := finishTestGC(t, s, 64); r.State != BlockedByReaders {
+		t.Fatal(r)
+	}
+	s.startGC()
+	if err = v.Close(); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		s.mu.Lock()
+		complete, fatal := s.ctrl.Pending == 0 && s.ctrl.Garbage == 0, s.fatal
+		s.mu.Unlock()
+		if fatal != nil {
+			t.Fatal(fatal)
+		}
+		if complete {
+			if s.Stats().GCFreed <= MaxBatchPages {
+				t.Fatal("fixture did not require multiple progressing batches")
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("worker did not continue without another deletion or explicit GC")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 // Exercise physical address ordering independently of logical B+ tree order.
 // Positions around 128 cross a descriptor page; 130 is deliberately live.
 func gcPhysicalFixture(t *testing.T) (*Store, string, []uint64) {
