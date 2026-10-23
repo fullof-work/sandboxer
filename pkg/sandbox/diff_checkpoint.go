@@ -147,7 +147,11 @@ func (h *SnapshotHandler) startCheckpointMaintenance(ctx context.Context, owner 
 	if h.checkpointMaintenance != nil {
 		return errors.New("checkpoint maintenance already initialized")
 	}
-	directory, err := filepath.EvalSymlinks(h.CheckpointDir)
+	directory, err := filepath.Abs(h.CheckpointDir)
+	if err != nil {
+		return err
+	}
+	directory, err = filepath.EvalSymlinks(directory)
 	if err != nil {
 		return err
 	}

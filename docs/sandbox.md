@@ -3253,10 +3253,13 @@ can be requested explicitly with `--sizes-gib`.
 The reclamation workload stops its independent GC worker to measure committed
 free slots, reuse, punch calls, metadata commits/writes and backlog work. It holds
 a reader during deletion, measures metadata writes while blocked, then releases
-the reader without another deletion. `gc-ns/cycle` sums GC calls;
-`backlog-wall-ns/cycle` also includes observing the committed free chain. Sequential
+the reader without another deletion. `gc-ns/cycle` sums all GC calls, including
+blocked-reader attempts; `backlog-wall-ns/cycle` measures post-unpin draining,
+including observing the committed free chain. Sequential
 and current-version export reads measure locality after reuse; retained-version
-export reads are an unchanged-data control. File length and allocated blocks are
+export reads are an unchanged-data control. Read metrics time only `ReadAt`, with
+full content comparisons and preallocated expected data outside those durations.
+File length and allocated blocks are
 reported separately: retained descriptors and management pages are not reclaimed.
 `background-gc` measures actual worker startup through completion for a fixed
 4 MiB payload backlog, one cycle per round, including polling and scheduling gaps.

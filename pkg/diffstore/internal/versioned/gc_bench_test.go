@@ -94,9 +94,11 @@ func BenchmarkCheckpointReclamation(b *testing.B) {
 				blockedBefore := s.Stats()
 				// Same number of attempts while a retained reader is deliberately held.
 				for range 16 {
+					callStart := time.Now()
 					if _, err = s.GC(ctx, 64); err != nil {
 						b.Fatal(err)
 					}
+					gcTime += time.Since(callStart)
 					gcCalls++
 				}
 				blockedAfter := s.Stats()
@@ -157,32 +159,38 @@ func BenchmarkCheckpointReclamation(b *testing.B) {
 			// Observe locality after repeated reuse. Check full content, including the
 			// retained root, outside the write/GC timer with O_DIRECT payload reads.
 			buffer := make([]byte, 1<<20)
-			start := time.Now()
 			expected := byte(0x21 + (b.N-1)%100)
+			activeExpected := bytes.Repeat([]byte{expected}, len(buffer))
+			retainedExpected := bytes.Repeat([]byte{0x11}, len(buffer))
+			var readTime time.Duration
 			for off := int64(0); off < size; off += int64(len(buffer)) {
+				start := time.Now()
 				if _, err = s.ReadAt(buffer, off); err != nil {
 					b.Fatal(err)
 				}
-				if !bytes.Equal(buffer, bytes.Repeat([]byte{expected}, len(buffer))) {
+				readTime += time.Since(start)
+				if !bytes.Equal(buffer, activeExpected) {
 					b.Fatal("active data differs after reuse")
 				}
 			}
-			b.ReportMetric(float64(size)/(1<<20)/time.Since(start).Seconds(), "sequential-read-MiB/s")
+			b.ReportMetric(float64(size)/(1<<20)/readTime.Seconds(), "sequential-read-MiB/s")
 			v, err := s.Export(ctx, "keep")
 			if err != nil {
 				b.Fatal(err)
 			}
 			defer v.Close()
-			start = time.Now()
+			readTime = 0
 			for off := int64(0); off < size; off += int64(len(buffer)) {
+				start := time.Now()
 				if _, err = v.ReadAt(ctx, buffer, uint64(off)); err != nil {
 					b.Fatal(err)
 				}
-				if !bytes.Equal(buffer, bytes.Repeat([]byte{0x11}, len(buffer))) {
+				readTime += time.Since(start)
+				if !bytes.Equal(buffer, retainedExpected) {
 					b.Fatal("retained data differs after reuse")
 				}
 			}
-			b.ReportMetric(float64(size)/(1<<20)/time.Since(start).Seconds(), "retained-export-read-MiB/s")
+			b.ReportMetric(float64(size)/(1<<20)/readTime.Seconds(), "retained-export-read-MiB/s")
 			if err = s.Checkpoint(ctx, "current"); err != nil {
 				b.Fatal(err)
 			}
@@ -191,16 +199,18 @@ func BenchmarkCheckpointReclamation(b *testing.B) {
 				b.Fatal(err)
 			}
 			defer current.Close()
-			start = time.Now()
+			readTime = 0
 			for off := int64(0); off < size; off += int64(len(buffer)) {
+				start := time.Now()
 				if _, err = current.ReadAt(ctx, buffer, uint64(off)); err != nil {
 					b.Fatal(err)
 				}
-				if !bytes.Equal(buffer, bytes.Repeat([]byte{expected}, len(buffer))) {
+				readTime += time.Since(start)
+				if !bytes.Equal(buffer, activeExpected) {
 					b.Fatal("current export differs after reuse")
 				}
 			}
-			b.ReportMetric(float64(size)/(1<<20)/time.Since(start).Seconds(), "current-export-read-MiB/s")
+			b.ReportMetric(float64(size)/(1<<20)/readTime.Seconds(), "current-export-read-MiB/s")
 		})
 	}
 }
