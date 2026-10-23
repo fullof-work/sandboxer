@@ -29,7 +29,9 @@ separate from `OpenDisk`: they neither attach the sandbox cache nor provide a
 live disk's admission/drain boundary. Applications must not open a second writable
 `Store` for a live `Disk`, or use offline APIs to bypass that disk's checkpoint
 boundary. This refactor retains the administrative API instead of introducing a
-second implementation of version management.
+second implementation of version management. The v2 `ErrEncryptionRequired` and
+`ErrAuthentication` sentinels are public for `errors.Is` checks through all v2
+entry points; they are distinct from the single-layer `ErrDiff*` sentinels.
 
 ## Choosing a format
 

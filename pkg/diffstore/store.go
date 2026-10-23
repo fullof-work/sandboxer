@@ -27,6 +27,8 @@ var (
 	ErrNotExist           = versioned.ErrNotExist
 	ErrRetired            = versioned.ErrRetired
 	ErrPlaintextForbidden = versioned.ErrPlaintextForbidden
+	ErrEncryptionRequired = versioned.ErrEncryptionRequired
+	ErrAuthentication     = versioned.ErrAuthentication
 )
 
 func Create(path string, o Options) (*Store, error) { return versioned.Create(path, o) }
