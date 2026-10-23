@@ -8,7 +8,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/kuasar-sandbox/sandboxer/pkg/diffstore"
 	"io"
 	"log"
 	"math"
@@ -33,6 +32,7 @@ import (
 	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
 	"github.com/kuasar-sandbox/sandboxer/pkg/chapi"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
+	"github.com/kuasar-sandbox/sandboxer/pkg/diffstore"
 	"github.com/kuasar-sandbox/sandboxer/pkg/guestlink"
 	"github.com/kuasar-sandbox/sandboxer/pkg/proto"
 	"github.com/kuasar-sandbox/sandboxer/pkg/resctl"
@@ -59,6 +59,7 @@ type Options struct {
 	EnableCheckpoint    bool // persistent multi-version writable disks
 	checkpointPlan      *sandbox.CheckpointDiskPlan
 	checkpointReopen    []string
+	checkpointOwner     *diffstore.DirectoryOwner
 	SnapshotPath        string                 // file path; mutually exclusive with SnapshotManifestKey
 	SnapshotManifestKey string                 // hex content key; mutually exclusive with SnapshotPath
 	SnapshotRef         string                 // canonical portable root ref; empty for a node-local file
@@ -540,6 +541,7 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 	return sandbox.ServeAndWait(sandbox.VMParams{
 		BaseDir:            sandbox.DefaultBaseDir(opts.BaseRoot, opts.PathID),
 		EnableCheckpoint:   opts.EnableCheckpoint,
+		CheckpointOwner:    opts.checkpointOwner,
 		Balloon:            balloonCtl,
 		Ctx:                ctx,
 		SandboxID:          opts.SandboxID,

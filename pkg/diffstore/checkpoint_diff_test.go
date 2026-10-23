@@ -395,9 +395,9 @@ func (b *failAfterCheckpointWrite) writePages(ctx context.Context, pages []pageW
 	}
 	return io.ErrShortWrite
 }
-func (b *failAfterCheckpointWrite) punchHole(off, length int64) error {
+func (b *failAfterCheckpointWrite) punchHole(ctx context.Context, off, length int64) error {
 	b.discards++
-	return b.diffBackend.punchHole(off, length)
+	return b.diffBackend.punchHole(ctx, off, length)
 }
 
 func TestCheckpointCOWWriteFailureCannotPunchCommittedOrPinnedSlots(t *testing.T) {

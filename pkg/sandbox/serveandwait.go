@@ -97,6 +97,7 @@ type PostSpawnCtx struct {
 // (config resolution, cgroup, controller admit) and converge here.
 type VMParams struct {
 	EnableCheckpoint   bool
+	CheckpointOwner    *diffstore.DirectoryOwner // borrowed target owner, separate from source export pins
 	owner              *Runtime
 	Ctx                context.Context
 	SandboxID          string
@@ -241,7 +242,7 @@ type SnapDiskRef struct {
 // escalation around CH, and the stats dump. The genuinely divergent
 // parts — config resolution, the CH cmdline, the post-spawn settle
 // protocol — stay in the callers via VMParams.BuildCmd / PostSpawn.
-func ServeAndWait(p VMParams) (int, error) {
+func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 	if p.owner == nil {
 		p.owner, _ = p.Ctx.Value(runtimeOwnerKey{}).(*Runtime)
 	}
@@ -700,6 +701,11 @@ func ServeAndWait(p VMParams) (int, error) {
 		Context:          backendCtx,
 		Logf:             logf,
 	}
+	// Runtime cleanup covers Launch and initialization failures. Restore closes
+	// this borrower before its outer disk and directory-owner closers.
+	if p.owner == nil || p.EnableCheckpoint {
+		defer func() { retErr = errors.Join(retErr, snapHandler.checkpointMaintenance.Close()) }()
+	}
 	var checkpointOwner ctl.CheckpointOwner
 	var checkpointOwnerMu sync.RWMutex
 	publishCheckpointOwner := func() error {
@@ -904,6 +910,10 @@ func ServeAndWait(p VMParams) (int, error) {
 			}
 			// Publish launch only after every backend and its capture provenance exists.
 			if enabled {
+				if err := snapHandler.startCheckpointMaintenance(backendCtx, r.checkpointOwner); err != nil {
+					return err
+				}
+				r.checkpointMaintenance = snapHandler.checkpointMaintenance
 				if err := publishCheckpointOwner(); err != nil {
 					return err
 				}
@@ -919,6 +929,10 @@ func ServeAndWait(p VMParams) (int, error) {
 		return -1, fmt.Errorf("ctl.sock listen: %w", err)
 	}
 	if enabled && (p.owner == nil || p.EnableCheckpoint) {
+		if err := snapHandler.startCheckpointMaintenance(backendCtx, p.CheckpointOwner); err != nil {
+			ctlSrv.Stop()
+			return -1, err
+		}
 		if err := publishCheckpointOwner(); err != nil {
 			ctlSrv.Stop()
 			return -1, err

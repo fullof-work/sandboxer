@@ -608,7 +608,10 @@ func (d *diffFile) validateFreshEncryptedBodySparse() error {
 	return nil
 }
 
-func (d *diffFile) punchHole(offset, length int64) error {
+func (d *diffFile) punchHole(ctx context.Context, offset, length int64) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	return unix.Fallocate(int(d.f.Fd()),
 		unix.FALLOC_FL_PUNCH_HOLE|unix.FALLOC_FL_KEEP_SIZE,
 		d.bodyOffset+offset, length)

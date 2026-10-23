@@ -325,6 +325,7 @@ func TestDeletedReaderRetainsCoWAndSurvivesOwner(t *testing.T) {
 
 func TestBatchWithdrawalSkipsDeletedPredecessors(t *testing.T) {
 	s, _ := newTestStore(t, 128, nil)
+	stopTestGC(s)
 	putPages(t, s, []uint64{1, 4, 8}, 1)
 	var ids []string
 	for i := 0; i < 12; i++ {
@@ -335,13 +336,11 @@ func TestBatchWithdrawalSkipsDeletedPredecessors(t *testing.T) {
 		}
 	}
 	putPages(t, s, []uint64{1, 4, 8}, 2)
-	// Persist a non-head cursor to reproduce reverse deletion's worst ordering.
+	// Start at a non-head cursor to reproduce reverse deletion's worst ordering.
 	s.mu.Lock()
-	err := s.mutate(ctx, func(tx *transaction) error { tx.ctrl.GCScan = tx.ctrl.Tail; return nil })
+	s.gc = gcScan{cursor: s.ctrl.Tail, tail: s.ctrl.Tail, generation: s.gcDeletion, limit: s.ctrl.Next}
 	s.mu.Unlock()
-	if err != nil {
-		t.Fatal(err)
-	}
+	var err error
 	for i, j := 0, len(ids)-1; i < j; i, j = i+1, j-1 {
 		ids[i], ids[j] = ids[j], ids[i]
 	}

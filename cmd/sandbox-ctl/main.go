@@ -117,6 +117,7 @@ Usage:
                         [--run-root <dir>] [--timeout <sec>]
   # With --checkpoint, optional --output must be the owner's checkpoint directory.
   sandbox-ctl checkpoint list|delete (--sandbox-id <sid> | --checkpoint-dir <dir>)
+  sandbox-ctl checkpoint gc --checkpoint-dir <dir> [--json]
                         [--path-id <leaf>] [--checkpoint <ID>] [--diff-id <ID> ...] [--json]
   sandbox-ctl export    --from <flattened-erofs-ref> --config sandbox.yaml
                         [--sandbox-id <sid>] (--output <out_dir> | --upload)

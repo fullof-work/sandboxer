@@ -53,6 +53,7 @@ func prepareRestoreCheckpoint(ctx context.Context, opts Options, source *openedS
 			return opts, source, release, err
 		}
 		closes = append(closes, owner.Close)
+		opts.checkpointOwner = owner
 	}
 	if pins == nil {
 		return opts, source, release, nil

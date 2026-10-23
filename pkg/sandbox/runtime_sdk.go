@@ -146,6 +146,7 @@ type runtimeOwnedDisk struct {
 type Runtime struct {
 	checkpointCleanup                  func() error
 	checkpointOwner                    *diffstore.DirectoryOwner
+	checkpointMaintenance              *diffstore.DirectoryMaintenance
 	listCheckpoints                    func(context.Context) ([]artifact.DiffCheckpointRef, error)
 	deleteCheckpoint                   func(context.Context, artifact.DiffCheckpointRef) error
 	consoleTTY                         atomic.Bool
@@ -1070,6 +1071,7 @@ func (r *Runtime) cleanup() {
 func (r *Runtime) cleanupResources() (retErr error) {
 	r.workMu.Lock()
 	defer r.workMu.Unlock()
+	retErr = errors.Join(retErr, r.checkpointMaintenance.Close())
 	if r.stopSignals != nil {
 		r.stopSignals()
 	}

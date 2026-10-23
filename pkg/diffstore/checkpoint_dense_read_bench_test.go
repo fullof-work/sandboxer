@@ -87,7 +87,7 @@ func TestCheckpointDenseReadPhases(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if n == 0 {
+			if n.State != More {
 				break
 			}
 		}

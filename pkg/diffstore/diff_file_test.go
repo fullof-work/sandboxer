@@ -1275,7 +1275,7 @@ func TestAsyncTemplateMaterializationFailureIsFatalAndUnpublished(t *testing.T) 
 }
 
 func TestAsyncTemplateDiscardDoesNotReintroduceTemplateBlock(t *testing.T) {
-	const size = 64 * cowBlockSize
+	const size = 130 * cowBlockSize
 	dir := t.TempDir()
 	templatePath := filepath.Join(dir, "template.ext4")
 	finalPath := filepath.Join(dir, "active.diff")
@@ -1287,15 +1287,16 @@ func TestAsyncTemplateDiscardDoesNotReintroduceTemplateBlock(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const blk = int64(17)
-	if err := cow.Discard(blk*cowBlockSize, cowBlockSize); err != nil {
+	const blk = int64(1)
+	const discarded = 128 * cowBlockSize
+	if err := cow.Discard(blk*cowBlockSize, discarded); err != nil {
 		t.Fatal(err)
 	}
-	got := make([]byte, cowBlockSize)
+	got := make([]byte, discarded)
 	if _, err := cow.ReadAt(got, blk*cowBlockSize); err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(got, base[blk*cowBlockSize:(blk+1)*cowBlockSize]) {
+	if !bytes.Equal(got, base[blk*cowBlockSize:blk*cowBlockSize+discarded]) {
 		t.Fatal("discarded block still fell through to template")
 	}
 	if err := cow.WaitMaterialized(context.Background()); err != nil {
@@ -1305,7 +1306,7 @@ func TestAsyncTemplateDiscardDoesNotReintroduceTemplateBlock(t *testing.T) {
 	if _, err := cow.ReadAt(got, blk*cowBlockSize); err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(got, base[blk*cowBlockSize:(blk+1)*cowBlockSize]) {
+	if !bytes.Equal(got, base[blk*cowBlockSize:blk*cowBlockSize+discarded]) {
 		t.Fatal("materializer reintroduced discarded template block")
 	}
 	if err := cow.Close(); err != nil {

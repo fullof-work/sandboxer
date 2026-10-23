@@ -250,6 +250,9 @@ cp "$OUT/list.json" "$OUT/initial-version-refs.json"
 if "$BIN/sandbox-ctl" checkpoint list --checkpoint-dir "$CP_DIR" --json >"$OUT/offline-busy.log" 2>&1; then
     e2e_fail "offline checkpoint management bypassed a live directory owner"
 fi
+if "$BIN/sandbox-ctl" checkpoint gc --checkpoint-dir "$CP_DIR" --json >"$OUT/offline-gc-busy.log" 2>&1; then
+    e2e_fail "offline GC bypassed a live directory owner"
+fi
 
 # Reverse order: owner is live before publication pins; guest overwrites proceed.
 # Successful publish routes exact deletion back through the live owner's gate.
@@ -350,6 +353,50 @@ done
 mv "$BASE_ROOT/source-hidden" "$BASE_ROOT/$PATH_ID"
 mv "$WORK/root.img.hidden" "$WORK/root.img"
 
+# Reusing the business directory creates new active identities. The earlier
+# writers are now historical files; online management must share their bounded
+# metadata handles with independent maintenance, and obsolete payload must be
+# reclaimed without another delete or foreground write.
+CP_DIR="$BASE_ROOT/$PATH_ID/checkpoint"
+python3 - "$CP_DIR" "$OUT/history-before-gc.json" <<'PY'
+import json, pathlib, sys
+files = list((pathlib.Path(sys.argv[1]) / 'diffs').glob('*.diff'))
+assert len(files) >= 6, files
+json.dump({p.name: {'allocated': p.stat().st_blocks * 512, 'length': p.stat().st_size}
+           for p in files}, open(sys.argv[2], 'w'))
+PY
+start gc-history "$PATH_ID" --config "$WORK/cold.yaml" --enable-checkpoint
+for version in snapshot-b historical-c; do
+    "$BIN/sandbox-ctl" checkpoint delete --path-id "$PATH_ID" --run-root "$RUN_ROOT" \
+        --checkpoint "$version" --json >"$OUT/gc-delete-$version.json"
+done
+assert_list "$PATH_ID" ""
+python3 - "$CP_DIR" "$OUT/history-before-gc.json" "$OUT/history-after-gc.json" <<'PY'
+import json, pathlib, sys, time
+root = pathlib.Path(sys.argv[1]) / 'diffs'
+before = json.load(open(sys.argv[2]))
+deadline = time.monotonic() + 60
+while True:
+    after = {name: {'allocated': (root / name).stat().st_blocks * 512,
+                    'length': (root / name).stat().st_size} for name in before}
+    assert all(after[n]['length'] == before[n]['length'] for n in before), (before, after)
+    reclaimed = sum(v['allocated'] for v in before.values()) - sum(v['allocated'] for v in after.values())
+    if reclaimed >= 8 * 1024 * 1024:
+        json.dump({'reclaimed_bytes': reclaimed, 'files': after}, open(sys.argv[3], 'w'))
+        break
+    assert time.monotonic() < deadline, ('historical maintenance did not reclaim backlog', before, after)
+    time.sleep(.2)
+PY
+guest /bin/true
+stop_run
+"$BIN/sandbox-ctl" checkpoint gc --checkpoint-dir "$CP_DIR" --json >"$OUT/offline-gc.json"
+python3 - "$OUT/offline-gc.json" <<'PY'
+import json, sys
+rows = json.load(open(sys.argv[1]))
+assert len(rows) >= 9 and len({r['diff_id'] for r in rows}) == len(rows), rows
+assert all(r['state'] == 'complete' and r['freed_slots'] >= 0 for r in rows), rows
+PY
+
 # Explicit handoff/delete/re-capture flow through both hot and CLI cold restore.
 # Repeat with local XTS enabled; the runtime still owns the live disks after its
 # temporary restore readers disappear. Publication must produce a portable root.
@@ -399,5 +446,12 @@ PY
         --ref-location "portable=file://$WORK/pins-published-$policy" "${CRYPTO_ARGS[@]}"
     guest /bin/sh -c 'for f in /handoff /scratch/handoff /data/handoff; do grep -qx after-delete "$f" || exit 1; done'
     stop_run
+    # Metadata-only reclamation of encrypted DIFFs needs no key/config.
+    "$BIN/sandbox-ctl" checkpoint gc --checkpoint-dir "$CP_DIR" --json >"$OUT/gc-$policy.json"
+    python3 - "$OUT/gc-$policy.json" <<'PY'
+import json, sys
+rows = json.load(open(sys.argv[1]))
+assert rows and all(r['state'] == 'complete' for r in rows), rows
+PY
 done
 echo "PASS snapshot.checkpoint.sh"

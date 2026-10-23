@@ -15,6 +15,14 @@ type Page = versioned.Page
 type Stats = versioned.Stats
 type View = versioned.View
 type DirectoryOwner = versioned.DirectoryOwner
+type GCState = versioned.GCState
+type GCResult = versioned.GCResult
+
+const (
+	Complete         = versioned.Complete
+	More             = versioned.More
+	BlockedByReaders = versioned.BlockedByReaders
+)
 
 const PageSize = versioned.PageSize
 const MaxBatchPages = versioned.MaxBatchPages

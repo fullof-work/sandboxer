@@ -710,6 +710,32 @@ while already pinned exports finish and delay bounded reclamation. Deletion can
 therefore invalidate a local E/S without immediately returning all space.
 
 ```bash
+sandbox-ctl checkpoint gc --checkpoint-dir /var/lib/sandbox/worker/checkpoint --json
+```
+
+This offline command takes the existing exclusive directory lock; a running
+directory returns busy. It uses metadata-only directory maintenance, with no
+artifact download or data decryption/key dependency. It accepts no Checkpoint ID
+or deletion filter and does not change retention. Per-DiffID output contains
+`diff_id`, `state` and committed `freed_slots` (plus `error` on failure). It drains
+`more` work until each file is `complete` or `blocked_by_readers`; the latter is a
+normal exit-0 result with pending reclamation, not a promise that space is free.
+Retired files report `skipped_retired` and remain untouched. Busy, cancellation and
+real I/O/metadata errors return nonzero; other files still receive results when a
+single file fails. Text output explicitly explains reader-blocked results.
+
+Runtime maintenance starts independently after all active DiffIDs are bound:
+normal startup, actual pooled Launch, and restore all borrow the acquired target
+directory owner. A parked pool does not take a business directory. Restore source
+export pins and the target owner are separate resources. Historical GC and online
+List/Delete share bounded, serialized metadata handles with reserved management
+capacity. Historical errors are logged by DiffID without terminating an unrelated
+active sandbox. Shutdown and initialization failure stop new operations/scheduling,
+join accepted operations and the current batch, close historical handles, close
+active disks, then release the owner. Deleted version descriptors, group metadata,
+fixed areas and active roots remain; GC does not truncate files or recycle IDs.
+
+```bash
 cd /var/lib/sandbox/worker/checkpoint
 sandbox-ctl publish --to-ref-location archive=file:///var/lib/sandbox/published \
   --delete-checkpoint --json '<snapshotRef>'
@@ -2621,7 +2647,7 @@ block numbers to data slots; internal entries pair each child's maximum logical
 key with its slot. Entry integers are little-endian. Data and index slots are distinct.
 The header binds DiffID, immutable BaseID, logical capacity and encryption policy;
 the control page names the active root, epoch, current-capture marker, checkpoint
-chain, free/garbage lists and persistent GC cursor. Each checkpoint record stores
+chain and free/garbage lists. The existing cursor field is reserved; pure GC progress is now in memory. Each checkpoint record stores
 its ID, root, epoch, predecessor/successor and visible/retained state. Slot
 descriptors record birth epoch, kind and chain linkage. The 512-page bounded
 metadata cache does not build an all-block in-memory map of every version.
@@ -2701,20 +2727,19 @@ independently. Deleted checkpoint IDs cannot be reused within the same DIFF.
 `Export(ActiveDiff)` is a caller-quiescent active view, while a named export owns
 an immutable retained root.
 
-GC operates on persisted retirement chains instead of walking every retained
-tree. For a deleted version it finds the nearest retained predecessor, transfers
-each slot only when that predecessor's epoch can still reference the slot's birth,
-and otherwise moves it to reclaimable garbage. Batch withdrawal occurs before
-GC, so chains do not repeatedly migrate through other versions being deleted.
-The cursor and chain updates commit together; work resumes after interruption.
-A slot is punched before joining the reusable free list, and its metadata cache
-entry is invalidated before reuse. Per-call work and owner background work are
-bounded; a released pin therefore permits progress without a new guest write.
-A GC round separately limits reclamation, version visits and predecessor
-discovery to 64 steps. It persists shortcuts across withdrawn predecessors and
-keeps a conservative protected epoch until discovery completes, causing extra
-COW rather than reclaiming a possibly retained slot. GCRead/GCWritten count
-completed physical index/redo bytes attributable to GC and overlap those totals.
+GC processes persisted retirement chains separately from deletion. A deleted
+version transfers records only to a retained predecessor whose epoch can still
+reference their birth; otherwise they enter the global reclaimable chain.
+Bounded `More` batches continue even with zero committed frees. A full valid scan
+can report `BlockedByReaders`; periodic retries allow reader release to resume
+work without another delete or guest write. Pure scan state stays in memory and
+does not write redo. GC sorts safe candidates by physical address, coalesces holes
+without crossing management/live pages, and commits an ascending batch to the free
+list only after punching succeeds. Metadata-only Open/List/Delete never start GC.
+The complete batching, crash and scheduling contract is maintained in
+[diffstore](diffstore.md#discard-and-reclamation). `GCRead/GCWritten` overlap total
+index/redo bytes; `GCPunchCalls` counts completed hole-punch calls, while `GCFreed`
+counts committed reusable slots.
 
 Named capture preserves immutable dependency identities when collecting local
 sources. It copies the original carrier when necessary, including an ordinary E
@@ -3125,6 +3150,13 @@ python3 test/perf/checkpoint_cow.py --tmpdir /path/to/native-ext4/scratch \
 python3 test/perf/checkpoint_template.py --tmpdir /path/to/native-ext4/scratch \
   --output /path/to/template-results
 
+# Compare the same baseline/candidate environment, payload and retained versions.
+# Three independent rounds, each with three write/checkpoint/delete/GC/reuse cycles:
+python3 test/perf/checkpoint_cow.py --tmpdir /path/to/native-ext4/scratch \
+  --output /path/to/reclamation-results --rounds 3 --gc-cycles 3 \
+  --modes 'v2-no-version|v2-xts-no-version' \
+  --workloads 'sequential|gc-write|reclamation|background-gc|discard'
+
 # Reuse the same fixture for baseline/candidate binaries; alternate >=3 rounds.
 # Cases: dense-plain/dense-xts (1 GiB payload), sparse-plain/sparse-xts
 # (30 GiB logical capacity with only 240 mapped pages).
@@ -3217,6 +3249,30 @@ can be requested explicitly with `--sizes-gib`.
 - V1 `--resume` may keep the VM paused until sink writes finish, preserving SnapshotView stability.
 
 ### 13.2 Performance observations
+
+The reclamation workload stops its independent GC worker to measure committed
+free slots, reuse, punch calls, metadata commits/writes and backlog work. It holds
+a reader during deletion, measures metadata writes while blocked, then releases
+the reader without another deletion. `gc-ns/cycle` sums all GC calls, including
+blocked-reader attempts; `backlog-wall-ns/cycle` measures post-unpin draining,
+including observing the committed free chain. Sequential
+and current-version export reads measure locality after reuse; retained-version
+export reads are an unchanged-data control. Read metrics time only `ReadAt`, with
+full content comparisons and preallocated expected data outside those durations.
+File length and allocated blocks are
+reported separately: retained descriptors and management pages are not reclaimed.
+`background-gc` measures actual worker startup through completion for a fixed
+4 MiB payload backlog, one cycle per round, including polling and scheduling gaps.
+The active worker leaves a cancellable 1 ms gap between progressing batches to
+reduce foreground contention; explicit GC remains unpaced. The gap trades peak
+background throughput for scheduling opportunities, not a foreground latency guarantee.
+`gc-write` keeps four recent versions while writing with normal background GC and
+reports frontend tail latency and index/redo amplification. Discard uses a fixed
+4 MiB range and 1 MiB cache; its backend-call count is attributable to Discard,
+but `total-commits/range` also includes concurrent GC. Unsupported shared/private
+mode combinations are omitted for the dedicated reclamation and Discard cases.
+Keep raw per-round results and exact baseline/candidate identities in the PR or
+Issue; these workloads establish observations, not a universal speedup claim.
 
 Key metrics:
 

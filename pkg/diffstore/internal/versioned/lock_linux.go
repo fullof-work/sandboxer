@@ -97,3 +97,30 @@ func (o *DirectoryOwner) Close() error {
 	o.file = nil
 	return f.Close()
 }
+
+// Validate checks the stable lock inode before a borrower opens another DIFF.
+// The owner must outlive its borrowers; Close is ordered after their shutdown.
+func (o *DirectoryOwner) Validate() error {
+	if o == nil || o.file == nil {
+		return os.ErrClosed
+	}
+	owned, err := o.file.Stat()
+	if err != nil {
+		return err
+	}
+	current, err := os.Lstat(filepath.Join(o.Directory, "diffs", ".owner.lock"))
+	if err != nil {
+		return err
+	}
+	if !current.Mode().IsRegular() || !os.SameFile(owned, current) {
+		return fmt.Errorf("diffstore: directory owner lock identity changed")
+	}
+	dir, err := os.Lstat(filepath.Join(o.Directory, "diffs"))
+	if err != nil {
+		return err
+	}
+	if !dir.IsDir() || dir.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("diffstore: diffs directory identity changed")
+	}
+	return nil
+}

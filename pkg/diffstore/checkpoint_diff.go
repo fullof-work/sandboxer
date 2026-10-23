@@ -135,7 +135,7 @@ func (d *diffFile) cleanupWriteFailure(pages []pageWrite) error {
 	var err error
 	for _, p := range pages {
 		if p.Fresh {
-			err = errors.Join(err, d.punchHole(int64(p.Block)*cowBlockSize, cowBlockSize))
+			err = errors.Join(err, d.punchHole(context.Background(), int64(p.Block)*cowBlockSize, cowBlockSize))
 		}
 	}
 	return err

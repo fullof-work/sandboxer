@@ -13,6 +13,50 @@ import (
 	"github.com/kuasar-sandbox/sandboxer/pkg/diffstore"
 )
 
+func TestCheckpointMaintenanceCanonicalOwner(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "checkpoint")
+	owner, err := diffstore.LockDirectory(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer owner.Close()
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	relative, err := filepath.Rel(cwd, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(t.TempDir(), "alias")
+	if err = os.Symlink(dir, alias); err != nil {
+		t.Fatal(err)
+	}
+	for name, path := range map[string]string{"absolute": dir, "relative": relative, "symlink": alias} {
+		t.Run(name, func(t *testing.T) {
+			h := &SnapshotHandler{CheckpointDir: path}
+			if err := h.startCheckpointMaintenance(context.Background(), owner); err != nil {
+				t.Fatal(err)
+			}
+			if err := h.checkpointMaintenance.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if err := owner.Validate(); err != nil {
+				t.Fatal("maintenance released borrowed owner", err)
+			}
+		})
+	}
+	other, err := diffstore.LockDirectory(filepath.Join(t.TempDir(), "other"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+	h := &SnapshotHandler{CheckpointDir: relative}
+	if err := h.startCheckpointMaintenance(context.Background(), other); err == nil {
+		t.Fatal("accepted unrelated directory owner")
+	}
+}
+
 func TestCheckpointDiskPlanFixesEveryPathAndRefusesTakeover(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "persistent-path", "checkpoint")
 	cfg := &config.SandboxConfig{}
@@ -142,7 +186,17 @@ func TestOnlineCheckpointManagementSkipsRetiredAndMissingDiffs(t *testing.T) {
 	}
 	create("available", "available", false)
 	pinned := create("retired", "retired", true)
-	handler := &SnapshotHandler{EnableCheckpoint: true, CheckpointDir: dir}
+	owner, err := diffstore.LockDirectory(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer owner.Close()
+	maintenance, err := diffstore.NewDirectoryMaintenance(owner, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer maintenance.Close()
+	handler := &SnapshotHandler{EnableCheckpoint: true, CheckpointDir: dir, checkpointMaintenance: maintenance}
 	refs, err := handler.listDiffCheckpoints(ctx)
 	if err != nil || len(refs) != 1 || refs[0].DiffID != "available" || refs[0].ID != "cp" {
 		t.Fatalf("retired file poisoned live list: %+v %v", refs, err)

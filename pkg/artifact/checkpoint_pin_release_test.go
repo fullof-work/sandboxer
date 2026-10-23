@@ -272,7 +272,7 @@ func (f *checkpointPinEffectFixture) gc(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if n == 0 {
+			if n.State != diffstore.More {
 				idle++
 			} else {
 				idle = 0

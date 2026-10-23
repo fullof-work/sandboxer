@@ -34,7 +34,7 @@ type diffBackend interface {
 	scan(context.Context, func(uint64) error) error
 	scanDirtyBlocks() ([]uint64, error)
 	presence(context.Context, uint64, []bool) error
-	punchHole(int64, int64) error
+	punchHole(context.Context, int64, int64) error
 	markModified(context.Context) error
 	err() error
 	Sync() error
@@ -84,8 +84,8 @@ func (d *checkpointDiff) policy() batchPolicy {
 	return batchPolicy{disjointWrites: true, materialPages: maxWritebackPages}
 }
 func (d *checkpointDiff) cleanupWriteFailure([]pageWrite) error { return nil }
-func (d *checkpointDiff) punchHole(off, n int64) error {
-	return d.store.Discard(context.Background(), off, n)
+func (d *checkpointDiff) punchHole(ctx context.Context, off, n int64) error {
+	return d.store.Discard(ctx, off, n)
 }
 func (d *checkpointDiff) scanDirtyBlocks() ([]uint64, error) {
 	bitmap := make([]uint64, (d.logicalSize/cowBlockSize+63)/64)

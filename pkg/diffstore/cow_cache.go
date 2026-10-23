@@ -720,22 +720,36 @@ func (c *Cache) Close() error {
 	return c.err
 }
 
-func (c *Cache) discard(ctx context.Context, cow *Disk, block int64) error {
-	key := cacheKey{cow, block}
+func (c *Cache) discard(ctx context.Context, cow *Disk, first, last int64) error {
 	for {
 		c.mu.Lock()
 		if err := c.checkLocked(ctx); err != nil {
 			c.mu.Unlock()
 			return err
 		}
-		p := c.pages[key]
-		if p != nil && p.state != cacheClean && p.state != cacheDirty {
+		var pages [maxDiscardPages]*cachePage
+		count, waiting := 0, false
+		for block := first; block <= last; block++ {
+			p := c.pages[cacheKey{cow, block}]
+			if p == nil {
+				continue // no reservation for an uncached page
+			}
+			if p.state != cacheClean && p.state != cacheDirty {
+				waiting = true
+				break
+			}
+			pages[count] = p
+			count++
+		}
+		if waiting {
 			if err := c.waitLocked(ctx); err != nil {
 				return err
 			}
 			continue
 		}
-		if p != nil {
+		// Freeze only after checking the entire batch under this same lock.
+		// Waiting with a partially frozen batch could prevent writeback progress.
+		for _, p := range pages[:count] {
 			if p.state == cacheClean {
 				c.clean.remove(p)
 			} else {
@@ -744,16 +758,23 @@ func (c *Cache) discard(ctx context.Context, cow *Disk, block int64) error {
 			p.state = cacheDiscarding
 		}
 		c.mu.Unlock()
-		err := cow.diff.punchHole(block*cowBlockSize, cowBlockSize)
+		// Once frozen, completion cannot be abandoned on cancellation: publish
+		// the complete batch, or the existing sticky failure, and wake waiters.
+		err := cow.diff.punchHole(context.WithoutCancel(ctx), first*cowBlockSize, (last-first+1)*cowBlockSize)
 		c.mu.Lock()
 		var report func(error)
 		if err == nil {
-			if p != nil {
+			for _, p := range pages[:count] {
 				c.releaseLocked(p)
 			}
-			cow.markAbsent(block)
+			for block := first; block <= last; block++ {
+				cow.markAbsent(block)
+			}
 		} else {
-			report = c.failLocked(fmt.Errorf("diffstore: discard block %d: %w", block, err))
+			report = c.failLocked(fmt.Errorf("diffstore: discard blocks %d..%d: %w", first, last, err))
+			for _, p := range pages[:count] {
+				c.releaseLocked(p)
+			}
 		}
 		fatal := c.err
 		c.signalLocked()
