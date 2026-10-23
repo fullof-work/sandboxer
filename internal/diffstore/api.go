@@ -92,6 +92,9 @@ type Store struct {
 	// beforeIO is deliberately package-private fault injection, installed before
 	// use by deterministic tests. A process-exit hook also exercises real reopen.
 	beforeIO func(stage string) error
+	// preadData is a per-store test seam for payload reads, protected by mu.
+	// A nil hook uses unix.Pread on the real O_DIRECT file description.
+	preadData func(fd int, b []byte, off int64) (int, error)
 }
 type storedError struct{ err error }
 

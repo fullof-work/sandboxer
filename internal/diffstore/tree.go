@@ -485,17 +485,32 @@ func (s *Store) ReadAt(p []byte, off int64) (int, error) {
 		}
 		if slot == 0 {
 			clear(p[done : done+n])
-		} else {
-			b, err := readFull(s.file, slotPage(slot))
-			if err != nil {
-				return done, s.fail(err)
-			}
-			s.stats.DataRead += PageSize
-			s.crypt(b, block, false)
-			copy(p[done:done+n], b[inner:inner+n])
-			clear(b)
+			done += n
+			continue
 		}
+		// Keep the active mapping and slot lifetimes protected through the
+		// read and copy. Slots that differ by one need not be physical neighbors:
+		// each allocator group has an intervening descriptor page.
+		pages := 1
+		var lookupErr error
+		for pages < 256 && pages*PageSize-inner < count-done {
+			var next uint64
+			next, lookupErr = lookup(storeReader{s}, s.ctrl.Root, block+uint64(pages))
+			if lookupErr != nil || next == 0 || slotPage(next) != slotPage(slot)+uint64(pages) {
+				break
+			}
+			pages++
+		}
+		n, err = s.readData(p[done:count], slotPage(slot), block, pages, inner)
 		done += n
+		if err != nil {
+			return done, s.fail(err)
+		}
+		// A lookahead failure must not discard the readable prefix collected
+		// before it. No mapping beyond that prefix is consumed.
+		if lookupErr != nil {
+			return done, s.fail(lookupErr)
+		}
 	}
 	if done < len(p) {
 		return done, io.EOF

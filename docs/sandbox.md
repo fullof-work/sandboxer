@@ -2629,6 +2629,19 @@ anonymous 8 MiB direct-I/O workspaces bound process-wide aligned scratch at
 concurrent fork. XTS uses 512-byte logical sector numbers, regardless of the
 physical slot selected by COW.
 
+Active reads combine adjacent logical pages only when their physical data pages
+are contiguous, with at most 256 pages (1 MiB) per direct read. Allocator descriptor
+pages, metadata slots, holes and fragmented mappings split runs. The active owner
+keeps its Store lock through lookup, read, decryption and copying, protecting slot
+lifetimes against writes and GC. Payloads are consumed directly from the existing
+shared workspace, which is cleared before reuse; no per-page payload copy is
+allocated on the Go heap. Short reads return only the complete-page prefix and
+leave the unfinished suffix untouched. This changes neither the DIFF format nor
+writeback/durability semantics. Large cold contiguous reads benefit; single-page
+random reads, fragmented data and COW-cache hits have little or no batching
+opportunity. XTS still decrypts each logical sector, and full-call locking still
+serializes concurrent storage operations.
+
 Physical page numbers are distinct from guest logical block numbers:
 
 | Physical pages | Contents |
@@ -3120,6 +3133,16 @@ CHECKPOINT_PRESENCE_DIR=/path/to/owned/native-ext4/fixtures \
 CHECKPOINT_PRESENCE_CASE=dense-plain CHECKPOINT_PRESENCE_PHASE=measure \
 CHECKPOINT_PRESENCE_LABEL=candidate \
   go test ./pkg/vhost -run '^TestCheckpointPresencePhases$' -count=1 -v
+
+# Active dense reads: same fixture for both binaries, >=3 alternating rounds.
+# CASE: plain-shared, plain-private, xts-shared, xts-private.
+CHECKPOINT_READ_DIR=/path/to/owned/native-ext4/dense-fixtures \
+CHECKPOINT_READ_CASE=plain-shared CHECKPOINT_READ_PHASE=seed \
+  go test ./pkg/vhost -run '^TestCheckpointDenseReadPhases$' -count=1 -v
+CHECKPOINT_READ_DIR=/path/to/owned/native-ext4/dense-fixtures \
+CHECKPOINT_READ_CASE=plain-shared CHECKPOINT_READ_PHASE=measure \
+CHECKPOINT_READ_LABEL=candidate \
+  go test ./pkg/vhost -run '^TestCheckpointDenseReadPhases$' -count=1 -v
 ```
 
 The source suite checks independent-process pins and writer handoff, killed-owner
@@ -3142,6 +3165,18 @@ percentiles, a warm repeat and complete active SnapshotView construction. Compar
 Open plus the first workload, not Open alone; these are block-layer measurements,
 not VM-to-business-ready timings. A sparse 30 GiB logical fixture does not validate
 30 GiB of actual payload.
+
+The dense-read probe uses 128 MiB of real payload with a 32 MiB COW cache.
+It verifies every byte and reports cold sequential reads, a full repeat, a hot
+16 MiB tail, cold random 4 KiB reads and their cached repeat. `api_MiB_s` divides
+bytes by cumulative ReadAt service time; `wall_with_validation_ns` also includes
+content verification. CPU fields include verification; end RSS, process-lifetime
+peak RSS and cumulative Go allocations are distinct measurements. Compare exact
+baseline/candidate production sources with identical test sources and binaries
+built in the same environment. Seed once, reopen for each case, and report raw
+samples and workload size rather than treating a short warm read as cold disk
+throughput. The write driver accepts `--working-set-mib` (default 64); increase
+`--operations` to at least `working-set-mib * 512` to retain two traversals.
 
 The benchmark driver records host/filesystem/build identity, raw logs, frontend
 and checkpoint p50/p95/p99, throughput including final Drain, physical data/index/
