@@ -3,7 +3,6 @@ package sandbox
 import (
 	"context"
 	"errors"
-	"github.com/kuasar-sandbox/sandboxer/internal/diffstore"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,6 +10,7 @@ import (
 
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/ctl"
+	"github.com/kuasar-sandbox/sandboxer/pkg/diffstore"
 )
 
 func TestCheckpointDiskPlanFixesEveryPathAndRefusesTakeover(t *testing.T) {

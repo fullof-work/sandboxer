@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/kuasar-sandbox/sandboxer/pkg/vhost"
+	"github.com/kuasar-sandbox/sandboxer/pkg/diffstore"
 )
 
 type capacityBase struct{ *bytes.Reader }
@@ -25,15 +25,15 @@ func TestPrepareDiffPreservesTemplateAndExistingLogicalCapacity(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			key := [32]byte{1}
-			options := func(encrypted bool) []vhost.BlockCOWOption {
+			options := func(encrypted bool) []diffstore.DiskOption {
 				if encrypted {
-					return []vhost.BlockCOWOption{vhost.WithDiffEncryption(key, true)}
+					return []diffstore.DiskOption{diffstore.WithDiffEncryption(key, true)}
 				}
 				return nil
 			}
 			dir := t.TempDir()
 			template, target := filepath.Join(dir, "template.diff"), filepath.Join(dir, "active.diff")
-			seed, err := vhost.OpenBlockCOW(template, nil, vhost.DiffInit{CreateSize: size}, options(tc.encryptedTemplate)...)
+			seed, err := diffstore.OpenDisk(template, nil, diffstore.DiffInit{CreateSize: size}, options(tc.encryptedTemplate)...)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -54,7 +54,7 @@ func TestPrepareDiffPreservesTemplateAndExistingLogicalCapacity(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			cow, err := vhost.OpenBlockCOW(target, nil, plan, options(tc.encryptedTarget)...)
+			cow, err := diffstore.OpenDisk(target, nil, plan, options(tc.encryptedTarget)...)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -76,7 +76,7 @@ func TestPrepareDiffPreservesTemplateAndExistingLogicalCapacity(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if logical, err := vhost.DiffSourceCapacity(target, false, options(tc.encryptedTarget)...); err != nil || logical != size {
+			if logical, err := diffstore.DiffSourceCapacity(target, false, options(tc.encryptedTarget)...); err != nil || logical != size {
 				t.Fatalf("runtime capacity projection=%d/%v", logical, err)
 			}
 			if tc.encryptedTarget && info.Size() <= size {
@@ -88,7 +88,7 @@ func TestPrepareDiffPreservesTemplateAndExistingLogicalCapacity(t *testing.T) {
 			if err != nil || !plan.Existing {
 				t.Fatalf("existing plan=%+v err=%v", plan, err)
 			}
-			reopened, err := vhost.OpenBlockCOW(target, nil, plan, options(tc.encryptedTarget)...)
+			reopened, err := diffstore.OpenDisk(target, nil, plan, options(tc.encryptedTarget)...)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -121,11 +121,11 @@ func TestPrepareDiffInheritsBaseLogicalCapacity(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			var options []vhost.BlockCOWOption
+			var options []diffstore.DiskOption
 			if encrypted {
-				options = append(options, vhost.WithDiffEncryption([32]byte{1}, true))
+				options = append(options, diffstore.WithDiffEncryption([32]byte{1}, true))
 			}
-			cow, err := vhost.OpenBlockCOW(path, base, plan, options...)
+			cow, err := diffstore.OpenDisk(path, base, plan, options...)
 			if err != nil {
 				t.Fatal(err)
 			}

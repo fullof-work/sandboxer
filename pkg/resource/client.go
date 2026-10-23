@@ -118,7 +118,7 @@ func (c *Client) roundTripContextOnWrite(ctx context.Context, req *Message, dead
 }
 
 type roundTripWriteOptions struct {
-	onWrite func()
+	onWrite    func()
 	startGuard context.Context
 }
 

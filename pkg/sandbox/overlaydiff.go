@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
-	"github.com/kuasar-sandbox/sandboxer/pkg/vhost"
+	"github.com/kuasar-sandbox/sandboxer/pkg/diffstore"
 )
 
 // DefaultBaseRoot is the on-disk root for per-sandbox persistent state (the
@@ -52,26 +52,26 @@ func DefaultDiskDiffURI(baseDir, sandboxID, diskKey string) string {
 //
 // baseSize is the COW base's logical size, or 0 without a base;
 // templateURI is "" when unset. No filesystem resize or quota is performed.
-func PrepareDiff(diffPath, templateURI string, baseSize int64) (vhost.DiffInit, error) {
+func PrepareDiff(diffPath, templateURI string, baseSize int64) (diffstore.DiffInit, error) {
 	if st, err := os.Stat(diffPath); err == nil {
 		if st.Size() > 0 {
-			return vhost.DiffInit{Existing: true}, nil
+			return diffstore.DiffInit{Existing: true}, nil
 		}
-		return vhost.DiffInit{}, fmt.Errorf("existing diff %s is empty; remove it or provide a formatted diff", diffPath)
+		return diffstore.DiffInit{}, fmt.Errorf("existing diff %s is empty; remove it or provide a formatted diff", diffPath)
 	} else if !os.IsNotExist(err) {
-		return vhost.DiffInit{}, fmt.Errorf("stat diff %s: %w", diffPath, err)
+		return diffstore.DiffInit{}, fmt.Errorf("stat diff %s: %w", diffPath, err)
 	}
 
 	switch {
 	case templateURI != "":
 		scheme, templatePath, ok := config.SchemeAndPath(templateURI)
 		if !ok || scheme != "file" {
-			return vhost.DiffInit{}, fmt.Errorf("diff_template invalid URI: %s", templateURI)
+			return diffstore.DiffInit{}, fmt.Errorf("diff_template invalid URI: %s", templateURI)
 		}
-		return vhost.DiffInit{TemplatePath: templatePath}, nil
+		return diffstore.DiffInit{TemplatePath: templatePath}, nil
 	case baseSize > 0:
-		return vhost.DiffInit{CreateSize: baseSize}, nil
+		return diffstore.DiffInit{CreateSize: baseSize}, nil
 	default:
-		return vhost.DiffInit{}, fmt.Errorf("no ext4 source for a fresh overlay diff: set boot.root.overlay.diff_template or boot.root.overlay.base, or pre-format the diff at %s", diffPath)
+		return diffstore.DiffInit{}, fmt.Errorf("no ext4 source for a fresh overlay diff: set boot.root.overlay.diff_template or boot.root.overlay.base, or pre-format the diff at %s", diffPath)
 	}
 }

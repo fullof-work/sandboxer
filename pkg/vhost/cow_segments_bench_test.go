@@ -11,6 +11,8 @@ import (
 	"sort"
 	"testing"
 	"time"
+
+	"github.com/kuasar-sandbox/sandboxer/pkg/diffstore"
 )
 
 // These fixtures exercise processChain, including descriptor walking and the
@@ -74,11 +76,11 @@ type segmentCountBackend struct {
 
 func (b *segmentCountBackend) readAt(ctx context.Context, p []byte, off int64) (int, error) {
 	b.reads++
-	return b.C.readAt(ctx, p, off)
+	return b.C.ReadAtContext(ctx, p, off)
 }
 func (b *segmentCountBackend) writeAt(ctx context.Context, p []byte, off int64) (int, error) {
 	b.writes++
-	return b.C.writeAt(ctx, p, off)
+	return b.C.WriteAtContext(ctx, p, off)
 }
 
 func BenchmarkCOWSegments(b *testing.B) {
@@ -88,11 +90,12 @@ func BenchmarkCOWSegments(b *testing.B) {
 				b.Run(fmt.Sprintf("%s/%s/encrypted=%t", work, layout, encrypted), func(b *testing.B) {
 					const request = 1 << 20
 					const dataset = 64 << 20
-					var opts []BlockCOWOption
+					var opts []diffstore.DiskOption
 					if encrypted {
-						opts = append(opts, WithDiffEncryption([32]byte{91}, true))
+						opts = append(opts, diffstore.WithDiffEncryption([32]byte{91}, true))
 					}
-					cow, err := OpenBlockCOW(filepath.Join(b.TempDir(), "diff"), nil, DiffInit{CreateSize: dataset}, opts...)
+					path := filepath.Join(b.TempDir(), "diff")
+					cow, err := diffstore.OpenDisk(path, nil, diffstore.DiffInit{CreateSize: dataset}, opts...)
 					if err != nil {
 						b.Fatal(err)
 					}
@@ -108,27 +111,34 @@ func BenchmarkCOWSegments(b *testing.B) {
 					for i := range data[:request] {
 						data[i] = 0x6d
 					}
-					for i := 0; i < request; i += cowBlockSize {
+					for i := 0; i < request; i += diffstore.PageSize {
 						binary.LittleEndian.PutUint64(data[i:i+8], uint64(i))
 					}
 					expectedCRC := crc32.ChecksumIEEE(data[:request])
 					if work != "write" {
 						for off := int64(0); off < dataset; off += request {
-							if err := writeFullAt(cow.diff, data[:request], off); err != nil {
+							if _, err := cow.WriteAt(data[:request], off); err != nil {
 								b.Fatal(err)
 							}
 						}
-						for block := int64(0); block < dataset/cowBlockSize; block++ {
-							cow.markDirty(block)
+						if err := cow.Drain(context.Background()); err != nil {
+							b.Fatal(err)
 						}
+						if err := cow.Close(); err != nil {
+							b.Fatal(err)
+						}
+						cow, err = diffstore.OpenDisk(path, nil, diffstore.DiffInit{Existing: true}, opts...)
+						if err != nil {
+							b.Fatal(err)
+						}
+						defer cow.Close()
+						backend.C = cow
 						if work == "cache-hit" {
 							if _, err := cow.ReadAt(data[:request], 0); err != nil {
 								b.Fatal(err)
 							}
 						}
 					}
-					probe := &workingSetIO{diffBodyIO: cow.diff.bodyIO}
-					cow.diff.bodyIO = probe
 					var samples [4096]int64 // fixed-size diagnostic sample, no timed allocation
 					sampleCount := min(b.N, len(samples))
 					sampleIndex, nextSample := 0, 0
@@ -181,25 +191,29 @@ func BenchmarkCOWSegments(b *testing.B) {
 					b.ReportMetric(float64(verification.Nanoseconds())/float64(b.N), "verification-ns/op")
 					reportSamples(b, samples[:sampleCount])
 					b.ReportMetric(float64(backend.reads+backend.writes)/float64(b.N), "cow-calls/op")
-					b.ReportMetric(float64(probe.readCalls.Load())/float64(b.N), "body-reads/op")
-					b.ReportMetric(float64(probe.writeCalls.Load())/float64(b.N), "body-writes/op")
-					b.ReportMetric(float64(probe.reads.Load())/float64(b.N*request), "read-amplification")
-					b.ReportMetric(float64(probe.writes.Load())/float64(b.N*request), "write-amplification")
-					stats := cow.cache.Stats()
+					stats := cow.CacheStats()
 					b.ReportMetric(float64(stats.PeakUsed), "cache-peak-B")
 					b.ReportMetric(float64(stats.PeakDirty), "dirty-peak-B")
 					if kind == BlkTypeOut {
-						// Check the actual diff after Drain, bypassing the clean cache.
+						if err := cow.Close(); err != nil {
+							b.Fatal(err)
+						}
+						cow, err = diffstore.OpenDisk(path, nil, diffstore.DiffInit{Existing: true}, opts...)
+						if err != nil {
+							b.Fatal(err)
+						}
+						defer cow.Close()
+						// Reopen after Drain to verify persisted bytes through the public API.
 						// Metrics above already captured only the timed workload I/O.
-						var check [cowBlockSize]byte
+						var check [diffstore.PageSize]byte
 						for rangeIndex := 0; rangeIndex < min(b.N, dataset/request); rangeIndex++ {
 							off := rangeIndex * request
 							last := rangeIndex + (b.N-1-rangeIndex)/(dataset/request)*(dataset/request)
 							binary.LittleEndian.PutUint64(data[:8], uint64(off))
 							binary.LittleEndian.PutUint64(data[8:16], uint64(last))
-							for block := 0; block < request; block += cowBlockSize {
-								n, err := cow.diff.ReadAt(check[:], int64(off+block))
-								if err != nil || n != len(check) || !bytes.Equal(check[:], data[block:block+cowBlockSize]) {
+							for block := 0; block < request; block += diffstore.PageSize {
+								n, err := cow.ReadAt(check[:], int64(off+block))
+								if err != nil || n != len(check) || !bytes.Equal(check[:], data[block:block+diffstore.PageSize]) {
 									b.Fatalf("write payload mismatch at %d: n=%d err=%v", off+block, n, err)
 								}
 							}

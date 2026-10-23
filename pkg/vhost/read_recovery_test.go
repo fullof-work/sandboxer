@@ -17,6 +17,7 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
 	"github.com/kuasar-sandbox/accelerator/pkg/readerr"
 	"github.com/kuasar-sandbox/sandboxer/internal/readretry"
+	"github.com/kuasar-sandbox/sandboxer/pkg/diffstore"
 	"golang.org/x/sys/unix"
 )
 
@@ -31,14 +32,14 @@ func (s recoveryStream) ReadAt(ctx context.Context, p []byte, _ uint64) (int, er
 func (recoveryStream) Close() error { return nil }
 
 // Exercise the real chain and ring path, including COW's implicit base read.
-func recoveryQueue(t *testing.T, stream fetch.Stream, write bool) (*Server, *virtq, []byte, *BlockCOW) {
+func recoveryQueue(t *testing.T, stream fetch.Stream, write bool) (*Server, *virtq, []byte, *diffstore.Disk) {
 	t.Helper()
-	base := NewStreamReader(context.Background(), stream, 4096)
+	base := diffstore.NewStreamReader(context.Background(), stream, 4096)
 	var backend Backend = &ReadOnlyBackend{R: base}
-	var cow *BlockCOW
+	var cow *diffstore.Disk
 	if write {
 		var err error
-		cow, err = OpenBlockCOW(filepath.Join(t.TempDir(), "diff"), base, DiffInit{CreateSize: 4096})
+		cow, err = diffstore.OpenDisk(filepath.Join(t.TempDir(), "diff"), base, diffstore.DiffInit{CreateSize: 4096})
 		if err != nil {
 			t.Fatal(err)
 		}

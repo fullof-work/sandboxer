@@ -147,7 +147,7 @@ func (f *trackingLocationReadFile) Seek(offset int64, whence int) (int64, error)
 	return f.base.Seek(offset, whence)
 }
 func (f *trackingLocationReadFile) Stat() (os.FileInfo, error) { return f.base.Stat() }
-func (f *trackingLocationReadFile) Close() error { return f.base.Close() }
+func (f *trackingLocationReadFile) Close() error               { return f.base.Close() }
 
 func TestLocationTargetFreshPublicationWritesSharedFinalOnce(t *testing.T) {
 	directory := t.TempDir()

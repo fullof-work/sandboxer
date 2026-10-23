@@ -19,7 +19,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/kuasar-sandbox/sandboxer/internal/diffstore"
+	"github.com/kuasar-sandbox/sandboxer/pkg/diffstore"
 	"golang.org/x/sys/unix"
 )
 
@@ -63,7 +63,7 @@ func run() error {
 	dir := flag.String("directory", "", "new task-owned directory on a real Linux filesystem")
 	sizes := flag.String("sizes-gib", "0,1,10", "actual payload history sizes; files are removed between sizes")
 	rounds := flag.Int("rounds", 5, "independent registrations and index reconstruction samples per size")
-	vhostBinary := flag.String("vhost-test-binary", "", "optional compiled pkg/vhost test binary for fixed-pending COW phase measurements")
+	vhostBinary := flag.String("vhost-test-binary", "", "optional compiled pkg/diffstore test binary for fixed-pending COW phase measurements")
 	flag.Parse()
 	if *dir == "" || *rounds < 1 {
 		return fmt.Errorf("--directory and positive --rounds are required")

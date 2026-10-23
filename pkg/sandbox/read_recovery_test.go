@@ -18,8 +18,8 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/readerr"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
+	"github.com/kuasar-sandbox/sandboxer/pkg/diffstore"
 	"github.com/kuasar-sandbox/sandboxer/pkg/proto"
-	"github.com/kuasar-sandbox/sandboxer/pkg/vhost"
 	"golang.org/x/sys/unix"
 )
 
@@ -38,7 +38,7 @@ func TestMandatoryReadFatalDuringPostSpawnReapsCHOnce(t *testing.T) {
 func testMandatoryReadFatalDuringPostSpawn(t *testing.T, blockReady bool) {
 	runDir := t.TempDir()
 	marker := filepath.Join(runDir, "child-ready")
-	cow, err := vhost.OpenBlockCOW(filepath.Join(t.TempDir(), "diff"), nil, vhost.DiffInit{CreateSize: 4096})
+	cow, err := diffstore.OpenDisk(filepath.Join(t.TempDir(), "diff"), nil, diffstore.DiffInit{CreateSize: 4096})
 	if err != nil {
 		t.Fatal(err)
 	}

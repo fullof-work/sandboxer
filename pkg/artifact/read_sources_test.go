@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"github.com/kuasar-sandbox/sandboxer/pkg/diffstore"
 	"io"
 	"net"
 	"os"
@@ -28,7 +29,6 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/store/pb"
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
-	"github.com/kuasar-sandbox/sandboxer/pkg/vhost"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -313,7 +313,7 @@ func TestSameReadScriptAcrossFileBundleCacheAndStore(t *testing.T) {
 			observed := &observedStream{Stream: stream}
 			readCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 			defer cancel()
-			reader := vhost.NewStreamReader(readCtx, observed, int64(len(plain)))
+			reader := diffstore.NewStreamReader(readCtx, observed, int64(len(plain)))
 			defer reader.Close()
 			script.armed.Store(true)
 			dst := bytes.Repeat([]byte{0xaa}, len(plain))

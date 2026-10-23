@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/kuasar-sandbox/sandboxer/internal/readretry"
+	"github.com/kuasar-sandbox/sandboxer/pkg/diffstore"
 )
 
 func bindingSetForTest(t *testing.T, specs ...BlockDeviceSpec) *BackendSet {
@@ -370,7 +371,7 @@ func TestBackendSetPreservesContextDispatch(t *testing.T) {
 }
 
 func TestBackendSetBoundCOWReadWrite(t *testing.T) {
-	cow, err := OpenBlockCOW(filepath.Join(t.TempDir(), "diff"), nil, DiffInit{CreateSize: 4096})
+	cow, err := diffstore.OpenDisk(filepath.Join(t.TempDir(), "diff"), nil, diffstore.DiffInit{CreateSize: 4096})
 	if err != nil {
 		t.Fatal(err)
 	}

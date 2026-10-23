@@ -14,8 +14,8 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 	"github.com/kuasar-sandbox/sandboxer/internal/readretry"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
+	"github.com/kuasar-sandbox/sandboxer/pkg/diffstore"
 	"github.com/kuasar-sandbox/sandboxer/pkg/sandboxfile"
-	"github.com/kuasar-sandbox/sandboxer/pkg/vhost"
 )
 
 // FileStreamOpener opens one already-resolved file:// artifact. Callers that
@@ -24,7 +24,7 @@ import (
 type FileStreamOpener func(ctx context.Context, path string, ref manifest.Ref) (fetch.Stream, error)
 
 // OpenBlockReader resolves a file:// or manifest:// disk URI into a
-// vhost.BlockReader plus the total disk size, via a fetch.Stream. file://
+// diffstore.BlockReader plus the total disk size, via a fetch.Stream. file://
 // opens a local tarstream by default or uses the supplied unified opener;
 // manifest:// resolves one manifest through the fetcher. Both wrap in a
 // StreamReader whose Close releases the stream (the file's fd; a manifest
@@ -37,18 +37,18 @@ type FileStreamOpener func(ctx context.Context, path string, ref manifest.Ref) (
 //
 // ctx scopes asynchronous chunk fetches kicked off by later ReadAt calls;
 // cancelling it makes pending vhost-user-blk reads fail promptly at shutdown.
-func OpenBlockReader(ctx context.Context, uri string, fetcher fetch.Fetcher, locations config.RefLocations, codec tarstream.Codec, required bool) (vhost.BlockReader, int64, error) {
+func OpenBlockReader(ctx context.Context, uri string, fetcher fetch.Fetcher, locations config.RefLocations, codec tarstream.Codec, required bool) (diffstore.BlockReader, int64, error) {
 	return OpenBlockReaderWithOpener(ctx, uri, fetcher, locations, codec, required, nil)
 }
 
 // OpenBlockReaderWithOpener is OpenBlockReader with unified file:// format
 // detection supplied by the process artifact owner.
-func OpenBlockReaderWithOpener(ctx context.Context, uri string, fetcher fetch.Fetcher, locations config.RefLocations, codec tarstream.Codec, required bool, opener FileStreamOpener) (vhost.BlockReader, int64, error) {
+func OpenBlockReaderWithOpener(ctx context.Context, uri string, fetcher fetch.Fetcher, locations config.RefLocations, codec tarstream.Codec, required bool, opener FileStreamOpener) (diffstore.BlockReader, int64, error) {
 	stream, size, err := OpenDiskStreamAtWithOpener(ctx, uri, fetcher, locations, "", codec, required, opener)
 	if err != nil {
 		return nil, 0, err
 	}
-	return vhost.NewStreamReader(ctx, stream, size), size, nil
+	return diffstore.NewStreamReader(ctx, stream, size), size, nil
 }
 
 // OpenRootImageBlockReaderWithOpener opens the read-only root EROFS image and
@@ -56,13 +56,13 @@ func OpenBlockReaderWithOpener(ctx context.Context, uri string, fetcher fetch.Fe
 // .sandbox has already been narrowed by OpenDiskStreamAtWithOpener; a normal
 // container image is then narrowed by the strict flattened-image reader.
 // ImageConfigBytes remains available to LoadImageConfigFrom in both cases.
-func OpenRootImageBlockReaderWithOpener(ctx context.Context, uri string, fetcher fetch.Fetcher, locations config.RefLocations, codec tarstream.Codec, required bool, opener FileStreamOpener) (vhost.BlockReader, int64, error) {
+func OpenRootImageBlockReaderWithOpener(ctx context.Context, uri string, fetcher fetch.Fetcher, locations config.RefLocations, codec tarstream.Codec, required bool, opener FileStreamOpener) (diffstore.BlockReader, int64, error) {
 	stream, size, err := OpenDiskStreamAtWithOpener(ctx, uri, fetcher, locations, "", codec, required, opener)
 	if err != nil {
 		return nil, 0, err
 	}
 	if provider, ok := stream.(interface{ ImageConfigBytes() []byte }); ok && provider.ImageConfigBytes() != nil {
-		return vhost.NewStreamReader(ctx, stream, size), size, nil
+		return diffstore.NewStreamReader(ctx, stream, size), size, nil
 	}
 	image, err := sandboxfile.OpenEROFSArtifact(ctx, stream)
 	if err != nil {
@@ -73,7 +73,7 @@ func OpenRootImageBlockReaderWithOpener(ctx context.Context, uri string, fetcher
 		return nil, 0, errors.Join(errors.New("root container image is too large"), closeErr)
 	}
 	size = int64(image.Payload.Size())
-	return vhost.NewStreamReader(ctx, image.Payload, size), size, nil
+	return diffstore.NewStreamReader(ctx, image.Payload, size), size, nil
 }
 
 // OpenDiskStream resolves a file:// or manifest:// disk URI into a fetch.Stream
@@ -162,13 +162,13 @@ func openLocalDiskStream(path string, ref manifest.Ref, codec tarstream.Codec, r
 
 // OpenLayeredBlockReader opens refs in top-to-bottom order and composes them as
 // one read-only block source. A single ref is returned without an extra layer.
-func OpenLayeredBlockReader(ctx context.Context, refs []string, fetcher fetch.Fetcher, locations config.RefLocations, codec tarstream.Codec, required bool) (vhost.BlockReader, int64, error) {
+func OpenLayeredBlockReader(ctx context.Context, refs []string, fetcher fetch.Fetcher, locations config.RefLocations, codec tarstream.Codec, required bool) (diffstore.BlockReader, int64, error) {
 	return OpenLayeredBlockReaderWithOpener(ctx, refs, fetcher, locations, codec, required, nil)
 }
 
 // OpenLayeredBlockReaderWithOpener is OpenLayeredBlockReader with unified
 // file:// format detection for every layer.
-func OpenLayeredBlockReaderWithOpener(ctx context.Context, refs []string, fetcher fetch.Fetcher, locations config.RefLocations, codec tarstream.Codec, required bool, opener FileStreamOpener) (vhost.BlockReader, int64, error) {
+func OpenLayeredBlockReaderWithOpener(ctx context.Context, refs []string, fetcher fetch.Fetcher, locations config.RefLocations, codec tarstream.Codec, required bool, opener FileStreamOpener) (diffstore.BlockReader, int64, error) {
 	if len(refs) == 0 {
 		return nil, 0, errors.New("disk layer list is empty")
 	}
@@ -200,7 +200,7 @@ func OpenLayeredBlockReaderWithOpener(ctx context.Context, refs []string, fetche
 	if len(streams) > 1 {
 		stream = fetch.NewLayered(streams...)
 	}
-	return vhost.NewStreamReader(ctx, stream, logicalSize), logicalSize, nil
+	return diffstore.NewStreamReader(ctx, stream, logicalSize), logicalSize, nil
 }
 
 type localArtifactError struct {

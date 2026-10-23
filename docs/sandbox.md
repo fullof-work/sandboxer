@@ -732,7 +732,7 @@ SDK entry points use the same rules: `RuntimeSpec.EnableCheckpoint`,
 `ProcessStorage.ListDiffCheckpoints/DeleteDiffCheckpoint`. After both
 `Publisher.PublishWithOptions` and `Publisher.Close` succeed, callers may invoke
 `ProcessStorage.DeletePublishedDiffCheckpoints(ctx, result)` and report that error
-separately before closing storage. No caller needs to open a BlockCOW to manage
+separately before closing storage. No caller needs to open a Disk to manage
 offline metadata or publish a fixed version.
 
 Embedding callers may supply an opaque `ProcessStorage` in `LaunchSpec`;
@@ -741,7 +741,7 @@ policy. `NewProcessStorageWithLocalAccess` can borrow a fetcher, and `Borrow`
 retains the complete storage access capability. Closing a borrower does not
 close the original clients; the owner must remain open until borrowers finish.
 
-At the block layer, `BlockCOW.Checkpoint(ctx, id)`, `ListCheckpoints(ctx)`,
+At the block layer, `Disk.Checkpoint(ctx, id)`, `ListCheckpoints(ctx)`,
 `DeleteCheckpoint(ctx, id)` and `Export(ctx, id)` use `vhost.CheckpointID`.
 A named `Export` returns a sparse source and closer that owns its reader pin;
 close it when finished. `Export(ctx, vhost.ActiveDiff)` instead requires the
@@ -983,7 +983,7 @@ restored instance uses its current host configuration. Portable C0/E/S never
 contains cache policy, pages, queues or LRU state. Strict restore validation,
 config merging and host projection preserve this boundary.
 
-Go callers can pass one `COWCache` with `WithCOWCache` to multiple `OpenBlockCOW`
+Go callers can pass one `diffstore.Cache` with `diffstore.WithCache` to multiple `diffstore.OpenDisk`
 calls. Close the COWs before closing that cache. Without this option, a standalone
 COW owns a finite default cache and closes it itself.
 
@@ -1256,7 +1256,7 @@ type Root struct {
 
 Payload is a section view preserving sparse `RunAt`/`ReadAt`. A shared close owner ensures that closing FullStream, Payload, or Root ultimately releases the carrier exactly once. Vhost sees only ordinary Payload, never the ZIP tail. A Checkpoint root additionally exposes parsed `Checkpoint` metadata; generic payload consumers reject it and require explicit version materialization.
 
-A live BlockCOW SnapshotView is an upper-only sparse delta. Its ext4-superblock offset can be a Hole, so not every live payload can be required to pass an independent ext4-magic check. The reader checks logical size, graph/self relationships, and the final composition. Direct EROFS payloads undergo strict EROFS logical-size/magic checks.
+A live Disk SnapshotView is an upper-only sparse delta. Its ext4-superblock offset can be a Hole, so not every live payload can be required to pass an independent ext4-magic check. The reader checks logical size, graph/self relationships, and the final composition. Direct EROFS payloads undergo strict EROFS logical-size/magic checks.
 
 <a id="snapshot-format"></a>
 
@@ -1907,7 +1907,7 @@ Only the current E contributes disk versions: retaining an ancestor S for memory
 does not retain that ancestor's disk Checkpoints. Cleanup obtains the directory
 owner, validates the complete keep set, deletes unused versions in batches, and
 retires DIFFs not needed by that set through the metadata backend. Existing read
-pins defer physical reclamation. It does not open an active BlockCOW or decrypt
+pins defer physical reclamation. It does not open an active Disk or decrypt
 guest pages. A keep-plan or identity error prevents this mutation.
 
 The keep set contains current S/E, memory-history carriers, and current disk,
@@ -1993,7 +1993,7 @@ T12 destroy, or --resume full recovery
 
 Export never drops caches, invokes `/vm.snapshot`, or reads CH snapshot files or memfd. Snapshot reads disks once, rather than capturing them once for E and a second time through an old disk path.
 
-BlockCOW SnapshotView is stable only while the backend is quiesced. V1 keeps the VM paused throughout sink reads; the VM cannot resume while the sink continues reading that view.
+Disk SnapshotView is stable only while the backend is quiesced. V1 keeps the VM paused throughout sink reads; the VM cannot resume while the sink continues reading that view.
 
 Failure semantics:
 
@@ -2172,7 +2172,7 @@ Tarstream and Bundle are physical carriers, not logical roles. Tarstream contain
 
 Named locations therefore require directory creation, exclusive file creation, writes/reads, stat/fstat/lstat, permission setting, seek/pread, close, and removal of incomplete files owned by this process. They do not rely on rename/renameat2, symlinks, hardlinks, reflinks, preservation of filesystem holes, advisory locks, or lock files, and perform no explicit file/directory sync. Successful publication is defined by exclusive writes, checked `Close()`, final-path reopening/full verification, and path-identity checks; the filesystem or underlying storage defines physical writeback.
 
-Active encrypted `.overlay.diff` files remain in KDXTS format. Export reads only the decrypted BlockCOW SnapshotView and creates a new immutable logical artifact. It never appends ZIP data to an active diff.
+Active encrypted `.overlay.diff` files remain in KDXTS format. Export reads only the decrypted Disk SnapshotView and creates a new immutable logical artifact. It never appends ZIP data to an active diff.
 
 <a id="manifest-upload"></a>
 
@@ -2429,7 +2429,7 @@ The vhost backend receives the `fetch.Stream` Payload section, not FullStream. I
 
 ### 11.2 Layered reads
 
-Read order is active diff → captured top → `base_from_refs` → root image where applicable. Hole falls through; Zero/Data stop traversal. The immutable layers composed within one writable block device must have matching logical sizes. In the EROFS-plus-ext4 topology, the read-only EROFS base is a separate vhost device; it is not the final fall-through layer of the writable ext4 BlockCOW device. See [disks.go](../pkg/sandbox/disks.go) and [serveandwait.go](../pkg/sandbox/serveandwait.go).
+Read order is active diff → captured top → `base_from_refs` → root image where applicable. Hole falls through; Zero/Data stop traversal. The immutable layers composed within one writable block device must have matching logical sizes. In the EROFS-plus-ext4 topology, the read-only EROFS base is a separate vhost device; it is not the final fall-through layer of the writable ext4 Disk device. See [disks.go](../pkg/sandbox/disks.go) and [serveandwait.go](../pkg/sandbox/serveandwait.go).
 
 `StreamReader` retries a complete read synchronously. Runtime queue contexts replace preparation contexts for that call, so stopping an old master session cancels its pending reads before its workers are joined and its memory table is replaced. The COW adapter passes that context into base materialization while retaining block locks, the dirty bitmap and partial-write algorithm. It never retries an entire `WriteAt`, `FLUSH`, Store `Put` or snapshot operation.
 
@@ -2450,7 +2450,10 @@ follows the failure. Export does not rotate the active diff or change its base.
 
 <a id="cow-backend"></a>
 
-### 11.4 BlockCOW state and I/O
+### 11.4 Disk state and I/O
+
+The public storage API is in [`pkg/diffstore`](../pkg/diffstore); see the
+[package architecture and migration guide](diffstore.md). `pkg/vhost` owns transport only.
 
 Active writable diffs request O_DIRECT through one common positioned-I/O API,
 including on tmpfs. Runtime policy does not identify the backing filesystem.
@@ -2464,8 +2467,7 @@ their existing behavior.
 
 #### 11.4.1 Logical state and accounting
 
-The stack is `BlockCOW -> plaintext cache -> diffFile encoding -> owned I/O
-workspace -> active file`. Pages are 4096 bytes. Base reads do not populate or
+The stack is `Disk -> plaintext cache -> diffBackend -> single-layer or versioned storage`. Pages are 4096 bytes. Base reads do not populate or
 materialize the upper cache. Each cached page is indexed by active file and block number.
 
 | State or transition | Total used | Dirty used |
@@ -2612,7 +2614,7 @@ retrying an unaligned remainder; see [write(2)](https://man7.org/linux/man-pages
 
 ### 11.4.5 Versioned DIFF v2 storage and recovery
 
-The optional backend lives in [`internal/diffstore`](../internal/diffstore).
+The optional backend lives in [`pkg/diffstore/internal/versioned`](../pkg/diffstore/internal/versioned).
 Each logical 4 KiB block maps through a B+ tree to a physical slot. A 4 KiB index
 page has a 16-byte header and at most 255 16-byte entries. Leaves map logical
 block numbers to data slots; internal entries pair each child's maximum logical
@@ -2888,7 +2890,7 @@ The historical runs remain in their original Git commits and [COW work](https://
 Use the existing `blk_cow_workingset_bench_test.go` working-set driver and a matching adapter for each revision. A buffered baseline without a sandbox cache uses no-op cache drain/close and no cache statistics; do not imply that its request completion is media durability. Keep candidate admission and final Drain separate:
 
 ```bash
-go test -tags no_rocksdb ./pkg/vhost -run '^$' \
+go test -tags no_rocksdb ./pkg/diffstore -run '^$' \
   -bench '^BenchmarkCOWWorkingSet$' -benchtime=1x -count=1 -timeout 15m
 ```
 
@@ -2899,7 +2901,7 @@ Exclude fixture/setup work; measure request percentiles including quota waits, l
 The existing `cow_direct_workingset_bench_test.go` provides an uncached direct-I/O reference with the same active-I/O and XTS rules, not a selectable production mode:
 
 ```bash
-go test -tags no_rocksdb ./pkg/vhost -run '^$' \
+go test -tags no_rocksdb ./pkg/diffstore -run '^$' \
   -bench '^BenchmarkCOWDirectWorkingSet$' -benchtime=1x -count=1 -timeout 15m
 ```
 
@@ -3096,14 +3098,14 @@ path, tmpfs-only run or skipped privileged test does not establish those results
 
 ```bash
 # In the prepared Go source environment, with TMPDIR on the filesystem under test:
-CGO_ENABLED=0 go test -count=1 ./internal/diffstore ./pkg/vhost ./pkg/artifact \
+CGO_ENABLED=0 go test -count=1 ./pkg/diffstore/... ./pkg/vhost ./pkg/artifact \
   ./pkg/config ./pkg/sandboxfile ./pkg/snapshot ./pkg/restore ./pkg/sandbox ./pkg/ctl ./cmd/sandbox-ctl
-CGO_ENABLED=1 go test -race -count=1 ./internal/diffstore ./pkg/vhost ./pkg/artifact ./pkg/restore
+CGO_ENABLED=1 go test -race -count=1 ./pkg/diffstore/... ./pkg/vhost ./pkg/artifact ./pkg/restore
 # Required full source gate in Workbench system mode with mount/namespace capability:
 bash scripts/ci-source-checks.sh
 
 # Dedicated, disposable 64 MiB ext4 filesystem; never a shared developer mount:
-DIFFSTORE_FULL_FS=/path/to/owned/finite-ext4 go test ./internal/diffstore \
+DIFFSTORE_FULL_FS=/path/to/owned/finite-ext4 go test ./pkg/diffstore/internal/versioned \
   -run '^TestRealFilesystemFullRecovery$' -count=1 -v
 
 # Root shell; PREPARED contains exact built artifacts and the platform E2E runner:
@@ -3111,7 +3113,7 @@ python3 "$PREPARED/test/e2e/e2e" run --workdir "$PREPARED" \
   --suite snapshot --include snapshot.checkpoint.sh
 
 # Actual payload histories; default sizes are 0,1,10 GiB:
-go test -c -o /path/to/compiled-vhost.test ./pkg/vhost
+go test -c -o /path/to/compiled-vhost.test ./pkg/diffstore
 go run ./test/perf/diffstore --directory /path/to/new-owned-directory \
   --sizes-gib 0,1,10 --rounds 5 \
   --vhost-test-binary /path/to/compiled-vhost.test
@@ -3128,21 +3130,21 @@ python3 test/perf/checkpoint_template.py --tmpdir /path/to/native-ext4/scratch \
 # (30 GiB logical capacity with only 240 mapped pages).
 CHECKPOINT_PRESENCE_DIR=/path/to/owned/native-ext4/fixtures \
 CHECKPOINT_PRESENCE_CASE=dense-plain CHECKPOINT_PRESENCE_PHASE=seed \
-  go test ./pkg/vhost -run '^TestCheckpointPresencePhases$' -count=1 -v
+  go test ./pkg/diffstore -run '^TestCheckpointPresencePhases$' -count=1 -v
 CHECKPOINT_PRESENCE_DIR=/path/to/owned/native-ext4/fixtures \
 CHECKPOINT_PRESENCE_CASE=dense-plain CHECKPOINT_PRESENCE_PHASE=measure \
 CHECKPOINT_PRESENCE_LABEL=candidate \
-  go test ./pkg/vhost -run '^TestCheckpointPresencePhases$' -count=1 -v
+  go test ./pkg/diffstore -run '^TestCheckpointPresencePhases$' -count=1 -v
 
 # Active dense reads: same fixture for both binaries, >=3 alternating rounds.
 # CASE: plain-shared, plain-private, xts-shared, xts-private.
 CHECKPOINT_READ_DIR=/path/to/owned/native-ext4/dense-fixtures \
 CHECKPOINT_READ_CASE=plain-shared CHECKPOINT_READ_PHASE=seed \
-  go test ./pkg/vhost -run '^TestCheckpointDenseReadPhases$' -count=1 -v
+  go test ./pkg/diffstore -run '^TestCheckpointDenseReadPhases$' -count=1 -v
 CHECKPOINT_READ_DIR=/path/to/owned/native-ext4/dense-fixtures \
 CHECKPOINT_READ_CASE=plain-shared CHECKPOINT_READ_PHASE=measure \
 CHECKPOINT_READ_LABEL=candidate \
-  go test ./pkg/vhost -run '^TestCheckpointDenseReadPhases$' -count=1 -v
+  go test ./pkg/diffstore -run '^TestCheckpointDenseReadPhases$' -count=1 -v
 ```
 
 The source suite checks independent-process pins and writer handoff, killed-owner
@@ -3195,7 +3197,7 @@ preparation is excluded; process peak RSS still includes that setup.
 
 The scaling driver removes each history before the next size. It reports
 checkpoint registration, control reopen and presence reconstruction separately;
-its explicit full-scan measurement scales with mapped pages. V2 BlockCOW reopen
+its explicit full-scan measurement scales with mapped pages. V2 Disk reopen
 now defers that work to accessed ranges or a later ordinary active export.
 The vhost helper freezes exactly 32 dirty pages (128 KiB) before writeback and
 reports template readiness, Drain, final materialization, metadata registration,

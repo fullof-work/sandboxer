@@ -11,7 +11,7 @@ import (
 
 	manifestcrypto "github.com/kuasar-sandbox/accelerator/pkg/manifest/crypto"
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
-	"github.com/kuasar-sandbox/sandboxer/internal/diffstore"
+	"github.com/kuasar-sandbox/sandboxer/pkg/diffstore"
 	"github.com/kuasar-sandbox/sandboxer/pkg/sandboxfile"
 	"golang.org/x/sys/unix"
 )

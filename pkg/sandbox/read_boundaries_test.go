@@ -16,7 +16,7 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/readerr"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/sandboxer/internal/readretry"
-	"github.com/kuasar-sandbox/sandboxer/pkg/vhost"
+	"github.com/kuasar-sandbox/sandboxer/pkg/diffstore"
 )
 
 type boundaryExt4Stream struct {
@@ -32,7 +32,7 @@ func (boundaryExt4Stream) Close() error { return nil }
 
 func TestReadBoundaryExt4FullTerminal(t *testing.T) {
 	cause := io.EOF
-	base := vhost.NewStreamReader(context.Background(), boundaryExt4Stream{cause: readerr.Mark(cause, false)}, 4096)
+	base := diffstore.NewStreamReader(context.Background(), boundaryExt4Stream{cause: readerr.Mark(cause, false)}, 4096)
 	err := validateExt4BlockReader(context.Background(), base)
 	if !readretry.IsTerminal(err) || !readerr.IsPermanent(err) || !errors.Is(err, cause) {
 		t.Fatalf("sandbox ext4 accepted/lost terminal: %v", err)
@@ -40,7 +40,7 @@ func TestReadBoundaryExt4FullTerminal(t *testing.T) {
 }
 
 func TestExt4FullOrdinaryEOFRemainsValid(t *testing.T) {
-	base := vhost.NewStreamReader(context.Background(), boundaryExt4Stream{cause: io.EOF}, 4096)
+	base := diffstore.NewStreamReader(context.Background(), boundaryExt4Stream{cause: io.EOF}, 4096)
 	if err := validateExt4BlockReader(context.Background(), base); err != nil {
 		t.Fatal(err)
 	}
@@ -53,7 +53,7 @@ func (missingImageStream) ReadAt(context.Context, []byte, uint64) (int, error) {
 }
 func (missingImageStream) Close() error { return nil }
 func TestReadBoundaryImageConfigSourceMissingIsNotSoftMiss(t *testing.T) {
-	reader := vhost.NewStreamReader(context.Background(), missingImageStream{}, 4096)
+	reader := diffstore.NewStreamReader(context.Background(), missingImageStream{}, 4096)
 	cfg, err := LoadImageConfigFrom(reader, reader.Size())
 	if cfg != nil || !readretry.IsTerminal(err) || !readerr.IsPermanent(err) || !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("source missing accepted as absent config: cfg=%v err=%v", cfg, err)
@@ -93,18 +93,18 @@ func TestImageConfigFullReadErrorsSurviveZIP(t *testing.T) {
 		t.Fatal(err)
 	}
 	baseline := &boundaryConfigStream{Source: source}
-	if _, err := LoadImageConfigFrom(vhost.NewStreamReader(context.Background(), baseline, int64(len(body))), int64(len(body))); err != nil {
+	if _, err := LoadImageConfigFrom(diffstore.NewStreamReader(context.Background(), baseline, int64(len(body))), int64(len(body))); err != nil {
 		t.Fatal(err)
 	}
 	for _, cause := range []error{readerr.Mark(io.EOF, false), readerr.Mark(syscall.EAGAIN, false), io.EOF} {
 		for fail := 1; fail <= baseline.calls; fail++ {
 			s := &boundaryConfigStream{Source: source, fail: fail, cause: cause}
-			cfg, err := LoadImageConfigFrom(vhost.NewStreamReader(context.Background(), s, int64(len(body))), int64(len(body)))
+			cfg, err := LoadImageConfigFrom(diffstore.NewStreamReader(context.Background(), s, int64(len(body))), int64(len(body)))
 			if cause == io.EOF {
 				// Preserve the delegated ZIP reader's existing EOF contract:
 				// some fields accept full EOF; entry.Open returns it to callers.
 				control := &boundaryConfigStream{Source: source, fail: fail, cause: io.EOF}
-				_, controlErr := image.ReadConfig(vhost.NewStreamReader(context.Background(), control, int64(len(body))), int64(len(body)))
+				_, controlErr := image.ReadConfig(diffstore.NewStreamReader(context.Background(), control, int64(len(body))), int64(len(body)))
 				if controlErr != nil {
 					if cfg != nil || !errors.Is(err, io.EOF) || readretry.IsTerminal(err) {
 						t.Fatalf("changed ordinary EOF at read %d: cfg=%v err=%v control=%v", fail, cfg, err, controlErr)

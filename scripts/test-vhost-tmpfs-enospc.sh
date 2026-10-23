@@ -22,13 +22,13 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-echo '==> build isolated vhost ENOSPC test binary'
-(cd "$repo_root" && CGO_ENABLED=0 go test -c -o "$work/vhost.test" ./pkg/vhost)
+echo '==> build isolated diffstore ENOSPC test binary'
+(cd "$repo_root" && CGO_ENABLED=0 go test -c -o "$work/vhost.test" ./pkg/diffstore)
 parent_mnt="$(readlink /proc/self/ns/mnt)"
 command=(timeout --kill-after=5s 35s unshare --mount --propagation private env
     "TMPDIR=$work" SANDBOXER_TMPFS_ENOSPC_ROOT=1 "SANDBOXER_TMPFS_TEST_PARENT_MNT=$parent_mnt"
     "$work/vhost.test" -test.run='^TestDiffTmpfsENOSPC$' -test.timeout=30s -test.v)
-echo '==> run both isolated vhost ENOSPC cases as root'
+echo '==> run both isolated diffstore ENOSPC cases as root'
 "${privileged[@]}" "${command[@]}" > "$work/result.log" 2>&1 || {
     status=$?; cat "$work/result.log"; exit "$status";
 }

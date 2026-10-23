@@ -11,10 +11,9 @@ import (
 	"testing"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
-	"github.com/kuasar-sandbox/sandboxer/internal/diffstore"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
+	"github.com/kuasar-sandbox/sandboxer/pkg/diffstore"
 	"github.com/kuasar-sandbox/sandboxer/pkg/sandbox"
-	"github.com/kuasar-sandbox/sandboxer/pkg/vhost"
 	"golang.org/x/sys/unix"
 )
 
@@ -112,7 +111,7 @@ func TestRestoreCheckpointSourcesHandOffAfterEveryWriter(t *testing.T) {
 				}
 				return releaseSources()
 			}
-			cache, err := vhost.NewCOWCache(32768, 16384)
+			cache, err := diffstore.NewCache(32768, 16384)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -205,7 +204,7 @@ func TestRestoreCheckpointFailedHandoffCleansEveryWriter(t *testing.T) {
 				}
 				defer conflict.Close()
 			}
-			cache, err := vhost.NewCOWCache(32768, 16384)
+			cache, err := diffstore.NewCache(32768, 16384)
 			if err != nil {
 				t.Fatal(err)
 			}

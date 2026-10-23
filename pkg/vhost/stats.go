@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"math/bits"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -343,10 +344,10 @@ func (s *Stats) Snapshot() StatsSnapshot {
 		Discard:     s.discard.snapshot(),
 	}
 	for i := range s.readMap {
-		snap.LoadedBlocks += uint64(popcount64(s.readMap[i].Load()))
+		snap.LoadedBlocks += uint64(bits.OnesCount64(s.readMap[i].Load()))
 	}
 	for i := range s.writeMap {
-		snap.WrittenBlocks += uint64(popcount64(s.writeMap[i].Load()))
+		snap.WrittenBlocks += uint64(bits.OnesCount64(s.writeMap[i].Load()))
 	}
 	return snap
 }

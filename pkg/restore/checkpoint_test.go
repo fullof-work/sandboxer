@@ -15,13 +15,12 @@ import (
 	manifestcrypto "github.com/kuasar-sandbox/accelerator/pkg/manifest/crypto"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
-	"github.com/kuasar-sandbox/sandboxer/internal/diffstore"
 	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
+	"github.com/kuasar-sandbox/sandboxer/pkg/diffstore"
 	"github.com/kuasar-sandbox/sandboxer/pkg/sandbox"
 	"github.com/kuasar-sandbox/sandboxer/pkg/sandboxfile"
 	"github.com/kuasar-sandbox/sandboxer/pkg/snapshot"
-	"github.com/kuasar-sandbox/sandboxer/pkg/vhost"
 )
 
 func restoreCheckpointFixture(t *testing.T, encrypted ...bool) (Options, *openedSandboxSource, []byte) {
@@ -135,7 +134,7 @@ func TestRestoreCheckpointSameDirectoryUsesPlanAndRealDIFF(t *testing.T) {
 	if err := preflightRestoreDiskGraph(ctx, cfg, opts, source.RelativeDir, [32]byte{}); err != nil {
 		t.Fatal(err)
 	}
-	cache, err := vhost.NewCOWCache(8192, 4096)
+	cache, err := diffstore.NewCache(8192, 4096)
 	if err != nil {
 		t.Fatal(err)
 	}

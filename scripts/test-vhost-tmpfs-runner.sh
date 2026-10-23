@@ -10,7 +10,7 @@ export PATH="$work/bin:$PATH"
 cat > "$work/bin/go" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
-[ "$*" = "test -c -o $4 ./pkg/vhost" ] && [ "$CGO_ENABLED" = 0 ]
+[ "$*" = "test -c -o $4 ./pkg/diffstore" ] && [ "$CGO_ENABLED" = 0 ]
 printf 'go\n' >> "$TEST_TRACE"
 cat > "$4" <<'BIN'
 #!/usr/bin/env bash
