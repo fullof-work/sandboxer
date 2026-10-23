@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/kuasar-sandbox/sandboxer/pkg/diffstore"
 	"io"
 	"log"
 	"math"
@@ -42,7 +43,6 @@ import (
 	"github.com/kuasar-sandbox/sandboxer/pkg/stdio"
 	"github.com/kuasar-sandbox/sandboxer/pkg/tapfd"
 	"github.com/kuasar-sandbox/sandboxer/pkg/uffd"
-	"github.com/kuasar-sandbox/sandboxer/pkg/vhost"
 )
 
 // Options is the restore-specific input.
@@ -481,7 +481,7 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 	if err != nil {
 		return -1, err
 	}
-	cowCache, err := vhost.NewCOWCache(cacheSize, maxDirtySize)
+	cowCache, err := diffstore.NewCache(cacheSize, maxDirtySize)
 	if err != nil {
 		return -1, err
 	}
@@ -706,7 +706,7 @@ func openAndEstablishRestoreMUX(
 // pins must survive every writer open, including a failure on the last disk.
 // Only after all writers and their cleanups are registered may they be released.
 // Disk provenance comes from E/C0; S contributes no disk fields.
-func reconstructRestoreDisks(ctx context.Context, opts Options, key [32]byte, cfg *config.SandboxConfig, logf func(string, ...any), cache *vhost.COWCache) (_ []sandbox.DiskBackend, cleanup func() error, retErr error) {
+func reconstructRestoreDisks(ctx context.Context, opts Options, key [32]byte, cfg *config.SandboxConfig, logf func(string, ...any), cache *diffstore.Cache) (_ []sandbox.DiskBackend, cleanup func() error, retErr error) {
 	var closes []func() error
 	cleanup = sync.OnceValue(func() error {
 		var err error
@@ -766,7 +766,7 @@ func reconstructRestoreDisks(ctx context.Context, opts Options, key [32]byte, cf
 // diffURI/diffTemplate come from the restore host binding (or the auto-default
 // <sid>.<diskKey>.diff).
 // The returned cleanup closes the readers/CoW and removes an auto-created diff.
-func reconstructDisk(ctx context.Context, opts Options, diffCustomerKey [32]byte, single bool, capturedTop string, chain []string, erofsBaseURI, diffURI, diffTemplate, diskKey string, logf func(string, ...any), cowCache *vhost.COWCache) (sandbox.DiskBackend, func() error, error) {
+func reconstructDisk(ctx context.Context, opts Options, diffCustomerKey [32]byte, single bool, capturedTop string, chain []string, erofsBaseURI, diffURI, diffTemplate, diskKey string, logf func(string, ...any), cowCache *diffstore.Cache) (sandbox.DiskBackend, func() error, error) {
 	var db sandbox.DiskBackend
 	var closers []func() error
 	cleanup := func() error {
@@ -784,7 +784,7 @@ func reconstructDisk(ctx context.Context, opts Options, diffCustomerKey [32]byte
 	// Layered ro base: [captured top] ++ chain.
 	logf("disk %s image: opening captured top", diskKey)
 	refs := append([]string{capturedTop}, chain...)
-	var baseReader vhost.BlockReader
+	var baseReader diffstore.BlockReader
 	var err error
 	if capturedTop != "" {
 		baseReader, err = openLayeredDiskBase(ctx, refs, func(ctx context.Context, raw string) (fetch.Stream, error) { return openDiskRefStream(ctx, raw, opts) })
@@ -819,12 +819,12 @@ func reconstructDisk(ctx context.Context, opts Options, diffCustomerKey [32]byte
 	if err != nil {
 		return fail(fmt.Errorf("%s: prepare diff: %w", diskKey, err))
 	}
-	cowOptions := []vhost.BlockCOWOption{vhost.WithCOWCache(cowCache)}
+	cowOptions := []diffstore.DiskOption{diffstore.WithCache(cowCache)}
 	if opts.checkpointPlan != nil {
 		found := false
 		for _, binding := range opts.checkpointPlan.Disks {
 			if binding.Path == diffPath {
-				cowOptions = append(cowOptions, vhost.WithCheckpoint(binding.DiffID, binding.BaseID))
+				cowOptions = append(cowOptions, diffstore.WithCheckpoint(binding.DiffID, binding.BaseID))
 				found = true
 				break
 			}
@@ -835,12 +835,12 @@ func reconstructDisk(ctx context.Context, opts Options, diffCustomerKey [32]byte
 		diffInit.Existing = len(opts.checkpointReopen) != 0
 	}
 	if db.OwnedDiff {
-		cowOptions = append(cowOptions, vhost.WithDiscardOnClose())
+		cowOptions = append(cowOptions, diffstore.WithDiscardOnClose())
 	}
 	if opts.LocalCodec != nil {
-		cowOptions = append(cowOptions, vhost.WithDiffEncryption(diffCustomerKey, opts.LocalRequired))
+		cowOptions = append(cowOptions, diffstore.WithDiffEncryption(diffCustomerKey, opts.LocalRequired))
 	}
-	cow, err := vhost.OpenBlockCOW(diffPath, baseReader, diffInit, cowOptions...)
+	cow, err := diffstore.OpenDisk(diffPath, baseReader, diffInit, cowOptions...)
 	if err != nil {
 		return fail(fmt.Errorf("%s: open BlockCOW: %w", diskKey, err))
 	}
@@ -864,7 +864,7 @@ type restoreDiskStreamOpener func(context.Context, string) (fetch.Stream, error)
 // openLayeredDiskBase transfers ownership of every successfully opened layer
 // to one BlockReader. A partial open closes all retained streams exactly once;
 // the success path closes them only through the layered reader.
-func openLayeredDiskBase(ctx context.Context, refs []string, opener restoreDiskStreamOpener) (_ vhost.BlockReader, retErr error) {
+func openLayeredDiskBase(ctx context.Context, refs []string, opener restoreDiskStreamOpener) (_ diffstore.BlockReader, retErr error) {
 	if len(refs) == 0 || refs[0] == "" {
 		return nil, errors.New("disk layer top is required")
 	}
@@ -904,13 +904,13 @@ func openLayeredDiskBase(ctx context.Context, refs []string, opener restoreDiskS
 			return nil, fmt.Errorf("layer[%d] size %d conflicts with top size %d", i, stream.Size(), logicalSize)
 		}
 	}
-	return vhost.NewStreamReader(sandbox.VMLifecycleContext(ctx), fetch.NewLayered(streams...), int64(logicalSize)), nil
+	return diffstore.NewStreamReader(sandbox.VMLifecycleContext(ctx), fetch.NewLayered(streams...), int64(logicalSize)), nil
 }
 
 // openEROFSBlockReader exposes only the EROFS prefix of a flattened image or
 // parent Sandbox. The optional config ZIP is host metadata and must never be
 // visible to a vhost block backend.
-func openEROFSBlockReader(ctx context.Context, raw string, opts Options) (vhost.BlockReader, int64, error) {
+func openEROFSBlockReader(ctx context.Context, raw string, opts Options) (diffstore.BlockReader, int64, error) {
 	opener := sandbox.FileStreamOpener(func(ctx context.Context, path string, ref manifest.Ref) (fetch.Stream, error) {
 		opened, err := artifact.OpenFileWithLocations(ctx, path, ref, opts.ManifestCfg, opts.CustomerKeyFn,
 			opts.Fetcher, opts.RefLocations, opts.LocalCodec, opts.LocalRequired)
@@ -1356,14 +1356,14 @@ func preflightRestoreDiskGraph(ctx context.Context, cfg *config.SandboxConfig, o
 		}
 		return nil
 	}
-	openLayers := func(field, top string, lowers []string) (vhost.BlockReader, error) {
+	openLayers := func(field, top string, lowers []string) (diffstore.BlockReader, error) {
 		if top == "" && len(lowers) == 0 && opts.checkpointPlan != nil && len(opts.checkpointReopen) != 0 {
 			return nil, nil
 		}
 		refs := append([]string{top}, lowers...)
 		streams := make([]fetch.Stream, 0, len(refs))
 		var logicalSize uint64
-		fail := func(cause error) (vhost.BlockReader, error) {
+		fail := func(cause error) (diffstore.BlockReader, error) {
 			for _, stream := range streams {
 				cause = errors.Join(cause, stream.Close())
 			}
@@ -1387,7 +1387,7 @@ func preflightRestoreDiskGraph(ctx context.Context, cfg *config.SandboxConfig, o
 			streams = append(streams, stream)
 		}
 		layered := fetch.NewLayered(streams...)
-		return vhost.NewStreamReader(sandbox.VMLifecycleContext(ctx), layered, int64(logicalSize)), nil
+		return diffstore.NewStreamReader(sandbox.VMLifecycleContext(ctx), layered, int64(logicalSize)), nil
 	}
 	validateWritable := func(field string, root *config.RootConfig, diskKey string) (retErr error) {
 		top, lowers := root.Base, root.BaseFromRefs
@@ -1411,12 +1411,12 @@ func preflightRestoreDiskGraph(ctx context.Context, cfg *config.SandboxConfig, o
 		if !ok || scheme != "file" {
 			return fmt.Errorf("%s writable diff invalid URI: %s", field, diffURI)
 		}
-		var cowOptions []vhost.BlockCOWOption
+		var cowOptions []diffstore.DiskOption
 		if opts.checkpointPlan != nil {
 			found := false
 			for _, binding := range opts.checkpointPlan.Disks {
 				if binding.Path == diffPath {
-					cowOptions = append(cowOptions, vhost.WithCheckpoint(binding.DiffID, binding.BaseID))
+					cowOptions = append(cowOptions, diffstore.WithCheckpoint(binding.DiffID, binding.BaseID))
 					found = true
 					break
 				}
@@ -1426,7 +1426,7 @@ func preflightRestoreDiskGraph(ctx context.Context, cfg *config.SandboxConfig, o
 			}
 		}
 		if opts.LocalCodec != nil {
-			cowOptions = append(cowOptions, vhost.WithDiffEncryption(diffCustomerKey, opts.LocalRequired))
+			cowOptions = append(cowOptions, diffstore.WithDiffEncryption(diffCustomerKey, opts.LocalRequired))
 		}
 		info, statErr := os.Stat(diffPath)
 		switch {
@@ -1434,7 +1434,7 @@ func preflightRestoreDiskGraph(ctx context.Context, cfg *config.SandboxConfig, o
 			if info.Size() == 0 {
 				return fmt.Errorf("%s writable diff %s is empty; provide a formatted ext4 diff", field, diffPath)
 			}
-			if err := vhost.ValidateExistingDiffExt4(ctx, diffPath, base, cowOptions...); err != nil {
+			if err := diffstore.ValidateExistingDiffExt4(ctx, diffPath, base, cowOptions...); err != nil {
 				return fmt.Errorf("%s writable diff: %w", field, err)
 			}
 		case !os.IsNotExist(statErr):
@@ -1444,7 +1444,7 @@ func preflightRestoreDiskGraph(ctx context.Context, cfg *config.SandboxConfig, o
 			if !templateOK || templateScheme != "file" {
 				return fmt.Errorf("%s diff_template invalid URI: %s", field, templateURI)
 			}
-			if err := vhost.ValidateDiffTemplateExt4(ctx, templatePath, base, cowOptions...); err != nil {
+			if err := diffstore.ValidateDiffTemplateExt4(ctx, templatePath, base, cowOptions...); err != nil {
 				return fmt.Errorf("%s diff_template: %w", field, err)
 			}
 		default:
@@ -1480,7 +1480,7 @@ func preflightRestoreDiskGraph(ctx context.Context, cfg *config.SandboxConfig, o
 	return nil
 }
 
-func validateRestoreExt4Reader(ctx context.Context, reader vhost.BlockReader) error {
+func validateRestoreExt4Reader(ctx context.Context, reader diffstore.BlockReader) error {
 	const magicOffset = int64(1024 + 0x38)
 	if err := ctx.Err(); err != nil {
 		return err

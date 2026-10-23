@@ -3,6 +3,7 @@ package snapshot
 import (
 	"bytes"
 	"context"
+	"github.com/kuasar-sandbox/sandboxer/pkg/diffstore"
 	"os"
 	"path/filepath"
 	"testing"
@@ -11,7 +12,6 @@ import (
 	manifestcrypto "github.com/kuasar-sandbox/accelerator/pkg/manifest/crypto"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
-	"github.com/kuasar-sandbox/sandboxer/pkg/vhost"
 )
 
 func TestEncryptedActiveDiffSnapshotToEncryptedFileSink(t *testing.T) {
@@ -24,11 +24,11 @@ func TestEncryptedActiveDiffSnapshotToEncryptedFileSink(t *testing.T) {
 	}
 	const size = 2 * 4096
 	activePath := filepath.Join(t.TempDir(), "runtime-active.diff")
-	cow, err := vhost.OpenBlockCOW(
+	cow, err := diffstore.OpenDisk(
 		activePath,
 		nil,
-		vhost.DiffInit{CreateSize: size},
-		vhost.WithDiffEncryption(key, true),
+		diffstore.DiffInit{CreateSize: size},
+		diffstore.WithDiffEncryption(key, true),
 	)
 	if err != nil {
 		t.Fatal(err)

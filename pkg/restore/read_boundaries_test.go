@@ -9,7 +9,7 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
 	"github.com/kuasar-sandbox/accelerator/pkg/readerr"
 	"github.com/kuasar-sandbox/sandboxer/internal/readretry"
-	"github.com/kuasar-sandbox/sandboxer/pkg/vhost"
+	"github.com/kuasar-sandbox/sandboxer/pkg/diffstore"
 )
 
 type boundaryExt4Stream struct {
@@ -25,7 +25,7 @@ func (boundaryExt4Stream) Close() error { return nil }
 
 func TestReadBoundaryExt4FullTerminal(t *testing.T) {
 	cause := io.EOF
-	base := vhost.NewStreamReader(context.Background(), boundaryExt4Stream{cause: readerr.Mark(cause, false)}, 4096)
+	base := diffstore.NewStreamReader(context.Background(), boundaryExt4Stream{cause: readerr.Mark(cause, false)}, 4096)
 	err := validateRestoreExt4Reader(context.Background(), base)
 	if !readretry.IsTerminal(err) || !readerr.IsPermanent(err) || !errors.Is(err, cause) {
 		t.Fatalf("restore ext4 accepted/lost terminal: %v", err)
@@ -33,7 +33,7 @@ func TestReadBoundaryExt4FullTerminal(t *testing.T) {
 }
 
 func TestExt4FullOrdinaryEOFRemainsValid(t *testing.T) {
-	base := vhost.NewStreamReader(context.Background(), boundaryExt4Stream{cause: io.EOF}, 4096)
+	base := diffstore.NewStreamReader(context.Background(), boundaryExt4Stream{cause: io.EOF}, 4096)
 	if err := validateRestoreExt4Reader(context.Background(), base); err != nil {
 		t.Fatal(err)
 	}

@@ -17,10 +17,10 @@ import (
 
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/ctl"
+	"github.com/kuasar-sandbox/sandboxer/pkg/diffstore"
 	"github.com/kuasar-sandbox/sandboxer/pkg/proto"
 	"github.com/kuasar-sandbox/sandboxer/pkg/uffd"
 	"github.com/kuasar-sandbox/sandboxer/pkg/usage"
-	"github.com/kuasar-sandbox/sandboxer/pkg/vhost"
 	"golang.org/x/sys/unix"
 )
 
@@ -88,7 +88,7 @@ func TestUsagePostSpawnFailure(t *testing.T) {
 					}
 				}
 			}
-			cow, err := vhost.OpenBlockCOW(filepath.Join(t.TempDir(), "disk"), nil, vhost.DiffInit{CreateSize: 4096})
+			cow, err := diffstore.OpenDisk(filepath.Join(t.TempDir(), "disk"), nil, diffstore.DiffInit{CreateSize: 4096})
 			if err != nil {
 				t.Fatal(err)
 			}

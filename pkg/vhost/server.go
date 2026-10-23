@@ -12,6 +12,7 @@ import (
 	"syscall"
 
 	"github.com/kuasar-sandbox/sandboxer/internal/readretry"
+	"github.com/kuasar-sandbox/sandboxer/pkg/diffstore"
 )
 
 // Backend is the per-device abstraction. blk0 (read-only base image)
@@ -46,7 +47,7 @@ func (b *ReadOnlyBackend) Size() int64                        { return b.R.Size(
 func (b *ReadOnlyBackend) ReadOnly() bool                     { return true }
 
 // CowBackend wraps a BlockCOW.
-type CowBackend struct{ C *BlockCOW }
+type CowBackend struct{ C *diffstore.Disk }
 
 func (b *CowBackend) ReadAt(buf []byte, offset int64) (int, error)  { return b.C.ReadAt(buf, offset) }
 func (b *CowBackend) WriteAt(buf []byte, offset int64) (int, error) { return b.C.WriteAt(buf, offset) }
@@ -177,10 +178,10 @@ func (b *ReadOnlyBackend) readAt(ctx context.Context, buf []byte, off int64) (in
 	return readBlock(ctx, b.R, buf, off)
 }
 func (b *CowBackend) readAt(ctx context.Context, buf []byte, off int64) (int, error) {
-	return b.C.readAt(ctx, buf, off)
+	return b.C.ReadAtContext(ctx, buf, off)
 }
 func (b *CowBackend) writeAt(ctx context.Context, buf []byte, off int64) (int, error) {
-	return b.C.writeAt(ctx, buf, off)
+	return b.C.WriteAtContext(ctx, buf, off)
 }
 func (s *Server) readAt(ctx context.Context, buf []byte, off int64) (int, error) {
 	return readBackendAt(ctx, s.backend, buf, off)

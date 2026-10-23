@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/kuasar-sandbox/sandboxer/pkg/diffstore"
 	"io"
 	"log"
 	"net"
@@ -191,11 +192,11 @@ type VMParams struct {
 // snapshot data comes from Cow.SnapshotView.
 type DiskBackend struct {
 	Overlay   bool
-	Reader    vhost.BlockReader // overlay only (ro base); nil in single-disk
-	Cow       *vhost.BlockCOW   // the writable ext4 (always present)
-	BasePath  string            // overlay: ro base stats path
-	DiffPath  string            // the Cow's diff file (stats/diagnostics/cleanup path)
-	OwnedDiff bool              // diff is auto-created (ours) → eligible for zero-copy move on destroy-snapshot
+	Reader    diffstore.BlockReader // overlay only (ro base); nil in single-disk
+	Cow       *diffstore.Disk       // the writable ext4 (always present)
+	BasePath  string                // overlay: ro base stats path
+	DiffPath  string                // the Cow's diff file (stats/diagnostics/cleanup path)
+	OwnedDiff bool                  // diff is auto-created (ours) → eligible for zero-copy move on destroy-snapshot
 }
 
 // servedDevice is one expanded vhost device (a DiskBackend yields 1 or 2),

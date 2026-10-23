@@ -23,7 +23,7 @@ def main():
     os.chdir(repo)
     env = os.environ.copy()
     env['TMPDIR'] = str(args.tmpdir)
-    sources = sorted(list((repo / 'pkg/vhost').glob('*.go')) + list((repo / 'internal/diffstore').glob('*.go'))) + [repo / 'go.mod', repo / 'go.sum']
+    sources = sorted(list((repo / 'pkg/diffstore').rglob('*.go'))) + [repo / 'go.mod', repo / 'go.sum']
     metadata = {'started_unix': time.time(), 'template_payload_bytes': 64 << 20, 'rounds': 3,
                 'source_sha256': {str(path.relative_to(repo)): hashlib.sha256(path.read_bytes()).hexdigest() for path in sources},
                 'go_version': subprocess.check_output(['go', 'version'], text=True),
@@ -34,7 +34,7 @@ def main():
     modes = ['raw', 'v1', 'v2', 'v2-xts']
     with tempfile.TemporaryDirectory(prefix='template-perf-', dir=args.tmpdir) as temporary:
         binary = str(Path(temporary) / 'vhost.test')
-        subprocess.run(['go', 'test', '-c', '-o', binary, './pkg/vhost'], env=env, check=True)
+        subprocess.run(['go', 'test', '-c', '-o', binary, './pkg/diffstore'], env=env, check=True)
         for round in range(1, 4):
             order = modes if round == 1 else list(reversed(modes)) if round == 2 else modes[1:] + modes[:1]
             for mode in order:

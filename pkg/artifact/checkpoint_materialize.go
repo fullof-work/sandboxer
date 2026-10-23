@@ -12,8 +12,8 @@ import (
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	manifestbundle "github.com/kuasar-sandbox/accelerator/pkg/manifest/bundle"
-	"github.com/kuasar-sandbox/sandboxer/internal/diffstore"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
+	"github.com/kuasar-sandbox/sandboxer/pkg/diffstore"
 	"github.com/kuasar-sandbox/sandboxer/pkg/sandboxfile"
 	"github.com/kuasar-sandbox/sandboxer/pkg/snapshot"
 )

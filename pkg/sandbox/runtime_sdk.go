@@ -22,11 +22,11 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/ingest"
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
-	"github.com/kuasar-sandbox/sandboxer/internal/diffstore"
 	"github.com/kuasar-sandbox/sandboxer/internal/runidentity"
 	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/ctl"
+	"github.com/kuasar-sandbox/sandboxer/pkg/diffstore"
 	"github.com/kuasar-sandbox/sandboxer/pkg/guestlink"
 	"github.com/kuasar-sandbox/sandboxer/pkg/proto"
 	"github.com/kuasar-sandbox/sandboxer/pkg/resctl"
@@ -134,9 +134,9 @@ func (s runtimeState) String() string {
 }
 
 type runtimeOwnedDisk struct {
-	reader    vhost.BlockReader
-	base      vhost.BlockReader
-	cow       *vhost.BlockCOW
+	reader    diffstore.BlockReader
+	base      diffstore.BlockReader
+	cow       *diffstore.Disk
 	diffPath  string
 	ownedDiff bool
 }
@@ -174,7 +174,7 @@ type Runtime struct {
 	hostProjection                     config.PortableProjection
 	legacyUnknownKernel                bool // only the validated legacy portable Run adapter
 	disks                              []runtimeOwnedDisk
-	cache                              *vhost.COWCache
+	cache                              *diffstore.Cache
 	storage                            *artifact.ProcessStorage
 	ownStorage                         bool
 	exitDone                           chan struct{}
@@ -725,7 +725,7 @@ func (r *Runtime) Launch(ctx context.Context, spec LaunchSpec) error {
 	if err != nil {
 		return fail(err)
 	}
-	cache, err := vhost.NewCOWCache(cacheSize, dirtySize)
+	cache, err := diffstore.NewCache(cacheSize, dirtySize)
 	if err != nil {
 		return fail(err)
 	}
@@ -743,7 +743,7 @@ func (r *Runtime) Launch(ctx context.Context, spec LaunchSpec) error {
 	var imageCfg *ImageConfig
 	var logical []DiskBackend
 	prepare := func(root *config.RootConfig, index int, isRoot bool) (_ DiskBackend, retErr error) {
-		var base, ro vhost.BlockReader
+		var base, ro diffstore.BlockReader
 		defer func() {
 			if retErr != nil {
 				if base != nil {
@@ -811,18 +811,18 @@ func (r *Runtime) Launch(ctx context.Context, spec LaunchSpec) error {
 		if err != nil {
 			return DiskBackend{}, err
 		}
-		opts := []vhost.BlockCOWOption{vhost.WithCOWCache(cache)}
+		opts := []diffstore.DiskOption{diffstore.WithCache(cache)}
 		if r.spec.EnableCheckpoint {
 			binding := r.spec.checkpointPlan.Disks[index]
-			opts = append(opts, vhost.WithCheckpoint(binding.DiffID, binding.BaseID))
+			opts = append(opts, diffstore.WithCheckpoint(binding.DiffID, binding.BaseID))
 		}
 		if owned {
-			opts = append(opts, vhost.WithDiscardOnClose())
+			opts = append(opts, diffstore.WithDiscardOnClose())
 		}
 		if launchCodec(spec) != nil {
-			opts = append(opts, vhost.WithDiffEncryption(diffKey, launchRequired(spec)))
+			opts = append(opts, diffstore.WithDiffEncryption(diffKey, launchRequired(spec)))
 		}
-		cow, err := vhost.OpenBlockCOW(diffPath, base, init, opts...)
+		cow, err := diffstore.OpenDisk(diffPath, base, init, opts...)
 		if err != nil {
 			return DiskBackend{}, err
 		}
@@ -1143,7 +1143,7 @@ func deriveRuntimeSpec(ctx context.Context, cfg *config.SandboxConfig, launch La
 		return RuntimeSpec{}, err
 	}
 	var shapes []RuntimeDiskSpec
-	var diffOpts []vhost.BlockCOWOption
+	var diffOpts []diffstore.DiskOption
 	if launchCodec(launch) != nil {
 		keyFn := launchKey(launch)
 		if keyFn == nil {
@@ -1153,7 +1153,7 @@ func deriveRuntimeSpec(ctx context.Context, cfg *config.SandboxConfig, launch La
 		if e != nil {
 			return RuntimeSpec{}, e
 		}
-		diffOpts = append(diffOpts, vhost.WithDiffEncryption(key, launchRequired(launch)))
+		diffOpts = append(diffOpts, diffstore.WithDiffEncryption(key, launchRequired(launch)))
 		clear(key[:])
 	}
 	baseRoot, sandboxID, pathID := "", "", ""
@@ -1179,7 +1179,7 @@ func deriveRuntimeSpec(ctx context.Context, cfg *config.SandboxConfig, launch La
 				return 0, fmt.Errorf("invalid diff URI %q", diffURI)
 			}
 			if st, e := os.Stat(p); e == nil && st.Size() > 0 {
-				return vhost.DiffSourceCapacity(p, false, diffOpts...)
+				return diffstore.DiffSourceCapacity(p, false, diffOpts...)
 			}
 		}
 		if template != "" {
@@ -1187,7 +1187,7 @@ func deriveRuntimeSpec(ctx context.Context, cfg *config.SandboxConfig, launch La
 			if !ok || scheme != "file" {
 				return 0, fmt.Errorf("invalid diff template %q", template)
 			}
-			return vhost.DiffSourceCapacity(p, true, diffOpts...)
+			return diffstore.DiffSourceCapacity(p, true, diffOpts...)
 		}
 		if baseSize > 0 {
 			return baseSize, nil

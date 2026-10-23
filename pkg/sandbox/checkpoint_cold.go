@@ -7,9 +7,9 @@ import (
 	"path/filepath"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
-	"github.com/kuasar-sandbox/sandboxer/internal/diffstore"
 	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
+	"github.com/kuasar-sandbox/sandboxer/pkg/diffstore"
 	"github.com/kuasar-sandbox/sandboxer/pkg/sandboxfile"
 )
 

@@ -49,7 +49,8 @@ Snapshot reuse is represented by explicit parent and child references. Multiple 
 | `pkg/sandbox`, `pkg/restore`, `pkg/snapshot` | Lifecycle, restore, and snapshot orchestration |
 | `pkg/artifact` | Typed publication to a Manifest store or a named-location Bundle |
 | `pkg/uffd`, `pkg/memory` | On-demand memory loading and memfd ownership |
-| `pkg/vhost` | vhost-user-blk backend and copy-on-write data path |
+| `pkg/vhost` | vhost-user-blk transport, queues and guest memory |
+| `pkg/diffstore` | [Writable disks, shared cache and single-layer/checkpoint storage](docs/diffstore.md) |
 | `pkg/guestlink`, `pkg/mux`, `pkg/proto`, `pkg/fwd`, `pkg/stdio` | Host/guest control, multiplexing, and forwarding |
 | `pkg/config`, `pkg/resctl`, `pkg/chapi`, `pkg/tapfd` | Runtime configuration, resource execution, Cloud Hypervisor API, and TAP handoff |
 

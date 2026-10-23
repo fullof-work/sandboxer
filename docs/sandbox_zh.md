@@ -655,14 +655,14 @@ SDK 使用同一契约：`RuntimeSpec.EnableCheckpoint`、`RunOptions.EnableChec
 `ProcessStorage.ListDiffCheckpoints/DeleteDiffCheckpoint`。在
 `Publisher.PublishWithOptions` 与 `Publisher.Close` 均成功后，可调用
 `ProcessStorage.DeletePublishedDiffCheckpoints(ctx, result)`，独立处理其错误，最后
-关闭 storage。离线元数据管理及固定版本发布都无需打开 BlockCOW。
+关闭 storage。离线元数据管理及固定版本发布都无需打开 Disk。
 
 嵌入调用方可在 `LaunchSpec` 中提供不透明的 `ProcessStorage`；Checkpoint 物化会
 保留它的 manifest fetcher 与本地加密策略。`NewProcessStorageWithLocalAccess`
 可以借用 fetcher，`Borrow` 保留完整存储访问能力。关闭借用对象不会关闭原始
 客户端；所有借用方结束前，资源 owner 必须保持打开。
 
-块层的 `BlockCOW.Checkpoint(ctx, id)`、`ListCheckpoints(ctx)`、
+块层的 `Disk.Checkpoint(ctx, id)`、`ListCheckpoints(ctx)`、
 `DeleteCheckpoint(ctx, id)` 和 `Export(ctx, id)` 使用 `vhost.CheckpointID`。
 命名 `Export` 返回持有 reader pin 的 sparse source 和 closer，用完后必须关闭。
 `Export(ctx, vhost.ActiveDiff)` 则要求调用者保持活动磁盘静止。raw/v1 后端的
@@ -871,7 +871,7 @@ headroom 和 VMM overhead：`sandbox-ctl` 不在 VMM cgroup 中，无需改资�
 策略；新恢复实例使用本次 host 配置。Portable C0/E/S 不包含缓存策略、页、队列或 LRU 状态。
 严格 restore 校验、配置合并与 host projection 都保持此边界。
 
-Go 调用者可通过 `WithCOWCache` 向多个 `OpenBlockCOW` 传入同一 `COWCache`。先关闭 COW，
+Go 调用者可通过 `diffstore.WithCache` 向多个 `diffstore.OpenDisk` 传入同一 `diffstore.Cache`。先关闭 COW，
 再关闭共享缓存。不传该 option 时，独立 COW 持有有限默认缓存并自行关闭。
 
 <a id="portable-config"></a>
@@ -1123,7 +1123,7 @@ type Root struct {
 
 `Payload` 是保留 sparse `RunAt`/`ReadAt` 的 section view. Shared close owner保证 FullStream/Payload/Root 任一 close 最终只释放 carrier 一次. Vhost 只能看到普通 Payload，不能看到 ZIP tail。Checkpoint root 另外提供已解析的 `Checkpoint` 元数据；通用 payload 读取会拒绝此布局，要求先显式物化版本。
 
-Live BlockCOW SnapshotView 是 upper-only sparse delta,ext4 superblock offset 可以是 Hole,所以不能要求每个 live payload独立通过 ext4 magic. Reader 校验 logical size、graph/self 关系和最终 composition. Direct EROFS payload则严格校验 EROFS logical size/magic.
+Live Disk SnapshotView 是 upper-only sparse delta,ext4 superblock offset 可以是 Hole,所以不能要求每个 live payload独立通过 ext4 magic. Reader 校验 logical size、graph/self 关系和最终 composition. Direct EROFS payload则严格校验 EROFS logical size/magic.
 
 本地磁盘 Checkpoint E 没有根盘 payload，ZIP 恰好包含 `checkpoint.json` 和
 `sandbox.runtime.cfg`。前者是 canonical JSON，包含 `version: 1`、`checkpoint_id`、
@@ -1662,7 +1662,7 @@ root carrier物化为`.image`;只有需要作为独立dependency保存的root/da
 对本地磁盘 Checkpoint E，keep plan 还记录它精确引用的 DIFF 版本。只有当前 E
 贡献磁盘版本：为内存保留历史 S 不会顺带保留其旧磁盘 Checkpoint。清理先取得目录
 owner，验证完整保留集，再通过 metadata backend 分批删除无用版本、retire 不再
-需要的 DIFF。已有 read pin 延后物理回收。此过程不打开活动 BlockCOW，也不解密
+需要的 DIFF。已有 read pin 延后物理回收。此过程不打开活动 Disk，也不解密
 guest 页；保留集或目录身份检查失败时不会开始修改。
 
 `merge_ref=false` 独立记录本轮驻留工作集。已有 `S1 -> S0` 时，下一次捕获先流式生成新的
@@ -1760,7 +1760,7 @@ T12 destroy, or --resume full recovery
 
 Export固定不执行 drop_caches,不调用 `/vm.snapshot`,不读取 CH snapshot files或 memfd. Snapshot只读取一次 disks,不会先为 E捕获一次再走旧 disk path第二次.
 
-BlockCOW SnapshotView只在 backend quiesced时稳定. V1在整个 sink read窗口保持 VM paused;不能恢复 VM后继续读取 view.
+Disk SnapshotView只在 backend quiesced时稳定. V1在整个 sink read窗口保持 VM paused;不能恢复 VM后继续读取 view.
 
 Failure semantics:
 
@@ -1938,7 +1938,7 @@ role-specific payload 与 sparse envelope，使用 `@digest`/`@hmac` identity；
 
 因此named location只依赖`mkdir`、exclusive create、write、read、stat/fstat/lstat、权限设置、seek/pread、close，以及删除本进程拥有的不完整file. 它不依赖rename/renameat2、symlink、hardlink、reflink、sparse-file preservation、advisory lock或lock file,也不执行显式file/directory sync;publication的success contract由`O_EXCL`写入、`Close()`检查、最终路径reopen/full verification与路径身份检查定义,物理写回由文件系统或底层存储实现定义.
 
-Active encrypted `.overlay.diff` 保持KDXTS格式. Export只读取decrypt后的BlockCOW SnapshotView并创建新的immutable logical artifact,绝不把ZIP追加到active diff.
+Active encrypted `.overlay.diff` 保持KDXTS格式. Export只读取decrypt后的Disk SnapshotView并创建新的immutable logical artifact,绝不把ZIP追加到active diff.
 
 <a id="manifest-upload"></a>
 
@@ -2219,7 +2219,7 @@ Vhost backend接收`fetch.Stream` Payload section,不是FullStream. 任何 `.san
 
 ### 11.2 Layered reads
 
-Read 顺序为 active diff -> captured top -> `base_from_refs` -> root image（适用时）。Hole fall through，Zero/Data stop traversal。同一 writable block device 中组合的 immutable layers 的 logical size 必须一致。EROFS + ext4 拓扑中，read-only EROFS base 是独立 vhost device，不是 writable ext4 BlockCOW device 最后一层 fall-through。源码见 [disks.go](../pkg/sandbox/disks.go) 与 [serveandwait.go](../pkg/sandbox/serveandwait.go)。
+Read 顺序为 active diff -> captured top -> `base_from_refs` -> root image（适用时）。Hole fall through，Zero/Data stop traversal。同一 writable block device 中组合的 immutable layers 的 logical size 必须一致。EROFS + ext4 拓扑中，read-only EROFS base 是独立 vhost device，不是 writable ext4 Disk device 最后一层 fall-through。源码见 [disks.go](../pkg/sandbox/disks.go) 与 [serveandwait.go](../pkg/sandbox/serveandwait.go)。
 
 `StreamReader` 同步重试完整读取. 运行队列 context 仅在本次调用替代准备阶段 context, 因此旧 master session 停止时先取消挂起读取, 再 join worker 并替换 memory table. COW 适配层将该 context 传入 base materialization, 同时保留块锁、dirty bitmap 和部分写算法. 不重放整个 `WriteAt`、`FLUSH`、Store `Put` 或快照操作.
 
@@ -2237,7 +2237,9 @@ CH pause 且前台 quiesce 后，`SnapshotView` 复制逻辑 bitmap 并提供 up
 
 <a id="cow-backend"></a>
 
-### 11.4 BlockCOW 状态与 I/O
+### 11.4 Disk 状态与 I/O
+
+统一存储入口为 [`pkg/diffstore`](../pkg/diffstore)，详见[抽象层次、所有权与迁移说明](diffstore.md)。`pkg/vhost` 仅负责传输协议。
 
 活动可写 diff（包括 tmpfs 上的文件）通过同一定位 I/O API 请求 O_DIRECT。
 运行时策略不识别底层文件系统类型。
@@ -2249,7 +2251,7 @@ tmpfs 与磁盘的情况。这实现了 [issue #230](https://github.com/kuasar-s
 
 #### 11.4.1 逻辑状态与记账
 
-分层为 `BlockCOW -> 明文缓存 -> diffFile 编码 -> 自有 I/O 工作区 -> 活动文件`。
+分层为 `Disk -> 明文缓存 -> diffBackend -> 单层或版本化存储`。
 页大小为 4096 字节。Base 读取不会填充缓存或物化 upper。缓存按活动文件与块号索引。
 
 | 状态或转换 | 总占用 | 脏占用 |
@@ -2362,7 +2364,7 @@ private heap/fork 风险。任意调用者切片和子页读取经过这些 buff
 
 ### 11.4.5 多版本 DIFF v2 存储与恢复
 
-可选后端位于 [`internal/diffstore`](../internal/diffstore)。每个逻辑 4 KiB 块经
+可选后端位于 [`pkg/diffstore/internal/versioned`](../pkg/diffstore/internal/versioned)。每个逻辑 4 KiB 块经
 B+ 树映射到物理槽。4 KiB 索引页包含 16 字节页头和最多 255 个 16 字节项；
 叶项保存逻辑块到数据槽的映射，内部项保存子树最大逻辑 key 及对应子索引槽。
 项中的整数使用 little-endian；数据槽与索引槽独立。header 绑定 DiffID、不可变 BaseID、
@@ -2580,7 +2582,7 @@ E2E 通过。
 使用现有 `blk_cow_workingset_bench_test.go` working-set driver，并为每个 revision 提供匹配 adapter。没有 sandbox cache 的 buffered baseline 使用 no-op cache drain/close，不提供 cache statistics；请求完成不代表介质持久化。分别记录候选实现的准入和最终 Drain：
 
 ```bash
-go test -tags no_rocksdb ./pkg/vhost -run '^$' \
+go test -tags no_rocksdb ./pkg/diffstore -run '^$' \
   -bench '^BenchmarkCOWWorkingSet$' -benchtime=1x -count=1 -timeout 15m
 ```
 
@@ -2591,7 +2593,7 @@ go test -tags no_rocksdb ./pkg/vhost -run '^$' \
 现有 `cow_direct_workingset_bench_test.go` 提供无缓存的 direct-I/O 对照，使用相同 active-I/O 和 XTS 规则，不是可选择的生产模式：
 
 ```bash
-go test -tags no_rocksdb ./pkg/vhost -run '^$' \
+go test -tags no_rocksdb ./pkg/diffstore -run '^$' \
   -bench '^BenchmarkCOWDirectWorkingSet$' -benchtime=1x -count=1 -timeout 15m
 ```
 
@@ -2747,14 +2749,14 @@ scratch；Windows 挂载目录、仅 tmpfs 测试或跳过特权用例不能证�
 
 ```bash
 # 准备好的 Go 源码环境；TMPDIR 应位于待测文件系统：
-CGO_ENABLED=0 go test -count=1 ./internal/diffstore ./pkg/vhost ./pkg/artifact \
+CGO_ENABLED=0 go test -count=1 ./pkg/diffstore/... ./pkg/vhost ./pkg/artifact \
   ./pkg/config ./pkg/sandboxfile ./pkg/snapshot ./pkg/restore ./pkg/sandbox ./pkg/ctl ./cmd/sandbox-ctl
-CGO_ENABLED=1 go test -race -count=1 ./internal/diffstore ./pkg/vhost ./pkg/artifact ./pkg/restore
+CGO_ENABLED=1 go test -race -count=1 ./pkg/diffstore/... ./pkg/vhost ./pkg/artifact ./pkg/restore
 # Workbench system mode，具备 mount/namespace 权限的完整源码 gate：
 bash scripts/ci-source-checks.sh
 
 # 独占、可丢弃的 64 MiB ext4 文件系统；不要使用共享开发挂载点：
-DIFFSTORE_FULL_FS=/path/to/owned/finite-ext4 go test ./internal/diffstore \
+DIFFSTORE_FULL_FS=/path/to/owned/finite-ext4 go test ./pkg/diffstore/internal/versioned \
   -run '^TestRealFilesystemFullRecovery$' -count=1 -v
 
 # root shell；PREPARED 包含准确构建的产物与平台 E2E runner：
@@ -2762,7 +2764,7 @@ python3 "$PREPARED/test/e2e/e2e" run --workdir "$PREPARED" \
   --suite snapshot --include snapshot.checkpoint.sh
 
 # 实际 payload 历史；默认规模为 0、1、10 GiB：
-go test -c -o /path/to/compiled-vhost.test ./pkg/vhost
+go test -c -o /path/to/compiled-vhost.test ./pkg/diffstore
 go run ./test/perf/diffstore --directory /path/to/new-owned-directory \
   --sizes-gib 0,1,10 --rounds 5 \
   --vhost-test-binary /path/to/compiled-vhost.test
@@ -2779,21 +2781,21 @@ python3 test/perf/checkpoint_template.py --tmpdir /path/to/native-ext4/scratch \
 # （逻辑容量 30 GiB，仅映射 240 页）。
 CHECKPOINT_PRESENCE_DIR=/path/to/owned/native-ext4/fixtures \
 CHECKPOINT_PRESENCE_CASE=dense-plain CHECKPOINT_PRESENCE_PHASE=seed \
-  go test ./pkg/vhost -run '^TestCheckpointPresencePhases$' -count=1 -v
+  go test ./pkg/diffstore -run '^TestCheckpointPresencePhases$' -count=1 -v
 CHECKPOINT_PRESENCE_DIR=/path/to/owned/native-ext4/fixtures \
 CHECKPOINT_PRESENCE_CASE=dense-plain CHECKPOINT_PRESENCE_PHASE=measure \
 CHECKPOINT_PRESENCE_LABEL=candidate \
-  go test ./pkg/vhost -run '^TestCheckpointPresencePhases$' -count=1 -v
+  go test ./pkg/diffstore -run '^TestCheckpointPresencePhases$' -count=1 -v
 
 # 活动密集读取：两版二进制共用 fixture，交替执行至少三轮。
 # CASE：plain-shared、plain-private、xts-shared、xts-private。
 CHECKPOINT_READ_DIR=/path/to/owned/native-ext4/dense-fixtures \
 CHECKPOINT_READ_CASE=plain-shared CHECKPOINT_READ_PHASE=seed \
-  go test ./pkg/vhost -run '^TestCheckpointDenseReadPhases$' -count=1 -v
+  go test ./pkg/diffstore -run '^TestCheckpointDenseReadPhases$' -count=1 -v
 CHECKPOINT_READ_DIR=/path/to/owned/native-ext4/dense-fixtures \
 CHECKPOINT_READ_CASE=plain-shared CHECKPOINT_READ_PHASE=measure \
 CHECKPOINT_READ_LABEL=candidate \
-  go test ./pkg/vhost -run '^TestCheckpointDenseReadPhases$' -count=1 -v
+  go test ./pkg/diffstore -run '^TestCheckpointDenseReadPhases$' -count=1 -v
 ```
 
 源码测试覆盖独立进程 pin 和 writer 交接、杀死 owner 后 redo 重开、真实短写、空间
@@ -2834,7 +2836,7 @@ v1 分别比较，并区分无版本、共享首写、已私有覆盖。这些�
 RSS 仍包含这部分准备阶段。
 
 规模 driver 在进入下一档前删除上一档历史，分别报告 checkpoint 注册、control 重开
-和 presence 重建；其中显式全扫描的耗时会随映射页数增长。v2 BlockCOW 重开现在将
+和 presence 重建；其中显式全扫描的耗时会随映射页数增长。v2 Disk 重开现在将
 这部分工作推迟到访问对应范围或后续普通活动层导出时执行。vhost helper
 在回写前固定恰好 32 个脏页（128 KiB），分别记录模板 readiness、Drain、最终
 materialization、元数据登记、捕获总耗时和重开。不使用 helper 时，登记样本的待写

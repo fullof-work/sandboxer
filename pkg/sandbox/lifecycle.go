@@ -24,13 +24,13 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/readerr"
 	"github.com/kuasar-sandbox/accelerator/pkg/store"
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
-	"github.com/kuasar-sandbox/sandboxer/internal/diffstore"
 	"github.com/kuasar-sandbox/sandboxer/internal/readretry"
 	"github.com/kuasar-sandbox/sandboxer/internal/runtimebundle"
 	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
 	"github.com/kuasar-sandbox/sandboxer/pkg/chapi"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/ctl"
+	"github.com/kuasar-sandbox/sandboxer/pkg/diffstore"
 	"github.com/kuasar-sandbox/sandboxer/pkg/guestlink"
 	"github.com/kuasar-sandbox/sandboxer/pkg/memory"
 	"github.com/kuasar-sandbox/sandboxer/pkg/proto"
@@ -624,7 +624,7 @@ func preflightWritableExt4(
 		}
 	}
 
-	var base vhost.BlockReader
+	var base diffstore.BlockReader
 	if len(baseRefs) != 0 {
 		reader, _, err := OpenLayeredBlockReaderWithOpener(ctx, baseRefs, fetcher, locations, codec, required, opener)
 		if err != nil {
@@ -643,13 +643,13 @@ func preflightWritableExt4(
 	if !ok || scheme != "file" {
 		return fmt.Errorf("preflight %s writable diff invalid URI: %s", field, diffURI)
 	}
-	var cowOptions []vhost.BlockCOWOption
+	var cowOptions []diffstore.DiskOption
 	if len(checkpointBindings) > 0 && checkpointBindings[0] != nil {
 		b := checkpointBindings[0]
-		cowOptions = append(cowOptions, vhost.WithCheckpoint(b.DiffID, b.BaseID))
+		cowOptions = append(cowOptions, diffstore.WithCheckpoint(b.DiffID, b.BaseID))
 	}
 	if codec != nil {
-		cowOptions = append(cowOptions, vhost.WithDiffEncryption(diffCustomerKey, required))
+		cowOptions = append(cowOptions, diffstore.WithDiffEncryption(diffCustomerKey, required))
 	}
 	info, statErr := os.Stat(diffPath)
 	switch {
@@ -657,7 +657,7 @@ func preflightWritableExt4(
 		if info.Size() == 0 {
 			return fmt.Errorf("preflight %s writable diff %s is empty; provide a formatted ext4 diff", field, diffPath)
 		}
-		if err := vhost.ValidateExistingDiffExt4(ctx, diffPath, base, cowOptions...); err != nil {
+		if err := diffstore.ValidateExistingDiffExt4(ctx, diffPath, base, cowOptions...); err != nil {
 			return fmt.Errorf("preflight %s writable diff: %w", field, err)
 		}
 		return nil
@@ -668,7 +668,7 @@ func preflightWritableExt4(
 		if !templateOK || templateScheme != "file" {
 			return fmt.Errorf("preflight %s diff_template invalid URI: %s", field, templateURI)
 		}
-		if err := vhost.ValidateDiffTemplateExt4(ctx, templatePath, base, cowOptions...); err != nil {
+		if err := diffstore.ValidateDiffTemplateExt4(ctx, templatePath, base, cowOptions...); err != nil {
 			return fmt.Errorf("preflight %s diff_template: %w", field, err)
 		}
 		return nil
@@ -682,7 +682,7 @@ func preflightWritableExt4(
 	}
 }
 
-func validateExt4BlockReader(ctx context.Context, reader vhost.BlockReader) error {
+func validateExt4BlockReader(ctx context.Context, reader diffstore.BlockReader) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}

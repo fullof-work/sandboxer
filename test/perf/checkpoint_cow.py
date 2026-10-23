@@ -60,7 +60,7 @@ def main():
         parser.error('workloads must be unique exact names separated by |')
     # The official workbench mounts sources but not the worktree git directory.
     # Hash exact Go sources as reproducible revision evidence even in that case.
-    sources = sorted(list((repo / 'pkg' / 'vhost').glob('*.go')) + list((repo / 'internal' / 'diffstore').glob('*.go')) + [repo / 'go.mod', repo / 'go.sum'])
+    sources = sorted(list((repo / 'pkg' / 'diffstore').rglob('*.go')) + [repo / 'go.mod', repo / 'go.sum'])
     metadata = {
         'source_sha256': {str(path.relative_to(repo)): hashlib.sha256(path.read_bytes()).hexdigest() for path in sources},
         'order': 'round 1 supplied order, round 2 reverse, round 3 rotated; each workload interleaves all selected modes',
@@ -80,7 +80,7 @@ def main():
     (args.output / 'environment.json').write_text(json.dumps(metadata, indent=2) + '\n')
     with tempfile.TemporaryDirectory(prefix='checkpoint-perf-', dir=args.tmpdir) as build:
         binary = str(Path(build) / 'vhost.test')
-        subprocess.run(['go', 'test', '-c', '-o', binary, './pkg/vhost'], env=env, check=True)
+        subprocess.run(['go', 'test', '-c', '-o', binary, './pkg/diffstore'], env=env, check=True)
         metrics = []
         for iteration in range(1, args.rounds + 1):
             order = list(reversed(modes)) if iteration % 2 == 0 else modes[(iteration - 1) // 2:] + modes[:(iteration - 1) // 2]
