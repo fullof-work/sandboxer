@@ -637,6 +637,26 @@ List 一次返回当前及历史 DIFF 的全部可见版本，也包括捕获中
 立即归还全部空间。
 
 ```bash
+sandbox-ctl checkpoint gc --checkpoint-dir /var/lib/sandbox/worker/checkpoint --json
+```
+
+此离线命令取得现有目录独占锁；运行中的目录返回 busy。它使用仅操作元数据的目录
+维护，不依赖制品下载、数据解密或密钥。不接受 Checkpoint ID 或删除过滤条件，不改变
+保留集合。按 DiffID 输出 `diff_id`、`state` 和已提交的 `freed_slots`，失败时附加
+`error`。命令持续处理 `more`，直到每份文件为 `complete` 或 `blocked_by_readers`；
+后者是退出码 0 的正常本轮结果，明确表示仍有待回收内容，不保证空间已经释放。
+Retire 文件输出 `skipped_retired` 并保持原样。忙、取消以及真实 I/O/元数据错误返回
+非零；单个文件失败仍继续输出其他文件结果。纯文字输出明确解释读取者阻挡状态。
+
+运行期维护在登记全部活动 DiffID 后独立启动：普通启动、池实例实际 Launch 和恢复
+都借用已取得的目标目录 owner；尚未 Launch 的池实例不接管业务目录。恢复源导出
+pin 与目标 owner 是不同资源。历史 GC 和在线 List/Delete 共用有界、串行访问的
+元数据句柄，并预留管理容量。历史错误按 DiffID 记录，不终止无关活动沙箱。退出和
+初始化失败都先停止新操作及调度，等待已进入操作与当前批次，关闭历史句柄、活动
+磁盘，最后释放 owner。已删除版本描述、分组管理页、固定管理区和活动根继续保留；
+GC 不截短文件，也不复用已使用的 Checkpoint ID。
+
+```bash
 cd /var/lib/sandbox/worker/checkpoint
 sandbox-ctl publish --to-ref-location archive=file:///var/lib/sandbox/published \
   --delete-checkpoint --json '<snapshotRef>'
@@ -2369,7 +2389,7 @@ B+ 树映射到物理槽。4 KiB 索引页包含 16 字节页头和最多 255 �
 叶项保存逻辑块到数据槽的映射，内部项保存子树最大逻辑 key 及对应子索引槽。
 项中的整数使用 little-endian；数据槽与索引槽独立。header 绑定 DiffID、不可变 BaseID、
 逻辑容量和加密策略；control 页保存活动根、epoch、当前捕获标记、版本链、空闲/垃圾链
-和持久 GC cursor。版本记录保存 ID、根、epoch、前驱/后继及 visible/retained 状态；
+。原 cursor 字段保留，纯 GC 扫描进度改为只保存在内存。版本记录保存 ID、根、epoch、前驱/后继及 visible/retained 状态；
 槽 descriptor 保存出生 epoch、种类和链指针。512 页有界元数据缓存不为全部版本
 建立全盘逻辑块映射。原始页和解码节点共用此预算，每个 owner/view 约 4 MiB。
 四个共享匿名 8 MiB direct-I/O 工作区将进程级对齐暂存空间固定为 32 MiB，
@@ -2428,14 +2448,15 @@ unlink 数据文件；锁 inode 保持稳定。
 独立重开已拥有的 inode。同一 DIFF 内已删除的 Checkpoint ID 不可复用。
 `Export(ActiveDiff)` 是由调用者保证静止的活动视图；命名导出则拥有不可变保留根。
 
-GC 处理持久退休链，而不是遍历所有保留树。删除版本时寻找最近的 retained 前驱：
-仅当前驱 epoch 仍可能引用某槽的出生时间时转移该槽，否则放入可回收垃圾链。批量删除
-先撤销整组选中版本，再运行 GC，避免链反复转移到同批待删版本。cursor 与链变更共同
-提交，中断后可继续。槽先打洞，再进入可复用 free list，复用前使相关缓存失效。
-单次及 owner 后台回收都有预算；pin 释放后无需新的 guest 写入也能继续推进。
-每轮 GC 对回收、版本访问、前驱探索分别限制为 64 步。跨越已撤销前驱时持久化路径
-压缩；找到真实前驱之前保留保守的 protected epoch，只会导致额外 COW。
-GCRead/GCWritten 统计归因于 GC 的已完成索引/redo 物理字节，与相应总量重叠。
+GC 与删除分开处理持久退休链。已删除版本的记录仅在 retained 前驱 epoch
+仍可能引用其出生时间时转移到该前驱，否则进入全局可回收链。有界 `More` 批次即使
+没有已提交释放量也继续推进；完整有效扫描可以返回 `BlockedByReaders`，定期重试
+使读取者释放后无需再次删除或 guest 写入即可回收。纯扫描状态只保存在内存，不写
+redo。GC 按实际文件地址排序安全候选，合并打洞但不跨管理页或有效页，并在打洞成功
+后才提交按地址升序连接的空闲批次。metadata-only Open/List/Delete 不启动 GC。
+完整批量、崩溃与调度契约由 [diffstore](diffstore.md#discard-and-reclamation) 维护。
+`GCRead/GCWritten` 与索引/redo 总字节重叠；`GCPunchCalls` 计已完成打洞调用，
+`GCFreed` 计已提交、可复用的位置。
 
 命名捕获收集本地依赖时保留原内容身份，包括作为磁盘 lower 的普通 E。必要时复制完整
 原 carrier，不将其剥成 payload 或转换哈希域；已归本目录所有的载体直接复用。
@@ -2776,6 +2797,13 @@ python3 test/perf/checkpoint_cow.py --tmpdir /path/to/native-ext4/scratch \
 python3 test/perf/checkpoint_template.py --tmpdir /path/to/native-ext4/scratch \
   --output /path/to/template-results
 
+# 基线/候选使用相同环境、payload 和保留版本集合。
+# 三个独立轮次，每轮三次写入/checkpoint/删除/GC/复用循环：
+python3 test/perf/checkpoint_cow.py --tmpdir /path/to/native-ext4/scratch \
+  --output /path/to/reclamation-results --rounds 3 --gc-cycles 3 \
+  --modes 'v2-no-version|v2-xts-no-version' \
+  --workloads 'sequential|gc-write|reclamation|discard'
+
 # 基线/候选二进制共用同一 fixture，交替执行至少三轮。
 # CASE：dense-plain/dense-xts（1 GiB payload），sparse-plain/sparse-xts
 # （逻辑容量 30 GiB，仅映射 240 页）。
@@ -2854,6 +2882,18 @@ payload 为零。捕获总耗时不含最初 open 和 guest 写入准入，也�
 - V1 `--resume` 可以在sink写完整期间保持VM paused,换取SnapshotView稳定性.
 
 ### 13.2 Performance observations
+
+reclamation 工作负载停止独立 GC worker，测量已提交的空闲位置、复用、打洞调用、
+元数据提交/写入和积压处理。删除时保留读取者，测量受阻期间的元数据写入，再释放
+读取者，不重复删除。`gc-ns/cycle` 累加 GC 调用耗时；`backlog-wall-ns/cycle`
+还包含观察已提交空闲链的开销。顺序读取和当前版本导出读取观察复用后的局部性；
+保留版本导出读取是数据未移动的控制项。文件长度与实际占用分别报告：保留的描述
+记录和管理页不回收。`gc-write` 在普通后台 GC 运行时写入并保留最近四个版本，
+报告前台尾延迟及索引/redo 写放大。Discard 固定使用 4 MiB 范围和 1 MiB 缓存；
+后端调用数可以归因于 Discard，但 `total-commits/range` 包含并发 GC 提交。
+专用 reclamation 和 Discard 用例会略过不支持的 shared/private 模式组合。
+各轮原始结果及准确的基线/候选身份保留在 PR 或 Issue；这些负载提供实测观察，
+不构成普遍加速倍数承诺。
 
 关键指标:
 

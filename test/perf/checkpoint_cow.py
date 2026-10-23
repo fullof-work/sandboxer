@@ -5,8 +5,12 @@ Run from the repository in a prepared Go environment, with --tmpdir on the
 filesystem under test. Builds once, then runs the same binary at least three
 times. Every timed throughput includes the final Drain; frontend and Checkpoint
 percentiles are separate. The default 64 MiB write/read working set exceeds the 32 MiB
-COW cache. The dedicated hot case intentionally uses only 4 MiB. v1 and all
-v2-xts variants use the same local encryption policy. Results are observations,
+COW cache. The dedicated hot case intentionally uses only 4 MiB.
+Discard uses a fixed 4 MiB range and a 1 MiB cache, with backend GC enabled;
+its total commits include concurrent GC. Reclamation stops the background
+worker, times GC calls separately from free-list observation, and reads both
+the reused current version and the unchanged retained version.
+v1 and all v2-xts variants use the same local encryption policy. Results are observations,
 not an automatic performance acceptance claim.
 """
 
@@ -34,6 +38,7 @@ def main():
     parser.add_argument('--rounds', type=int, default=3)
     parser.add_argument('--operations', type=int, default=32768)
     parser.add_argument('--working-set-mib', type=int, default=64)
+    parser.add_argument('--gc-cycles', type=int, default=3, help='write/checkpoint/delete/GC/reuse cycles for reclamation')
     parser.add_argument('--modes', default='raw|v1|v2-no-version|v2-shared|v2-private|v2-xts-no-version|v2-xts-shared|v2-xts-private')
     parser.add_argument('--workloads', default='sequential|random|partial|hot|mixed|cold-read|frequent-checkpoint')
     args = parser.parse_args()
@@ -41,6 +46,8 @@ def main():
         parser.error('working-set-mib must be between 64 and 4096')
     if args.rounds < 3 or args.operations < args.working_set_mib * 512:
         parser.error('use at least three rounds and two working-set traversals (working-set-mib * 512 operations)')
+    if args.gc_cycles < 3:
+        parser.error('gc-cycles must be at least three to observe reuse')
     args.tmpdir = args.tmpdir.resolve()
     args.output = args.output.resolve()
     args.tmpdir.mkdir(parents=True, exist_ok=True)
@@ -53,7 +60,7 @@ def main():
     modes = args.modes.split('|')
     workloads = args.workloads.split('|')
     known_modes = {'raw', 'v1', 'v2-no-version', 'v2-shared', 'v2-private', 'v2-xts-no-version', 'v2-xts-shared', 'v2-xts-private'}
-    known_workloads = {'sequential', 'random', 'partial', 'hot', 'mixed', 'cold-read', 'frequent-checkpoint'}
+    known_workloads = {'sequential', 'random', 'partial', 'hot', 'mixed', 'cold-read', 'frequent-checkpoint', 'gc-write', 'reclamation', 'discard'}
     if len(set(modes)) != len(modes) or set(modes) - known_modes:
         parser.error('modes must be unique exact names separated by |')
     if len(set(workloads)) != len(workloads) or set(workloads) - known_workloads:
@@ -67,6 +74,14 @@ def main():
         'started_unix': time.time(), 'host': platform.uname()._asdict(),
         'working_set_bytes': args.working_set_mib << 20, 'cow_cache_bytes': 32 << 20,
         'operations': args.operations, 'rounds': args.rounds,
+        'gc_cycles': args.gc_cycles,
+        'workload_parameters': {
+            'discard': {'range_bytes': 4 << 20, 'cow_cache_bytes': 1 << 20,
+                        'background_gc': True, 'commits': 'total, including concurrent GC'},
+            'reclamation': {'working_set_bytes': args.working_set_mib << 20,
+                            'background_gc': False, 'gc_time': 'sum of GC calls, excluding free-list observation',
+                            'backlog_wall_time': 'includes committed free-list observation'},
+        },
         'tmpdir': str(args.tmpdir), 'modes': args.modes, 'workloads': args.workloads,
         'go_environment': {name: env.get(name) for name in ('GOMAXPROCS', 'GOMEMLIMIT', 'GOGC', 'GOAMD64', 'GOOS', 'GOARCH')},
         'cgroups': {name: (Path('/sys/fs/cgroup') / name).read_text() for name in ('cpu.max', 'memory.max') if (Path('/sys/fs/cgroup') / name).is_file()},
@@ -81,16 +96,28 @@ def main():
     with tempfile.TemporaryDirectory(prefix='checkpoint-perf-', dir=args.tmpdir) as build:
         binary = str(Path(build) / 'vhost.test')
         subprocess.run(['go', 'test', '-c', '-o', binary, './pkg/diffstore'], env=env, check=True)
+        gc_binary = str(Path(build) / 'versioned.test')
+        if 'reclamation' in workloads:
+            subprocess.run(['go', 'test', '-c', '-o', gc_binary, './pkg/diffstore/internal/versioned'], env=env, check=True)
         metrics = []
         for iteration in range(1, args.rounds + 1):
             order = list(reversed(modes)) if iteration % 2 == 0 else modes[(iteration - 1) // 2:] + modes[:(iteration - 1) // 2]
             for workload in workloads:
                 for mode in order:
-                    if workload == 'frequent-checkpoint' and mode in ('raw', 'v1'):
+                    if workload in ('frequent-checkpoint', 'gc-write', 'reclamation') and mode in ('raw', 'v1'):
                         continue
-                    bench = '^BenchmarkCheckpointCOWWriteback$/' + re.escape(mode) + '$/' + re.escape(workload) + '$'
-                    command = [binary, '-test.run=^$', '-test.bench=' + bench,
-                               '-test.benchtime=' + str(args.operations) + 'x', '-test.timeout=60m']
+                    if workload in ('discard', 'reclamation') and mode not in ('raw', 'v1', 'v2-no-version', 'v2-xts-no-version'):
+                        continue
+                    name, executable, operations = 'BenchmarkCheckpointCOWWriteback', binary, args.operations
+                    bench = '^' + name + '$/' + re.escape(mode) + '$/' + re.escape(workload) + '$'
+                    if workload == 'reclamation':
+                        name, executable, operations = 'BenchmarkCheckpointReclamation', gc_binary, args.gc_cycles
+                        bench = '^' + name + '$/' + ('xts' if '-xts-' in mode else 'plain') + '$'
+                    elif workload == 'discard':
+                        name, operations = 'BenchmarkCheckpointDiscard', args.gc_cycles
+                        bench = '^' + name + '$/' + re.escape(mode) + '$'
+                    command = [executable, '-test.run=^$', '-test.bench=' + bench,
+                               '-test.benchtime=' + str(operations) + 'x', '-test.timeout=60m']
                     stem = 'round-%02d-%s-%s' % (iteration, workload, mode)
                     log = args.output / (stem + '.log')
                     start = time.monotonic()
@@ -113,12 +140,12 @@ def main():
                         raise SystemExit('benchmark failed; raw log: ' + str(log))
                     found = 0
                     for line in log.read_text().splitlines():
-                        if not line.startswith('BenchmarkCheckpointCOWWriteback/'):
+                        if not line.startswith(name + '/'):
                             continue
                         fields = line.split()
                         if len(fields) < 4 or not fields[1].isdigit():
                             continue
-                        row = {'round': iteration, 'case': re.sub(r'-\d+$', '', fields[0]), 'operations': int(fields[1])}
+                        row = {'round': iteration, 'mode': mode, 'workload': workload, 'case': re.sub(r'-\d+$', '', fields[0]), 'operations': int(fields[1])}
                         for i in range(2, len(fields) - 1, 2):
                             row[fields[i + 1]] = float(fields[i])
                         metrics.append(row)

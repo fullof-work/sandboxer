@@ -125,6 +125,75 @@ a complete active sparse export resolves all unknown presence. Named version
 exports retain their independent index view. Errors never turn unknown presence
 into a lower-layer hole.
 
+## Discard and reclamation
+
+`Disk.Discard` withdraws complete 4 KiB pages from the active upper layer. Reads
+then fall back to the immutable lower layer; partial edge pages retain their
+contents. It does not mean Guest DISCARD, explicit zero pages or zero compression.
+Each batch covers at most 64 full pages. It takes distinct stripe locks in numeric
+order, checks all existing cache pages under one cache lock, and only then freezes
+them together. Loading or writeback makes the whole batch wait without freezing
+any part. Uncached pages require no placeholder and unrelated dirty pages need no
+drain. Backend I/O runs without the cache lock and receives a context. Cancellation
+can stop a batch before freezing; afterward it must publish the whole batch or
+enter the existing sticky failure path and wake waiters. Success publishes absent
+presence and resolves template backfill for every page, including already absent
+pages. Separate batches do not provide an all-or-nothing range transaction.
+
+`DeleteCheckpoints` only withdraws visibility and immediately releases protection
+when no reader pins the version. It never runs or waits for GC. `OpenMetadata`
+and List also do not schedule GC. Active stores have an independent worker;
+metadata-only owners explicitly schedule maintenance.
+
+`Store.GC(ctx, budget)` returns `GCResult{State, FreedSlots}`. `Complete` means no
+pending versions or globally reclaimable records remain. `More` means bounded
+work remains and must be retried even if `FreedSlots` is zero. `BlockedByReaders`
+is returned only when the global reclaimable chain is empty and a valid complete
+round found all remaining pending versions pinned. A later reader close permits
+progress without another deletion. `FreedSlots` counts only locations committed
+to the reusable free list, never scans, transfers or punch attempts.
+
+Version visits, predecessor discovery and ownership transfers have bounded work;
+global release and version work take turns using full bounded batches, including
+budget 1, avoiding two half-sized metadata commits when both are ready.
+Pure cursors and predecessor search progress live in memory, not redo. A round
+captures its tail; new Checkpoints cannot extend it indefinitely. Ordinary writes
+do not reset it, and new deletion invalidates a stale blocked conclusion. Reopen
+can repeat pure scanning while persisted ownership changes remain recoverable.
+The active worker yields between `More` batches and checks reader-blocked work
+less frequently. Allocation failure may perform a finite amount of foreground
+assistance, retrying only after committed frees; GC never recursively allocates
+through that assistance path.
+
+Only the global reclaimable chain is punched. A batch validates unique candidates
+and legal states, sorts by physical file page address, and merges physically
+adjacent ranges. Descriptor pages between each 128 record positions and all live
+pages split ranges. Punching finishes before one existing metadata/redo transaction
+removes the old chain entries and publishes free descriptors. The batch links in
+ascending address order, then joins the former free head. Failure before commit
+publishes no free slots; reopening may safely repeat a punch. No new format version,
+larger redo area, payload relocation, file truncation or global free-range index
+is introduced. Encryption and direct-I/O alignment retain their existing rules.
+
+`DirectoryMaintenance` borrows an acquired `DirectoryOwner`, validates its stable
+lock identity, and registers all active DiffIDs before enumeration. It never
+acquires a second writer for an active disk or releases the owner. Historical
+enumeration uses bounded batches; two GC handles and one transient management
+handle bound open metadata writers. List/Delete share an existing GC handle, with
+serialized requests between GC batches. Management of another historical file
+can use the reserved handle even when both GC slots are occupied. Startup and
+periodic sweeps report per-DiffID errors and continue other files. They skip
+retired files without calling Retire or unlinking them. Close stops admission and
+scheduling, joins admitted operations/current batches, and closes historical
+handles. The caller then closes active disks and finally the directory owner.
+
+Reclamation does not choose retention. Deleted Checkpoint descriptors, descriptor
+group pages and fixed management areas remain, as does the active root in a
+historical DIFF. Files need not return to their initial allocated size or length;
+used Checkpoint IDs remain unavailable for reuse. Independent Retire still owns
+whole-file withdrawal/deletion. Runtime and offline usage belongs to
+[sandbox lifecycle and CLI](sandbox.md#211-local-disk-checkpoints).
+
 ## Migration and validation
 
 | Previous entry | Current entry |

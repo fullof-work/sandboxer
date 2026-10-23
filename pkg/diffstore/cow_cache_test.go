@@ -604,6 +604,190 @@ func TestCOWCacheDiscardCannotResurrectWriteback(t *testing.T) {
 	}
 }
 
+type discardObserver struct {
+	diffBackend
+	calls  [][2]int64
+	before func(context.Context) error
+}
+
+func (d *discardObserver) punchHole(ctx context.Context, off, length int64) error {
+	d.calls = append(d.calls, [2]int64{off, length})
+	if d.before != nil {
+		if err := d.before(ctx); err != nil {
+			return err
+		}
+	}
+	return d.diffBackend.punchHole(ctx, off, length)
+}
+
+func TestCOWDiscardBoundedBatchesAcrossFormatsAndEdges(t *testing.T) {
+	for _, mode := range []string{"raw", "v1", "v2", "v2-xts"} {
+		t.Run(mode, func(t *testing.T) {
+			const blocks = 132
+			cache := testCache(t, 3, 2, cacheHooks{}) // substantially smaller than one batch
+			options := []DiskOption{}
+			if mode == "v1" || mode == "v2-xts" {
+				options = append(options, WithDiffEncryption([32]byte{9}, true))
+			}
+			if mode == "v2" || mode == "v2-xts" {
+				options = append(options, WithCheckpoint("disk", "base"))
+			}
+			base := bytes.Repeat([]byte{0x21}, blocks*cowBlockSize)
+			cow := cachedCOW(t, cache, blocks, &fakeReader{data: base}, options...)
+			for i := range blocks {
+				writePage(t, cow, i, 0x56)
+			}
+			if err := cow.Drain(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			var view ExportView
+			if mode == "v2" || mode == "v2-xts" {
+				if err := cow.Checkpoint(context.Background(), "keep"); err != nil {
+					t.Fatal(err)
+				}
+				var err error
+				view, err = cow.Export(context.Background(), "keep")
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer view.Close()
+			}
+			observer := &discardObserver{diffBackend: cow.diff}
+			cow.diff = observer
+			// Preserve edge pages 0 and 131; discard 130 complete pages in 3 calls.
+			if err := cow.Discard(17, blocks*cowBlockSize-34); err != nil {
+				t.Fatal(err)
+			}
+			if len(observer.calls) != 3 {
+				t.Fatalf("backend calls %v", observer.calls)
+			}
+			for _, call := range observer.calls {
+				if call[1] > 64*cowBlockSize || call[0]%cowBlockSize != 0 {
+					t.Fatal(call)
+				}
+			}
+			for i := range blocks {
+				value := byte(0x21)
+				if i == 0 || i == blocks-1 {
+					value = 0x56
+				}
+				checkRead(t, cow, i, bytes.Repeat([]byte{value}, cowBlockSize))
+			}
+			if view != nil && !bytes.Equal(readExport(t, view), bytes.Repeat([]byte{0x56}, blocks*cowBlockSize)) {
+				t.Fatal("discard changed retained checkpoint")
+			}
+		})
+	}
+}
+
+func TestCOWDiscardWaitsWholeBatchBeforeFreezingAndCancels(t *testing.T) {
+	for _, state := range []cacheState{cacheLoading, cacheConstructing, cacheWriteback} {
+		t.Run(fmt.Sprint(state), func(t *testing.T) {
+			gate := newWorkerGate()
+			defer gate.open()
+			waiting := make(chan struct{}, 8)
+			cache := testCache(t, 3, 3, cacheHooks{beforeSelect: gate.wait, waiting: func() {
+				select {
+				case waiting <- struct{}{}:
+				default:
+				}
+			}})
+			cow := cachedCOW(t, cache, 64, nil)
+			writePage(t, cow, 0, 1)
+			writePage(t, cow, 1, 2)
+			awaitSignal(t, gate.entered)
+			observer := &discardObserver{diffBackend: cow.diff}
+			cow.diff = observer
+			cache.mu.Lock()
+			p := cache.pages[cacheKey{cow, 1}]
+			cache.dirty.remove(p)
+			p.state = state
+			cache.mu.Unlock()
+			ctx, cancel := context.WithCancel(context.Background())
+			done := make(chan error, 1)
+			go func() { done <- cache.discard(ctx, cow, 0, 63) }()
+			awaitSignal(t, waiting)
+			cache.mu.Lock()
+			first := cache.pages[cacheKey{cow, 0}].state
+			used := len(cache.pages)
+			cache.mu.Unlock()
+			if first != cacheDirty || used != 2 {
+				t.Fatalf("partially froze or allocated placeholders: %v %d", first, used)
+			}
+			cancel()
+			if err := awaitError(t, done); !errors.Is(err, context.Canceled) {
+				t.Fatal(err)
+			}
+			if len(observer.calls) != 0 {
+				t.Fatal("cancelled batch reached backend")
+			}
+			cache.mu.Lock()
+			p.state = cacheDirty
+			cache.dirty.push(p)
+			cache.signalLocked()
+			cache.mu.Unlock()
+			gate.open()
+		})
+	}
+}
+
+func TestCOWDiscardFrozenBatchPublishesDespiteCancelOrFailsAndWakes(t *testing.T) {
+	for _, fail := range []bool{false, true} {
+		t.Run(fmt.Sprint(fail), func(t *testing.T) {
+			gate := newWorkerGate()
+			defer gate.open()
+			cache := testCache(t, 2, 2, cacheHooks{beforeSelect: gate.wait})
+			cow := cachedCOW(t, cache, 64, nil)
+			writePage(t, cow, 0, 7)
+			writePage(t, cow, 1, 8)
+			awaitSignal(t, gate.entered)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			observer := &discardObserver{diffBackend: cow.diff, before: func(ioctx context.Context) error {
+				cancel()
+				if ioctx.Err() != nil {
+					t.Error("frozen operation retained cancellation")
+				}
+				// This would deadlock if the cache global lock covered backend I/O.
+				cache.mu.Lock()
+				defer cache.mu.Unlock()
+				for _, p := range cache.pages {
+					if p.state != cacheDiscarding {
+						t.Error("batch not wholly frozen")
+					}
+				}
+				if fail {
+					return io.ErrUnexpectedEOF
+				}
+				return nil
+			}}
+			cow.diff = observer
+			err := cache.discard(ctx, cow, 0, 63)
+			if fail {
+				if !errors.Is(err, io.ErrUnexpectedEOF) || cache.Err() == nil {
+					t.Fatal(err)
+				}
+			} else {
+				if err != nil {
+					t.Fatal(err)
+				}
+				for i := int64(0); i < 64; i++ {
+					if cow.blockDirty(i) {
+						t.Fatal("batch not published absent", i)
+					}
+				}
+			}
+			cache.mu.Lock()
+			remaining := len(cache.pages)
+			cache.mu.Unlock()
+			if remaining != 0 {
+				t.Fatal("frozen pages stranded", remaining)
+			}
+			gate.open()
+		})
+	}
+}
+
 func TestCOWCacheRejectsInvalidOwnershipAndSizes(t *testing.T) {
 	for _, sizes := range [][2]uint64{{0, 4096}, {4096, 0}, {4096, 8192}, {4097, 4096}, {8192, 1}} {
 		if c, err := NewCache(sizes[0], sizes[1]); err == nil {

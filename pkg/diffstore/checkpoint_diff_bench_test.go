@@ -27,12 +27,75 @@ import (
 // 128 with -benchtime=32768x touches every page once). Seed/setup is untimed.
 func BenchmarkCheckpointCOWWriteback(b *testing.B) {
 	for _, mode := range []string{"raw", "v1", "v2-no-version", "v2-shared", "v2-private", "v2-xts-no-version", "v2-xts-shared", "v2-xts-private"} {
-		for _, workload := range []string{"sequential", "random", "partial", "hot", "mixed", "cold-read", "frequent-checkpoint"} {
-			if workload == "frequent-checkpoint" && (mode == "raw" || mode == "v1") {
+		for _, workload := range []string{"sequential", "random", "partial", "hot", "mixed", "cold-read", "frequent-checkpoint", "gc-write"} {
+			if (workload == "frequent-checkpoint" || workload == "gc-write") && (mode == "raw" || mode == "v1") {
 				continue
 			}
 			b.Run(mode+"/"+workload, func(b *testing.B) { benchmarkCheckpointWriteback(b, mode, workload) })
 		}
+	}
+}
+
+// Discard is measured with a dense upper and a cache smaller than the range.
+// Refill/Drain is excluded. The normal backend GC remains enabled, so total
+// commits include concurrent reclamation and are not Discard-only commits.
+func BenchmarkCheckpointDiscard(b *testing.B) {
+	for _, mode := range []string{"raw", "v1", "v2-no-version", "v2-xts-no-version"} {
+		b.Run(mode, func(b *testing.B) {
+			const size = int64(4 << 20)
+			const cacheSize = 1 << 20
+			cache, err := NewCache(cacheSize, cacheSize/2)
+			if err != nil {
+				b.Fatal(err)
+			}
+			defer cache.Close()
+			options := []DiskOption{WithCache(cache)}
+			if strings.HasPrefix(mode, "v2") {
+				options = append(options, WithCheckpoint("discard-benchmark", ""))
+			}
+			if mode == "v1" || strings.Contains(mode, "-xts-") {
+				options = append(options, WithDiffEncryption([32]byte{1}, true))
+			}
+			cow, err := OpenDisk(filepath.Join(b.TempDir(), "disk.diff"), nil, DiffInit{CreateSize: size}, options...)
+			if err != nil {
+				b.Fatal(err)
+			}
+			defer cow.Close()
+			backend, _ := cow.checkpointBackend()
+			observer := &discardObserver{diffBackend: cow.diff}
+			cow.diff = observer
+			chunk := bytes.Repeat([]byte{0x45}, 1<<20)
+			var commits uint64
+			b.SetBytes(size)
+			b.ResetTimer()
+			b.StopTimer()
+			for range b.N {
+				for off := int64(0); off < size; off += int64(len(chunk)) {
+					if _, err := cow.WriteAt(chunk, off); err != nil {
+						b.Fatal(err)
+					}
+				}
+				if err := cow.Drain(context.Background()); err != nil {
+					b.Fatal(err)
+				}
+				var before versioned.Stats
+				if backend != nil {
+					before = backend.store.Stats()
+				}
+				b.StartTimer()
+				if err := cow.Discard(0, size); err != nil {
+					b.Fatal(err)
+				}
+				b.StopTimer()
+				if backend != nil {
+					commits += backend.store.Stats().Commits - before.Commits
+				}
+			}
+			b.ReportMetric(float64(len(observer.calls))/float64(b.N), "backend-calls/range")
+			b.ReportMetric(float64(commits)/float64(b.N), "total-commits/range")
+			b.ReportMetric(float64(size), "range-B")
+			b.ReportMetric(float64(cacheSize), "cache-B")
+		})
 	}
 }
 
@@ -148,16 +211,21 @@ func benchmarkCheckpointWriteback(b *testing.B, mode, workload string) {
 		if workload == "hot" {
 			period = 1024
 		}
-		if workload == "frequent-checkpoint" {
+		if workload == "frequent-checkpoint" || workload == "gc-write" {
 			period = 256
 		}
-		if backend != nil && (mode == "v2-shared" || workload == "frequent-checkpoint") && (i+1)%period == 0 {
+		if backend != nil && (mode == "v2-shared" || workload == "frequent-checkpoint" || workload == "gc-write") && (i+1)%period == 0 {
 			checkpointStart := time.Now()
 			if err := cow.Checkpoint(ctx, CheckpointID(fmt.Sprintf("iteration-%d", i))); err != nil {
 				b.Fatal(err)
 			}
 			if len(checkpointLatencies) < cap(checkpointLatencies) {
 				checkpointLatencies = append(checkpointLatencies, time.Since(checkpointStart).Nanoseconds())
+			}
+			if workload == "gc-write" && i >= 4*period {
+				if err := cow.DeleteCheckpoint(ctx, CheckpointID(fmt.Sprintf("iteration-%d", i-4*period))); err != nil {
+					b.Fatal(err)
+				}
 			}
 		}
 	}

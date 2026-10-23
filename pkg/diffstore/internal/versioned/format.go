@@ -416,7 +416,9 @@ func openStore(path string, o Options, metadata bool) (*Store, error) {
 	}
 	s.currentFlag.Store(ctrl.Current)
 	s.retiredFlag.Store(ctrl.Retired)
-	s.startGC()
+	if !metadata {
+		s.startGC()
+	}
 	return s, nil
 }
 

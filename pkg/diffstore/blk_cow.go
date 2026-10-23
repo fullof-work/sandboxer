@@ -702,24 +702,46 @@ func (c *Disk) Discard(offset, length int64) error {
 	if err := c.markModified(ctx); err != nil {
 		return err
 	}
-	for blk := startBlk; blk < endBlk; blk++ {
-		lock := c.blockLock(blk)
-		lock.Lock()
+	for first := startBlk; first < endBlk; first += maxDiscardPages {
+		last := min(first+maxDiscardPages, endBlk) - 1
+		c.lockBlockRange(first, last)
 		// A discarded mapping must pass the same metadata validation as a write.
-		err := c.resolvePresenceLocked(ctx, blk, blk)
+		err := c.resolvePresenceLocked(ctx, first, last)
 		if err == nil {
-			err = c.cache.discard(ctx, c, blk)
+			err = c.cache.discard(ctx, c, first, last)
 		}
 		if err == nil {
-			c.markMaterialResolved(blk)
+			for blk := first; blk <= last; blk++ {
+				c.markMaterialResolved(blk)
+			}
 		}
-		lock.Unlock()
+		c.unlockBlockRange(first, last)
 		if err != nil {
 			return err
 		}
 	}
 
 	return nil
+}
+
+const maxDiscardPages = 64
+
+// Discard uses at most 64 pages, but can wrap around the stripe array. Lock
+// each touched stripe once in the same numeric order as multi-page readers.
+func (c *Disk) lockBlockRange(first, last int64) {
+	for stripe := range c.blockMu {
+		if delta := (int64(stripe) - first%int64(len(c.blockMu)) + int64(len(c.blockMu))) % int64(len(c.blockMu)); delta <= last-first {
+			c.blockMu[stripe].Lock()
+		}
+	}
+}
+
+func (c *Disk) unlockBlockRange(first, last int64) {
+	for stripe := len(c.blockMu) - 1; stripe >= 0; stripe-- {
+		if delta := (int64(stripe) - first%int64(len(c.blockMu)) + int64(len(c.blockMu))) % int64(len(c.blockMu)); delta <= last-first {
+			c.blockMu[stripe].Unlock()
+		}
+	}
 }
 
 // SnapshotView returns a read-only, upper-only view at the current logical

@@ -142,7 +142,17 @@ func TestOnlineCheckpointManagementSkipsRetiredAndMissingDiffs(t *testing.T) {
 	}
 	create("available", "available", false)
 	pinned := create("retired", "retired", true)
-	handler := &SnapshotHandler{EnableCheckpoint: true, CheckpointDir: dir}
+	owner, err := diffstore.LockDirectory(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer owner.Close()
+	maintenance, err := diffstore.NewDirectoryMaintenance(owner, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer maintenance.Close()
+	handler := &SnapshotHandler{EnableCheckpoint: true, CheckpointDir: dir, checkpointMaintenance: maintenance}
 	refs, err := handler.listDiffCheckpoints(ctx)
 	if err != nil || len(refs) != 1 || refs[0].DiffID != "available" || refs[0].ID != "cp" {
 		t.Fatalf("retired file poisoned live list: %+v %v", refs, err)

@@ -1138,34 +1138,35 @@ func (q *allQuiescer) Resume() {
 // that owns the bundle holds references; the snapshot path consumes
 // them when a request arrives.
 type SnapshotHandler struct {
-	EnableCheckpoint bool
-	CheckpointDir    string // derived from the owning VM BaseDir
-	usageSampler     *usage.Sampler
-	Cfg              *config.SandboxConfig
-	PortableConfig   *config.PortableSandboxConfig
-	SourceBinding    *RunSourceBinding
-	MemoryBinding    *MemorySourceBinding
-	ManifestCfg      *config.ManifestConfig // required for --upload; the Ingester is built lazily per snapshot
-	Fetcher          fetch.Fetcher
-	BundleReader     *manifestbundle.Reader
-	BundleFetcher    *manifestbundle.ManifestFetcher
-	RefLocations     config.RefLocations
-	CustomerKeyFn    ingest.CustomerKeyFunc
-	LocalCodec       tarstream.Codec
-	LocalRequired    bool
-	SandboxID        string // required: snapshot.Take rejects empty
-	Memfd            *memory.Memfd
-	Disks            []SnapDiskRef   // writable diffs to capture, logical order (root, then data disks)
-	Servers          []*vhost.Server // all vhost servers (quiesced together around the dump)
-	CHSock           string
-	RunDir           string
-	Pinger           *guestlink.Pinger        // optional; if non-nil, paused around quiesce/Take
-	Forwarder        *Forwarder               // optional; if non-nil, paused + active relays collapsed around quiesce
-	Reattach         func() error             // optional; re-establishes the stdio MUX whenever a snapshot attempt resumes
-	Memory           *resctl.MemoryController // optional; blocks local Budget mutation across capture
-	CHProcess        func() processSignaler   // late-bound after CH starts; used to guarantee destroy completion
-	Context          context.Context
-	Logf             func(string, ...any)
+	checkpointMaintenance *diffstore.DirectoryMaintenance
+	EnableCheckpoint      bool
+	CheckpointDir         string // derived from the owning VM BaseDir
+	usageSampler          *usage.Sampler
+	Cfg                   *config.SandboxConfig
+	PortableConfig        *config.PortableSandboxConfig
+	SourceBinding         *RunSourceBinding
+	MemoryBinding         *MemorySourceBinding
+	ManifestCfg           *config.ManifestConfig // required for --upload; the Ingester is built lazily per snapshot
+	Fetcher               fetch.Fetcher
+	BundleReader          *manifestbundle.Reader
+	BundleFetcher         *manifestbundle.ManifestFetcher
+	RefLocations          config.RefLocations
+	CustomerKeyFn         ingest.CustomerKeyFunc
+	LocalCodec            tarstream.Codec
+	LocalRequired         bool
+	SandboxID             string // required: snapshot.Take rejects empty
+	Memfd                 *memory.Memfd
+	Disks                 []SnapDiskRef   // writable diffs to capture, logical order (root, then data disks)
+	Servers               []*vhost.Server // all vhost servers (quiesced together around the dump)
+	CHSock                string
+	RunDir                string
+	Pinger                *guestlink.Pinger        // optional; if non-nil, paused around quiesce/Take
+	Forwarder             *Forwarder               // optional; if non-nil, paused + active relays collapsed around quiesce
+	Reattach              func() error             // optional; re-establishes the stdio MUX whenever a snapshot attempt resumes
+	Memory                *resctl.MemoryController // optional; blocks local Budget mutation across capture
+	CHProcess             func() processSignaler   // late-bound after CH starts; used to guarantee destroy completion
+	Context               context.Context
+	Logf                  func(string, ...any)
 
 	capture captureGate
 }

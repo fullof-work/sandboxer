@@ -244,9 +244,6 @@ func deleteDirectoryDiffCheckpoints(ctx context.Context, directory string, refs 
 		} else {
 			err = store.DeleteCheckpoints(ctx, ids)
 		}
-		if err == nil {
-			_, err = store.GC(ctx, 256)
-		}
 		if errors.Is(err, diffstore.ErrRetired) {
 			err = nil
 		}
@@ -447,9 +444,6 @@ func cleanupDiffVersionSet(ctx context.Context, directory string, keep map[strin
 			err = meta.Retire(ctx)
 		} else if len(plan.remove) > 0 {
 			err = meta.DeleteCheckpoints(ctx, plan.remove)
-			if err == nil {
-				_, err = meta.GC(ctx, 256)
-			}
 		}
 		if err = errors.Join(err, meta.Close()); err != nil {
 			return err

@@ -194,7 +194,7 @@ func TestKilledMetadataTransactionsReopen(t *testing.T) {
 		if operation == "create" {
 			stages = append(stages, "new-index")
 		} else if operation == "gc" {
-			stages = append(stages, "gc-punch")
+			stages = append(stages, "gc-punch", "gc-punched")
 		}
 		for _, stage := range stages {
 			t.Run(operation+"/"+stage, func(t *testing.T) {

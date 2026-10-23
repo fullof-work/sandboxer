@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -10,11 +11,15 @@ import (
 
 	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
 	"github.com/kuasar-sandbox/sandboxer/pkg/ctl"
+	"github.com/kuasar-sandbox/sandboxer/pkg/diffstore"
 )
 
 func checkpointCmd(args []string) int {
+	if len(args) > 0 && args[0] == "gc" {
+		return checkpointGCCmd(args[1:])
+	}
 	if len(args) == 0 || (args[0] != "list" && args[0] != "delete") {
-		fmt.Fprintln(os.Stderr, "usage: sandbox-ctl checkpoint list|delete (--sandbox-id ID | --checkpoint-dir DIR) [--checkpoint ID] [--diff-id ID ...] [--json]")
+		fmt.Fprintln(os.Stderr, "usage: sandbox-ctl checkpoint list|delete (--sandbox-id ID | --checkpoint-dir DIR) [--checkpoint ID] [--diff-id ID ...] [--json]\n       sandbox-ctl checkpoint gc --checkpoint-dir DIR [--json]")
 		return 2
 	}
 	action := args[0]
@@ -125,6 +130,83 @@ func checkpointCmd(args []string) int {
 		for _, r := range refs {
 			fmt.Printf("%s\t%s\n", r.DiffID, r.ID)
 		}
+	}
+	return 0
+}
+
+// Metadata reclamation needs no artifact storage, fetcher, or data key.
+func checkpointGCCmd(args []string) int {
+	fs := flag.NewFlagSet("checkpoint gc", flag.ContinueOnError)
+	directory := fs.String("checkpoint-dir", "", "offline directory to reclaim")
+	jsonOutput := fs.Bool("json", false, "emit per-DiffID state and committed freed_slots")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if fs.NArg() != 0 || *directory == "" {
+		fmt.Fprintln(os.Stderr, "usage: sandbox-ctl checkpoint gc --checkpoint-dir DIR [--json]")
+		return 2
+	}
+	ctx, stop := commandContext()
+	defer stop()
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	owner, err := diffstore.LockDirectory(*directory)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	m, err := diffstore.NewDirectoryMaintenance(owner, nil)
+	if err != nil {
+		_ = owner.Close()
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	var outputErr error
+	write := func(s string) {
+		if outputErr != nil {
+			return
+		}
+		_, outputErr = fmt.Fprint(os.Stdout, s)
+		if outputErr != nil {
+			cancel()
+		}
+	}
+	if *jsonOutput {
+		write("[")
+	}
+	first := true
+	err = m.Sweep(ctx, func(result diffstore.DirectoryGCResult) {
+		if *jsonOutput {
+			if !first {
+				write(",")
+			}
+			first = false
+			b, e := json.Marshal(result)
+			if e != nil {
+				outputErr = e
+				cancel()
+				return
+			}
+			write(string(b))
+		} else {
+			write(fmt.Sprintf("%s\t%s\tfreed_slots=%d", result.DiffID, result.State, result.FreedSlots))
+			if result.State == string(diffstore.BlockedByReaders) {
+				write("\tpending reclamation: readers still hold deleted versions")
+			}
+			if result.Error != "" {
+				write("\t" + result.Error)
+			}
+			write("\n")
+		}
+	})
+	if *jsonOutput {
+		write("]\n")
+	}
+	// Close the borrower before releasing directory ownership, including errors.
+	err = errors.Join(err, outputErr, m.Close(), owner.Close())
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
 	}
 	return 0
 }

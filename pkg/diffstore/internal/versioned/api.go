@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -66,29 +67,33 @@ type Stats struct {
 	IndexRead, IndexWritten                 uint64
 	RedoRead, RedoWritten                   uint64
 	GCRead, GCWritten, GCPunched            uint64
+	GCPunchCalls, GCFreed                   uint64
 	CacheHits, CacheMisses                  uint64
 	Allocated, Reused, Commits, GCProcessed uint64
 }
 
 type Store struct {
-	mu           sync.Mutex
-	file         *os.File
-	lock         *os.File
-	lockPath     string
-	info         Info
-	cipher       *xts.Cipher
-	ctrl         control
-	cache        *pageCache
-	stats        Stats
-	fatal        error
-	closed       bool
-	closedFlag   atomic.Bool
-	retiredFlag  atomic.Bool
-	fatalFlag    atomic.Pointer[storedError]
-	currentFlag  atomic.Uint64
-	metadataOnly bool
-	stop         chan struct{}
-	done         chan struct{}
+	mu            sync.Mutex
+	file          *os.File
+	lock          *os.File
+	lockPath      string
+	info          Info
+	cipher        *xts.Cipher
+	ctrl          control
+	cache         *pageCache
+	stats         Stats
+	fatal         error
+	closed        bool
+	closedFlag    atomic.Bool
+	retiredFlag   atomic.Bool
+	fatalFlag     atomic.Pointer[storedError]
+	currentFlag   atomic.Uint64
+	gc            gcScan
+	gcDeletion    uint64
+	gcVersionTurn bool
+	metadataOnly  bool
+	stop          chan struct{}
+	done          chan struct{}
 	// beforeIO is deliberately package-private fault injection, installed before
 	// use by deterministic tests. A process-exit hook also exercises real reopen.
 	beforeIO func(stage string) error
@@ -239,20 +244,37 @@ func (s *Store) startGC() {
 	s.done = make(chan struct{})
 	go func() {
 		defer close(s.done)
-		tick := time.NewTicker(250 * time.Millisecond)
-		defer tick.Stop()
+		delay := 250 * time.Millisecond
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
 		for {
 			select {
 			case <-s.stop:
 				return
-			case <-tick.C:
-				s.mu.Lock()
-				pending := !s.closed && s.fatal == nil && (s.ctrl.Garbage != 0 || s.ctrl.Pending != 0)
-				s.mu.Unlock()
-				if pending {
-					_, _ = s.GC(context.Background(), 64)
-				}
+			case <-timer.C:
 			}
+			for {
+				select {
+				case <-s.stop:
+					return
+				default:
+				}
+				result, err := s.GC(context.Background(), MaxBatchPages)
+				if err != nil {
+					return
+				}
+				if result.State != More {
+					delay = 250 * time.Millisecond
+					if result.State == BlockedByReaders {
+						delay = time.Second
+					}
+					break
+				}
+				// GC released mu. Yield between finite batches so foreground work
+				// can run; zero freed slots does not mean traversal has completed.
+				runtime.Gosched()
+			}
+			timer.Reset(delay)
 		}
 	}()
 }

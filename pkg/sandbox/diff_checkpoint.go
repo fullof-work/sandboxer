@@ -141,68 +141,67 @@ func prepareNamedCapture(req ctl.Request, opts RunOptions, disks []SnapDiskRef) 
 	return req, nil
 }
 
+// startCheckpointMaintenance is called only after the final active disk set is
+// bound. A parked pool instance does not own or inspect a business directory.
+func (h *SnapshotHandler) startCheckpointMaintenance(ctx context.Context, owner *diffstore.DirectoryOwner) error {
+	if h.checkpointMaintenance != nil {
+		return errors.New("checkpoint maintenance already initialized")
+	}
+	directory, err := filepath.EvalSymlinks(h.CheckpointDir)
+	if err != nil {
+		return err
+	}
+	if owner == nil || owner.Directory != directory {
+		return errors.New("checkpoint maintenance requires the target DirectoryOwner")
+	}
+	active := make([]string, 0, len(h.Disks))
+	for _, d := range h.Disks {
+		if d.DiffID == "" {
+			return errors.New("checkpoint maintenance requires all active DiffIDs")
+		}
+		active = append(active, d.DiffID)
+	}
+	m, err := diffstore.NewDirectoryMaintenance(owner, active)
+	if err != nil {
+		return err
+	}
+	if err = m.Start(ctx, func(result diffstore.DirectoryGCResult) {
+		if result.Error != "" && h.Logf != nil {
+			h.Logf("checkpoint maintenance diff=%s: %s", result.DiffID, result.Error)
+		}
+	}); err != nil {
+		return errors.Join(err, m.Close())
+	}
+	h.checkpointMaintenance = m
+	return nil
+}
+
 func (h *SnapshotHandler) listDiffCheckpoints(ctx context.Context) ([]artifact.DiffCheckpointRef, error) {
 	if !h.EnableCheckpoint {
 		return nil, ctl.ErrCheckpointUnsupported
 	}
-	var refs []artifact.DiffCheckpointRef
-	entries, err := os.ReadDir(filepath.Join(h.CheckpointDir, "diffs"))
-	if err != nil {
-		return nil, err
+	if h.checkpointMaintenance == nil {
+		return nil, errors.New("checkpoint directory maintenance unavailable")
 	}
-	for _, e := range entries {
-		if err := ctx.Err(); err != nil {
-			return nil, err
+	var refs []artifact.DiffCheckpointRef
+	appendRefs := func(id string, ids []string) error {
+		for _, cp := range ids {
+			refs = append(refs, artifact.DiffCheckpointRef{DiffID: id, ID: cp})
 		}
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".diff") {
-			continue
+		return nil
+	}
+	for _, d := range h.Disks {
+		if d.ListCheckpoints == nil {
+			return nil, ctl.ErrCheckpointUnsupported
 		}
-		id := strings.TrimSuffix(e.Name(), ".diff")
-		live := false
-		for _, d := range h.Disks {
-			if d.DiffID == id {
-				ids, err := d.ListCheckpoints(ctx)
-				if err != nil {
-					return nil, err
-				}
-				for _, cp := range ids {
-					refs = append(refs, artifact.DiffCheckpointRef{DiffID: id, ID: cp})
-				}
-				live = true
-				break
-			}
-		}
-		if live {
-			continue
-		}
-		info, err := e.Info()
+		ids, err := d.ListCheckpoints(ctx)
 		if err != nil {
 			return nil, err
 		}
-		if !info.Mode().IsRegular() {
-			return nil, errors.New("checkpoint DIFF is not a regular file")
-		}
-		path := filepath.Join(h.CheckpointDir, "diffs", e.Name())
-		meta, err := diffstore.OpenMetadata(path)
-		if err != nil {
-			return nil, err
-		}
-		if meta.Info().DiffID != id {
-			return nil, errors.Join(errors.New("checkpoint DIFF filename/header identity mismatch"), meta.Close())
-		}
-		ids, err := meta.ListCheckpoints(ctx)
-		// Retirement withdraws every version immediately, even while an export
-		// pin keeps the old inode present until a later cleanup retry.
-		if errors.Is(err, diffstore.ErrRetired) {
-			err = nil
-		}
-		closeErr := meta.Close()
-		if err = errors.Join(err, closeErr); err != nil {
-			return nil, err
-		}
-		for _, id := range ids {
-			refs = append(refs, artifact.DiffCheckpointRef{DiffID: strings.TrimSuffix(e.Name(), ".diff"), ID: id})
-		}
+		appendRefs(d.DiffID, ids)
+	}
+	if err := h.checkpointMaintenance.ListCheckpoints(ctx, appendRefs); err != nil {
+		return nil, err
 	}
 	return refs, nil
 }
@@ -242,21 +241,10 @@ func (h *SnapshotHandler) deleteDiffCheckpoints(ctx context.Context, refs []ctl.
 		if live {
 			continue
 		}
-		meta, err := diffstore.OpenMetadata(filepath.Join(h.CheckpointDir, "diffs", id+".diff"))
-		if os.IsNotExist(err) {
-			continue
+		if h.checkpointMaintenance == nil {
+			return errors.New("checkpoint directory maintenance unavailable")
 		}
-		if err != nil {
-			return err
-		}
-		if meta.Info().DiffID != id {
-			return errors.Join(errors.New("checkpoint DIFF filename/header identity mismatch"), meta.Close())
-		}
-		err = meta.DeleteCheckpoints(ctx, ids)
-		if errors.Is(err, diffstore.ErrRetired) {
-			err = nil
-		}
-		if err = errors.Join(err, meta.Close()); err != nil {
+		if err := h.checkpointMaintenance.DeleteCheckpoints(ctx, id, ids); err != nil {
 			return err
 		}
 	}

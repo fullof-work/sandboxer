@@ -48,13 +48,18 @@ func (s *Store) mutate(ctx context.Context, fn func(*transaction) error) error {
 		}
 		// Reserved redo lets GC run even when new payload allocation fails.
 		// Bound foreground assistance; retained pages are never sacrificed.
-		before := s.stats.GCPunched
+		var freed uint64
 		for i := 0; i < 16 && (s.ctrl.Garbage != 0 || s.ctrl.Pending != 0); i++ {
-			if _, gcErr := s.gcLocked(ctx, MaxBatchPages); gcErr != nil {
+			result, gcErr := s.gcLocked(ctx, MaxBatchPages)
+			if gcErr != nil {
 				return gcErr
 			}
+			freed += result.FreedSlots
+			if result.State != More {
+				break
+			}
 		}
-		if s.stats.GCPunched == before {
+		if freed == 0 {
 			return s.fail(err)
 		}
 	}
