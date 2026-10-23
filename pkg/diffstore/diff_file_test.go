@@ -1257,6 +1257,21 @@ func TestAsyncTemplateMaterializationFailureIsFatalAndUnpublished(t *testing.T) 
 	}
 	ctx, cancel := context.WithCancel(cow.lifeCtx)
 	cow.materialCancel = cancel
+	reported := make(chan error, 1)
+	cow.SetFatalHandler(func(cause error) {
+		// A reporter may inspect the completed result synchronously.
+		select {
+		case <-cow.materialDone:
+		default:
+			reported <- errors.New("fatal callback preceded materialization completion")
+			return
+		}
+		if err := cow.WaitMaterialized(context.Background()); !errors.Is(err, cause) {
+			reported <- fmt.Errorf("fatal callback materialization error = %v, want %v", err, cause)
+			return
+		}
+		reported <- nil
+	})
 	go cow.runMaterializer(ctx)
 
 	if err := cow.WaitMaterialized(context.Background()); err == nil {
@@ -1270,6 +1285,9 @@ func TestAsyncTemplateMaterializationFailureIsFatalAndUnpublished(t *testing.T) 
 	}
 	if partials, _ := filepath.Glob(filepath.Join(dir, ".active.diff.*.partial")); len(partials) != 0 {
 		t.Fatalf("failed materialization left temporary files: %v", partials)
+	}
+	if err := awaitError(t, reported); err != nil {
+		t.Fatal(err)
 	}
 	_ = cow.Close()
 }
