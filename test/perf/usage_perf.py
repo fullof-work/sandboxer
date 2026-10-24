@@ -152,7 +152,7 @@ def measure(work, name, density, workload, enabled, seconds, root, ref, read_g, 
                 config = {"resources": {"capacity": {"cpu": 1, "memory": "512MiB"},
                                         "allocatable": {"cpu": 1, "memory": "256MiB", "deflate_on_oom": True}},
                           "boot": {"kernel": f"file://{BIN / 'vmlinux'}", "runtime": f"file://{BIN / 'sandbox-runtime.bundle'}",
-                                   "root": {"base": ref, "overlay": {"diff": f"file://{diff}"}}},
+                                   "root": {"base": ref, "overlay": {"diff_template": f"file://{diff}"}}},
                           "launch": {"exec": "/probe", "args": ["wait"], "restart": "never", "pid_namespace": "shared"},
                           "usage": {"enabled": enabled, "sample_interval": "1s", "flush_interval": "5s" if workload == "save" else "5m"}}
                 if workload == "multidisk":
@@ -160,7 +160,7 @@ def measure(work, name, density, workload, enabled, seconds, root, ref, read_g, 
                     for disk in range(2):
                         path = group / f"data-{ordinal}-{disk}.ext4"
                         ext4(path)
-                        config["boot"]["disks"].append({"name": f"d{disk}", "diff": f"file://{path}"})
+                        config["boot"]["disks"].append({"name": f"d{disk}", "diff_template": f"file://{path}"})
                         config["mounts"].append({"type": "disk", "source": f"d{disk}", "target": f"/data{disk}"})
                 sb = Sandbox(group, f"s{ordinal}", config)
                 sandboxes.append(sb)

@@ -14,6 +14,11 @@ import (
 // createFreshDiff owns claim/template/temp resources from acquisition through
 // atomic publication. Only format initialization differs between backends.
 func createFreshDiff(path string, init DiffInit, options diskOptions) (*freshDiffInit, error) {
+	if init.TemplatePath == "" {
+		if err := validateDiffLogicalSize(init.CreateSize); err != nil {
+			return nil, err
+		}
+	}
 	check := func() error {
 		info, err := os.Lstat(path)
 		if err == nil {
@@ -72,21 +77,13 @@ func createFreshDiff(path string, init DiffInit, options diskOptions) (*freshDif
 		}
 		fresh.diff = wrapCheckpointDiff(store, path)
 	} else {
-		var target *diffFile
-		if options.encryption == nil {
-			if err := tmp.Truncate(size); err != nil {
-				return fail(errors.Join(err, tmp.Close()))
-			}
-			target = &diffFile{f: tmp, bodyIO: tmp, logicalSize: size}
-		} else {
-			target, err = createEncryptedDiffFile(tmp, size, options.encryption, cryptorand.Reader)
-			if err != nil {
-				return fail(errors.Join(err, tmp.Close()))
-			}
+		target, err := createDiffFile(tmp, size, options.encryption, cryptorand.Reader)
+		if err != nil {
+			return fail(errors.Join(err, tmp.Close()))
 		}
 		target.path = path
 		fresh.diff = target
-		if err := target.validateFreshEncryptedBodySparse(); err != nil {
+		if err := target.validateFreshBodySparse(); err != nil {
 			return fail(err)
 		}
 		if err := target.enableDirect(); err != nil {

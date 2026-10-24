@@ -97,11 +97,14 @@ func TestPresenceRejectsHiddenMappingsAcrossSkippedBoundaries(t *testing.T) {
 				}
 			}
 			before := make([]bool, 1)
-			if err := s.Presence(ctx, hidden, before); err != nil || before[0] == low {
+			if err := s.PayloadPresence(ctx, hidden, before); err != nil || before[0] == low {
 				t.Fatal("unexpected healthy fixture presence", hidden, before, err)
 			}
 			if err := s.Scan(ctx, func(uint64) error { return nil }); err != nil {
 				t.Fatal("fixture is not a valid complete tree before corruption", err)
+			}
+			if err := s.Checkpoint(ctx, "retained"); err != nil {
+				t.Fatal(err)
 			}
 			if err := s.Close(); err != nil {
 				t.Fatal(err)
@@ -128,6 +131,23 @@ func TestPresenceRejectsHiddenMappingsAcrossSkippedBoundaries(t *testing.T) {
 					return encodeNode(n)
 				})
 			}
+			if !low {
+				for _, id := range []string{"", "retained"} {
+					v, err := OpenExport(ctx, path, id, nil)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if _, err := v.RunAt(hidden*PageSize, PageSize); err == nil {
+						t.Fatal("export classified a hidden mapping as Zero", id)
+					}
+					if n, err := v.ReadAt(ctx, make([]byte, PageSize), hidden*PageSize); err == nil || n != 0 {
+						t.Fatal("export read a hidden mapping as Zero", id, n, err)
+					}
+					if err := v.Close(); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
 			s, err = Open(path, Options{})
 			if err != nil {
 				t.Fatal("root-only open unexpectedly scanned children", err)
@@ -142,14 +162,14 @@ func TestPresenceRejectsHiddenMappingsAcrossSkippedBoundaries(t *testing.T) {
 				t.Fatal("fixture has no hidden mapping", hidden, err)
 			}
 			present := make([]bool, 1)
-			err = s.Presence(ctx, hidden, present)
+			err = s.PayloadPresence(ctx, hidden, present)
 			if err == nil {
 				t.Fatalf("hidden mapped block %d returned present=%v without reporting corrupt boundary", hidden, present[0])
 			}
 			if !errors.Is(s.Err(), err) {
 				t.Fatal("boundary error was not sticky", err, s.Err())
 			}
-			if again := s.Presence(ctx, 0, make([]bool, 1)); again != err {
+			if again := s.PayloadPresence(ctx, 0, make([]bool, 1)); again != err {
 				t.Fatal("fatal owner continued serving", again)
 			}
 		})
@@ -170,11 +190,11 @@ func TestPresenceBoundaryValidationRemainsBounded(t *testing.T) {
 	}
 	defer s.Close()
 	before := s.Stats()
-	if before.IndexRead != PageSize {
-		t.Fatal("open scanned past root", before)
+	if before.IndexRead != 260*PageSize {
+		t.Fatal("open must read the root and all 259 maximum-capacity presence pages", before)
 	}
 	present := make([]bool, 1)
-	if err := s.Presence(ctx, 8*1024*1024-1, present); err != nil || present[0] {
+	if err := s.PayloadPresence(ctx, 8*1024*1024-1, present); err != nil || present[0] {
 		t.Fatal(present, err)
 	}
 	after := s.Stats()
@@ -206,7 +226,7 @@ func TestPresenceCancellationDuringBoundaryValidation(t *testing.T) {
 	query := &cancelPresenceContext{Context: cancelled, cancel: cancel, checks: 4}
 	before := s.Stats()
 	present := make([]bool, 1)
-	if err := s.Presence(query, 2047, present); !errors.Is(err, context.Canceled) {
+	if err := s.PayloadPresence(query, 2047, present); !errors.Is(err, context.Canceled) {
 		t.Fatal(err)
 	}
 	if s.Err() != nil {
@@ -215,7 +235,7 @@ func TestPresenceCancellationDuringBoundaryValidation(t *testing.T) {
 	if got := s.Stats().IndexRead - before.IndexRead; got != PageSize {
 		t.Fatalf("fixture must cancel between boundary nodes, read=%d", got)
 	}
-	if err := s.Presence(ctx, 2047, present); err != nil || present[0] {
+	if err := s.PayloadPresence(ctx, 2047, present); err != nil || present[0] {
 		t.Fatal("boundary retry failed", present, err)
 	}
 }

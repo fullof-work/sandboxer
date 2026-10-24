@@ -141,7 +141,7 @@ func (d *diffFile) withDirectRead(length int, offset int64, consume func([]byte)
 	if err := readFullAt(d.bodyIO, scratch, d.bodyOffset+start); err != nil {
 		return err
 	}
-	d.cryptUnits(scratch, start, false)
+	d.decodePayload(scratch, start)
 	return consume(scratch[offset-start : offset-start+int64(length)])
 }
 
@@ -181,12 +181,20 @@ func (d *diffFile) directWriteAt(buf []byte, offset int64) (int, error) {
 			if err := readFullAt(d.bodyIO, scratch, d.bodyOffset+start); err != nil {
 				return done, err
 			}
-			d.cryptUnits(scratch, start, false)
+			d.decodePayload(scratch, start)
 		}
+		pages := make([]pageWrite, (end-start)/cowBlockSize)
+		for i := range pages {
+			pages[i].Block = uint64(start/cowBlockSize) + uint64(i)
+		}
+		d.prepareWrites(pages)
 		copy(scratch[pos-start:pos-start+int64(length)], buf[done:done+length])
 		d.cryptUnits(scratch, start, true)
 		if err := writeFullAt(d.bodyIO, scratch, d.bodyOffset+start); err != nil {
-			return done, err
+			return done, errors.Join(err, d.cleanupWritesLocked(pages))
+		}
+		if err := d.finishWrites(pages); err != nil {
+			return done, errors.Join(err, d.cleanupWritesLocked(pages))
 		}
 		done += length
 	}
@@ -213,6 +221,7 @@ func (d *diffFile) writePages(ctx context.Context, pages []pageWrite) error {
 	if d.direct.write.Bytes == nil {
 		return os.ErrClosed
 	}
+	d.prepareWrites(pages)
 	for first := 0; first < len(pages); {
 		end := first + 1
 		for end < len(pages) && pages[end].Block == pages[end-1].Block+1 {
@@ -231,7 +240,7 @@ func (d *diffFile) writePages(ctx context.Context, pages []pageWrite) error {
 		}
 		first = end
 	}
-	return nil
+	return d.finishWrites(pages)
 }
 
 func (d *diffFile) cryptUnits(buf []byte, start int64, encrypt bool) {

@@ -52,8 +52,8 @@ ROOT_IMAGE="$WORK/root.img"
 docker save "$E2E_IMAGE" | "$BIN/flatten-ctl" export --output "$ROOT_IMAGE" --no-progress
 ROOT_REF=$(plaintext_tarstream_ref "$ROOT_IMAGE")
 SOURCE_DIFF="$WORK/source.diff"
-truncate -s 1G "$SOURCE_DIFF"
-mkfs.ext4 -q -F -O ^has_journal "$SOURCE_DIFF"
+truncate -s 1G "$SOURCE_DIFF.template"
+mkfs.ext4 -q -F -O ^has_journal "$SOURCE_DIFF.template"
 
 cat >"$WORK/source.yaml" <<EOF
 resources: { capacity: { cpu: 1, memory: 512MiB }, allocatable: { cpu: 1, memory: 512MiB } }
@@ -64,7 +64,7 @@ boot:
   cmdline: "console=hvc0 printk.time=1"
   root:
     base: $ROOT_REF
-    overlay: { diff: file://$SOURCE_DIFF }
+    overlay: { diff: file://$SOURCE_DIFF, diff_template: file://$SOURCE_DIFF.template }
 files:
   - { path: /etc/kuasar-persistent, content: declared }
 ephemeral_files:
@@ -104,6 +104,14 @@ wait_exec "$SID" "$SOURCE_PID" "$SOURCE_LOG"
 C0="$RUN_ROOT/$SID/sandbox.runtime.cfg"
 [ -f "$C0" ] || e2e_fail "immutable C0 was not written"
 C0_SHA=$(sha256sum "$C0" | awk '{print $1}')
+# Guest readiness may precede lazy template materialization and atomic file
+# publication. Observe the published binding before checking its stability.
+for _ in $(seq 1 120); do
+    [ -f "$SOURCE_DIFF" ] && break
+    kill -0 "$SOURCE_PID" 2>/dev/null || { tail -80 "$SOURCE_LOG" >&2 || true; e2e_fail "source exited before DIFF publication"; }
+    sleep 1
+done
+[ -f "$SOURCE_DIFF" ] || e2e_fail "source DIFF was not published"
 DIFF_BINDING=$(stat -Lc '%d:%i' "$SOURCE_DIFF")
 assert_live_baseline() {
     local phase=$1
@@ -145,7 +153,6 @@ SOURCE_PID=""
 run_from_export() {
     local artifact=$1 expected=$2 suffix=$3
     local diff="$WORK/from-$suffix.diff" cfg="$WORK/from-$suffix.yaml" log="$OUT/from-$suffix.log" clone="export-from-$suffix-$BASHPID"
-    truncate -s 1G "$diff"
     cat >"$cfg" <<EOF
 network: { tap: $TAP_NAME, interface: eth0, ip: 169.254.1.1/31, hostname: export-from-$suffix }
 boot:

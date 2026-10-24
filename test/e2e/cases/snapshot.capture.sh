@@ -50,8 +50,8 @@ docker save "$E2E_IMAGE" | "$BIN/flatten-ctl" export --output "$ROOT_IMAGE" --no
 [ -s "$ROOT_IMAGE" ] || e2e_fail "flatten produced an empty root artifact"
 ROOT_REF="$(plaintext_tarstream_ref "$ROOT_IMAGE")"
 DIFF="$WORK/root.diff"
-truncate -s 1G "$DIFF"
-mkfs.ext4 -q -F -O ^has_journal "$DIFF"
+truncate -s 1G "$DIFF.template"
+mkfs.ext4 -q -F -O ^has_journal "$DIFF.template"
 
 cat >"$WORK/sandbox.yaml" <<EOF
 resources:
@@ -64,7 +64,7 @@ boot:
   cmdline: "console=hvc0 printk.time=1"
   root:
     base: $ROOT_REF
-    overlay: { diff: file://$DIFF }
+    overlay: { diff: file://$DIFF, diff_template: file://$DIFF.template }
 launch:
   args: ["-c", "import sys,time\nprint('PYBOOT-OK', sys.version_info.major*100+sys.version_info.minor, flush=True)\ni=0\nwhile True:\n print('TICK', i, flush=True); i+=1; time.sleep(0.25)"]
   restart: never

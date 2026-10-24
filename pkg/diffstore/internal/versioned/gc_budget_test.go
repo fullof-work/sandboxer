@@ -54,6 +54,11 @@ func TestGCPredecessorDiscoveryIsBoundedAndResumes(t *testing.T) {
 	if err != nil || cp.Previous != previous || protected != tail || s.gc.predecessor == previous {
 		t.Fatalf("bounded traversal lost volatile progress/conservative protection: %+v %d %v", cp, protected, err)
 	}
+	// The first version visit also retired this checkpoint's one private
+	// bitmap page. Release it before isolating the pure predecessor scan.
+	if result, err := s.GC(ctx, 1); err != nil || result.FreedSlots != 1 || result.State != More {
+		t.Fatalf("private bitmap release: %+v %v", result, err)
+	}
 	before := s.Stats()
 	if result, err := s.GC(ctx, 1); err != nil || result.State != More || result.FreedSlots != 0 {
 		t.Fatalf("pure predecessor scan: %+v %v", result, err)
@@ -71,10 +76,10 @@ func TestGCPredecessorDiscoveryIsBoundedAndResumes(t *testing.T) {
 	}
 	defer s.Close()
 	stopTestGC(s)
-	for i := 0; i < 200; i++ {
-		if _, err = s.GC(ctx, 1); err != nil {
-			t.Fatal(err)
-		}
+	// Every withdrawn version now owns another page to transfer and release.
+	// The common bounded drain checks all More steps, including zero frees.
+	if r := finishTestGC(t, s, 1); r.State != Complete {
+		t.Fatal(r)
 	}
 	s.mu.Lock()
 	_, cp, err = s.findCheckpoint("tail", nil)
@@ -292,7 +297,7 @@ func TestGCBudgetOneFairWithContinuouslyAddedGarbage(t *testing.T) {
 		// This new page was born after every retained version. Its withdrawal
 		// continually replenishes the global chain while version work is pending.
 		putPages(t, s, []uint64{8}, byte(step))
-		if err := s.Discard(ctx, 8*PageSize, PageSize); err != nil {
+		if err := s.Discard(ctx, 8*PageSize, PageSize, true); err != nil {
 			t.Fatal(err)
 		}
 		if s.gc != progress {

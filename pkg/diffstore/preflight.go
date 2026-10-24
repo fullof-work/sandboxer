@@ -37,11 +37,7 @@ func ValidateExistingDiffExt4(ctx context.Context, path string, base BlockReader
 	if err := diff.enableDirect(); err != nil {
 		return errors.Join(err, diff.Close())
 	}
-	bitmap, err := diff.scanDirtyBlocks()
-	if err != nil {
-		return errors.Join(fmt.Errorf("diffstore: scan existing diff: %w", err), diff.Close())
-	}
-	return validateDiffSourceExt4(ctx, &fileDiffTemplate{diff: diff, bitmap: bitmap}, base)
+	return validateDiffSourceExt4(ctx, &fileDiffTemplate{diff: diff}, base)
 }
 
 // ValidateDiffTemplateExt4 verifies the effective filesystem produced by a
@@ -80,7 +76,9 @@ func validateDiffSourceExt4(ctx context.Context, source diffTemplateSource, base
 			return fmt.Errorf("diffstore: inspect ext4 superblock run: %w", err)
 		}
 		switch run.Kind() {
-		case sparse.Hole, sparse.Zero:
+		case sparse.Zero:
+			// An explicit zero masks even a valid ext4 superblock in the base.
+		case sparse.Hole:
 			if base != nil && base.Size() >= ext4MagicOffset+int64(len(magic)) {
 				n, readErr := base.ReadAt(magic[:], ext4MagicOffset)
 				if readErr != nil && (readretry.IsTerminal(readErr) || readerr.IsPermanent(readErr) || !(errors.Is(readErr, io.EOF) && n == len(magic))) {

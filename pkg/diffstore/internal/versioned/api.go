@@ -21,7 +21,7 @@ const PageSize = 4096
 const MaxBatchPages = 64
 
 var (
-	ErrFormat             = errors.New("diffstore: not a v2 DIFF")
+	ErrFormat             = errors.New("diffstore: unsupported DIFF format; export old working files before upgrading")
 	ErrBusy               = errors.New("diffstore: owner or reader busy")
 	ErrExists             = errors.New("diffstore: checkpoint identity already used")
 	ErrNotExist           = errors.New("diffstore: checkpoint does not exist")
@@ -78,6 +78,7 @@ type Store struct {
 	lockPath      string
 	info          Info
 	cipher        *xts.Cipher
+	presence      []byte // complete committed logical presence; protected by mu
 	ctrl          control
 	cache         *pageCache
 	stats         Stats

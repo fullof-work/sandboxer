@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"io"
 	"os"
 	"path/filepath"
@@ -159,16 +160,14 @@ func TestDiffTmpfsPreparedBeforeTemplateSeed(t *testing.T) {
 
 func testDiffIOBeforeTemplateSeed(t *testing.T, dir string, tmpfs bool) {
 	srcPath := filepath.Join(dir, "template")
-	if err := os.WriteFile(srcPath, patternedBytes(2*cowBlockSize), 0600); err != nil {
-		t.Fatal(err)
-	}
+	writeSparseTemplate(t, srcPath, patternedBytes(2*cowBlockSize), []sparse.Extent{{Size: 2 * cowBlockSize}})
 	src, err := openDiffTemplate(srcPath, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer src.Close()
-	if src.(*fileDiffTemplate).diff.direct != nil {
-		t.Fatal("immutable template unexpectedly direct")
+	if _, ok := src.(*templateImage); !ok {
+		t.Fatal("raw provisioning template was opened as an active DIFF")
 	}
 	probeDir, err := filepath.EvalSymlinks(dir)
 	if err != nil {
@@ -489,13 +488,11 @@ func TestDiffDirectUnsupportedSetupIO(t *testing.T) {
 					t.Fatal(err)
 				}
 				t.Cleanup(func() { _ = f.Close() })
-				d := &diffFile{f: f, bodyIO: f, logicalSize: 3 * maxDiffScratchSize}
+				var enc *diffEncryption
 				if encrypted {
-					d, err = createEncryptedDiffFile(f, d.logicalSize, mustDiffEncryption(t, testDiffKey(21)),
-						bytes.NewReader(patternedBytes(diffXTSKeySize+diffHeaderNonceSize)))
-				} else {
-					err = f.Truncate(d.logicalSize)
+					enc = mustDiffEncryption(t, testDiffKey(21))
 				}
+				d, err := createDiffFile(f, 3*maxDiffScratchSize, enc, bytes.NewReader(patternedBytes(diffXTSKeySize+diffHeaderNonceSize)))
 				if err != nil {
 					t.Fatal(err)
 				}

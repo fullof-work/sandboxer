@@ -257,9 +257,7 @@ func captureSandboxAtFreeze(ctx context.Context, sources ExportSources, sink Art
 		DataPaths: make([]string, max(0, len(sources.Diffs)-1)),
 	}
 	for i := 1; i < len(sources.Diffs); i++ {
-		view, cleanup, err := prepareDiskSource(ctx, sources.Diffs[i], func() (io.ReadSeeker, []sparse.Extent, func() error, error) {
-			return prepareDiskCapture(ctx, sources.Diffs[i], sources.LocalCodec, sources.LocalRequired, sources.MergeBaseOpener)
-		})
+		view, cleanup, err := prepareDiskSource(ctx, sources.Diffs[i], sources.LocalCodec, sources.LocalRequired, sources.MergeBaseOpener)
 		if err != nil {
 			return nil, fmt.Errorf("export data disk %d SnapshotView: %w", i-1, err)
 		}
@@ -293,9 +291,7 @@ func captureSandboxAtFreeze(ctx context.Context, sources ExportSources, sink Art
 	if err != nil {
 		return nil, err
 	}
-	rootSource, rootCleanup, err := prepareDiskSource(ctx, sources.Diffs[0], func() (io.ReadSeeker, []sparse.Extent, func() error, error) {
-		return prepareDiskCapture(ctx, sources.Diffs[0], sources.LocalCodec, sources.LocalRequired, sources.MergeBaseOpener)
-	})
+	rootSource, rootCleanup, err := prepareDiskSource(ctx, sources.Diffs[0], sources.LocalCodec, sources.LocalRequired, sources.MergeBaseOpener)
 	if err != nil {
 		return nil, fmt.Errorf("export root SnapshotView: %w", err)
 	}

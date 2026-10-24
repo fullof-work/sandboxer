@@ -94,7 +94,7 @@ func TestCheckpointCOWProtectsDirtyVersionAndPinnedDelete(t *testing.T) {
 			if _, err := cow.WriteAt(bytes.Repeat([]byte{0xb4}, cowBlockSize), 0); err != nil {
 				t.Fatal(err)
 			}
-			if err := cow.Discard(2*cowBlockSize, cowBlockSize); err != nil {
+			if err := cow.Discard(2*cowBlockSize, cowBlockSize, true); err != nil {
 				t.Fatal(err)
 			}
 			if err := cow.Drain(context.Background()); err != nil {
@@ -142,8 +142,8 @@ func TestCheckpointCOWReopenPresenceCapacityAndIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer reopened.Close()
-	if reopened.DirtyCount() != 0 || reopened.BackendStats()["diff_presence_complete"] != false {
-		t.Fatal("reopen eagerly resolved presence", reopened.BackendStats())
+	if reopened.DirtyCount() != 4 || reopened.BackendStats()["diff_presence_complete"] != true {
+		t.Fatal("reopen did not load complete presence", reopened.BackendStats())
 	}
 	if !reopened.CanResumeCheckpoint("reopen") {
 		t.Fatal("continuation marker lost")
@@ -327,9 +327,7 @@ func TestCheckpointCOWTemplateCaptureProgressesUnderWrites(t *testing.T) {
 	template := filepath.Join(dir, "template.raw")
 	path := filepath.Join(dir, "active.diff")
 	want := bytes.Repeat([]byte{0x63}, size)
-	if err := os.WriteFile(template, want, 0600); err != nil {
-		t.Fatal(err)
-	}
+	writeSparseTemplate(t, template, want, []sparse.Extent{{Size: uint64(len(want))}})
 	cow, err := OpenDisk(path, nil, DiffInit{TemplatePath: template}, WithCheckpoint("templated", "base"))
 	if err != nil {
 		t.Fatal(err)
@@ -395,9 +393,9 @@ func (b *failAfterCheckpointWrite) writePages(ctx context.Context, pages []pageW
 	}
 	return io.ErrShortWrite
 }
-func (b *failAfterCheckpointWrite) punchHole(ctx context.Context, off, length int64) error {
+func (b *failAfterCheckpointWrite) discard(ctx context.Context, off, length int64, hole bool) error {
 	b.discards++
-	return b.diffBackend.punchHole(ctx, off, length)
+	return b.diffBackend.discard(ctx, off, length, hole)
 }
 
 func TestCheckpointCOWWriteFailureCannotPunchCommittedOrPinnedSlots(t *testing.T) {

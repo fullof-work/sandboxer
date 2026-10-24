@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
+	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/ctl"
 	"github.com/kuasar-sandbox/sandboxer/pkg/sandboxfile"
@@ -102,15 +104,28 @@ func captureCheckpointAtFreeze(ctx context.Context, s ExportSources, sink Artifa
 	return out, nil
 }
 
-func prepareDiskSource(ctx context.Context, d DiskDiff, codecSources func() (io.ReadSeeker, []sparse.Extent, func() error, error)) (sparse.Source, func() error, error) {
-	if d.Export != nil && d.MergeBase == "" {
+func prepareDiskSource(ctx context.Context, d DiskDiff, codec tarstream.Codec, required bool, opener MergeBaseOpener) (sparse.Source, func() error, error) {
+	if d.Export != nil {
 		v, err := d.Export(ctx)
 		if err != nil {
 			return nil, nil, err
 		}
-		return v, v.Close, nil
+		if d.MergeBase == "" {
+			return v, v.Close, nil
+		}
+		base, err := openMergeBaseStream(ctx, d.MergeBase, codec, required, opener)
+		if err != nil {
+			return nil, nil, errors.Join(err, v.Close())
+		}
+		if base.Size() < v.Size() {
+			return nil, nil, errors.Join(fmt.Errorf("merge base: entry size %d < expected disk size %d", base.Size(), v.Size()), base.Close(), v.Close())
+		}
+		// Bound the parent to disk bytes so its ZIP tail cannot enter this
+		// payload. Layering preserves Zero as an opaque run above older data.
+		merged := fetch.NewLayered(v, &diskMergeBase{Stream: base, size: v.Size(), ctx: ctx})
+		return merged, merged.Close, nil
 	}
-	r, holes, close, err := codecSources()
+	r, holes, close, err := prepareDiskCapture(ctx, d, codec, required, opener)
 	if err != nil {
 		return nil, nil, err
 	}

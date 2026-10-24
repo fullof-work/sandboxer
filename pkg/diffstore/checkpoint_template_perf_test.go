@@ -49,11 +49,16 @@ func TestCheckpointTemplatePhases(t *testing.T) {
 		options = append(options, WithDiffEncryption([32]byte{1}, true))
 	}
 	templatePath := filepath.Join(dir, "template.diff")
-	template, err := OpenDisk(templatePath, nil, DiffInit{CreateSize: size}, options...)
+	// Provisioning input stays raw, independently of the active target format.
+	// The historical mode names select target encryption/checkpoint policy.
+	template, err := os.Create(templatePath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer template.Close()
+	if err := template.Truncate(size); err != nil {
+		t.Fatal(err)
+	}
 	chunk := make([]byte, 1<<20)
 	if _, err := rand.New(rand.NewSource(327)).Read(chunk); err != nil {
 		t.Fatal(err)
@@ -65,7 +70,7 @@ func TestCheckpointTemplatePhases(t *testing.T) {
 		}
 		_, _ = want.Write(chunk)
 	}
-	if err := template.Drain(ctx); err != nil {
+	if err := template.Sync(); err != nil {
 		t.Fatal(err)
 	}
 	if err := template.Close(); err != nil {
@@ -117,7 +122,7 @@ func TestCheckpointTemplatePhases(t *testing.T) {
 		"process_peak_rss_kib":    cpuAfter.Maxrss, "go_heap_bytes": memory.HeapAlloc,
 		"allocated_file_bytes": physical.Blocks * 512, "file_bytes": physical.Size,
 		"filesystem_type": fmt.Sprintf("0x%x", fs.Type),
-		"note":            "64 MiB fully populated raw/v1 source; v1 and v2-xts share key/required policy; total includes final materialization publication and initial synchronization; source setup and final full SHA256 verification are outside timing; process peak RSS includes setup",
+		"note":            "64 MiB fully populated immutable raw source; historical mode names select target policy only; v1 and v2-xts share key/required policy; total includes final materialization publication and initial synchronization; source setup and final full SHA256 verification are outside timing; process peak RSS includes setup",
 	}
 	if backend, err := cow.checkpointBackend(); err == nil {
 		stats := backend.store.Stats()

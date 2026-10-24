@@ -55,7 +55,7 @@ func TestCheckpointOpenRejectsCorruptCurrentBeforeCacheAttach(t *testing.T) {
 			if _, err := f.ReadAt(original, checkpointOffset); err != nil {
 				t.Fatal(err)
 			}
-			if !bytes.HasPrefix(original, []byte("KDCP2")) {
+			if !bytes.HasPrefix(original, []byte("KDCP4")) {
 				t.Fatal("fixture current slot is not a checkpoint")
 			}
 			damaged := append([]byte(nil), original...)
@@ -108,11 +108,11 @@ func TestCheckpointOpenRejectsCorruptCurrentBeforeCacheAttach(t *testing.T) {
 				t.Fatal(err)
 			}
 			stats := backend.store.Stats()
-			if stats.DataRead != 0 || stats.IndexRead != 2*versioned.PageSize {
-				t.Fatalf("reopen must read only root/current metadata, no payload/full scan: %+v", stats)
+			if stats.DataRead != 0 || stats.IndexRead != 3*versioned.PageSize {
+				t.Fatalf("reopen must read only root/current plus full P, no payload/index scan: %+v", stats)
 			}
-			if stats := opened.BackendStats(); stats["diff_presence_known_blocks"] != 0 || stats["diff_presence_complete"] != false {
-				t.Fatal("health check rebuilt presence", stats)
+			if stats := opened.BackendStats(); stats["diff_presence_known_blocks"] != size/cowBlockSize || stats["diff_presence_complete"] != true {
+				t.Fatal("open did not load presence", stats)
 			}
 		})
 	}

@@ -152,7 +152,7 @@ func TestVersionsAndRandomOperations(t *testing.T) {
 				case round%5 == 0:
 					block := uint64(r.Intn(2048))
 					count := min(24, 2048-int(block))
-					if err := s.Discard(ctx, int64(block)*PageSize, int64(count)*PageSize); err != nil {
+					if err := s.Discard(ctx, int64(block)*PageSize, int64(count)*PageSize, true); err != nil {
 						t.Fatal(err)
 					}
 					for i := 0; i < count; i++ {
@@ -359,7 +359,9 @@ func TestBatchWithdrawalSkipsDeletedPredecessors(t *testing.T) {
 		}
 	}
 	after := s.Stats()
-	if after.GCProcessed-before.GCProcessed > 16 {
+	// Each private one-page bitmap is transferred once and released once;
+	// shared data must still avoid forwarding through the withdrawn versions.
+	if after.GCProcessed-before.GCProcessed > 16+2*uint64(len(ids)) {
 		t.Fatalf("retirement repeatedly forwarded: %d", after.GCProcessed-before.GCProcessed)
 	}
 	before = after
@@ -380,7 +382,7 @@ func TestBPlusSplitMergeAndHoles(t *testing.T) {
 	if err := s.Checkpoint(ctx, "split"); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Discard(ctx, 100*PageSize, 1300*PageSize); err != nil {
+	if err := s.Discard(ctx, 100*PageSize, 1300*PageSize, true); err != nil {
 		t.Fatal(err)
 	}
 	want := map[uint64][]byte{}

@@ -60,7 +60,7 @@ def main():
     modes = args.modes.split('|')
     workloads = args.workloads.split('|')
     known_modes = {'raw', 'v1', 'v2-no-version', 'v2-shared', 'v2-private', 'v2-xts-no-version', 'v2-xts-shared', 'v2-xts-private'}
-    known_workloads = {'sequential', 'random', 'partial', 'hot', 'mixed', 'cold-read', 'frequent-checkpoint', 'gc-write', 'reclamation', 'background-gc', 'discard'}
+    known_workloads = {'first-sequential', 'first-random', 'sequential', 'random', 'partial', 'hot', 'mixed', 'cold-read', 'frequent-checkpoint', 'gc-write', 'reclamation', 'background-gc', 'discard'}
     if len(set(modes)) != len(modes) or set(modes) - known_modes:
         parser.error('modes must be unique exact names separated by |')
     if len(set(workloads)) != len(workloads) or set(workloads) - known_workloads:
@@ -106,21 +106,25 @@ def main():
             order = list(reversed(modes)) if iteration % 2 == 0 else modes[(iteration - 1) // 2:] + modes[:(iteration - 1) // 2]
             for workload in workloads:
                 for mode in order:
+                    if workload.startswith('first-') and mode.endswith('-private'):
+                        continue
                     if workload in ('frequent-checkpoint', 'gc-write', 'reclamation', 'background-gc') and mode in ('raw', 'v1'):
                         continue
                     if workload in ('discard', 'reclamation', 'background-gc') and mode not in ('raw', 'v1', 'v2-no-version', 'v2-xts-no-version'):
                         continue
                     name, executable, operations = 'BenchmarkCheckpointCOWWriteback', binary, args.operations
-                    bench = '^' + name + '$/' + re.escape(mode) + '$/' + re.escape(workload) + '$'
+                    if workload.startswith('first-'):
+                        operations = args.working_set_mib * 256  # one first write per page, no overwrite
+                    bench = '^' + name + '$/^' + re.escape(mode) + '$/^' + re.escape(workload) + '$'
                     if workload == 'reclamation':
                         name, executable, operations = 'BenchmarkCheckpointReclamation', gc_binary, args.gc_cycles
-                        bench = '^' + name + '$/' + ('xts' if '-xts-' in mode else 'plain') + '$'
+                        bench = '^' + name + '$/^' + ('xts' if '-xts-' in mode else 'plain') + '$'
                     elif workload == 'background-gc':
                         name, executable, operations = 'BenchmarkCheckpointBackgroundGC', gc_binary, 1
-                        bench = '^' + name + '$/' + ('xts' if '-xts-' in mode else 'plain') + '$'
+                        bench = '^' + name + '$/^' + ('xts' if '-xts-' in mode else 'plain') + '$'
                     elif workload == 'discard':
                         name, operations = 'BenchmarkCheckpointDiscard', args.gc_cycles
-                        bench = '^' + name + '$/' + re.escape(mode) + '$'
+                        bench = '^' + name + '$/^' + re.escape(mode) + '$'
                     command = [executable, '-test.run=^$', '-test.bench=' + bench,
                                '-test.benchtime=' + str(operations) + 'x', '-test.timeout=60m']
                     stem = 'round-%02d-%s-%s' % (iteration, workload, mode)

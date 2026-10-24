@@ -130,6 +130,65 @@ PY
 check_hashes() {
     guest /bin/sh -c 'sha256sum /checkpoint-payload /scratch/checkpoint-payload /data/checkpoint-payload' >"$OUT/$1.hashes"
     cmp "$OUT/original.hashes" "$OUT/$1.hashes"
+    guest python3 -c "$(cat "$E2E_LIB/sandboxer/trim_probe.py")" check >"$OUT/$1.trim.json"
+}
+check_exported_trim() {
+    local artifact=$1 label=$2
+    "$BIN/sandbox-ctl" info --json "$artifact" >"$OUT/$label.info.json"
+    python3 - "$artifact" "$OUT/$label.info.json" "$OUT/trim-seed.json" >"$OUT/$label.payload.json" <<'PY'
+import json, pathlib, struct, sys, tarfile, zlib
+artifact = pathlib.Path(sys.argv[1])
+config = json.load(open(sys.argv[2]))
+position = json.load(open(sys.argv[3]))
+disk = next(d for d in config['Boot']['Disks'] if d['Name'] == 'scratch')
+assert disk.get('Overlay') is None, disk
+# A restored active layer can be Hole above an immutable Zero layer. Resolve
+# the real chain: its first present layer must provide zero and mask the seed.
+# Legacy carriers store explicit zero Data; payload omission is independent.
+for layer, ref in enumerate([disk['Base']] + (disk.get('BaseFromRefs') or [])):
+    name = ref.removeprefix('file://').split('@', 1)[0]
+    assert name == pathlib.Path(name).name, ref
+    with tarfile.open(artifact.parent / name) as carrier:
+        members = carrier.getmembers()
+        bitmaps = [m for m in members if m.name == '.kuasar.presence.v1']
+        payloads = [m for m in members if m.isfile() and not m.name.startswith('.kuasar.')]
+        assert len(payloads) == 1 and len(bitmaps) <= 1, members
+        payload = payloads[0]
+        payload.size = int(payload.pax_headers.get('GNU.sparse.realsize', payload.size))
+        page = 4096
+        offset = position['offset']
+        assert offset + page <= payload.size and offset % page == 0
+        extents = payload.sparse if payload.sparse is not None else [(0, payload.size)]
+        stored = sum(max(0, min(start + length, offset + page) - max(start, offset))
+                     for start, length in extents)
+        if bitmaps:
+            metadata = carrier.extractfile(bitmaps[0]).read()
+            assert metadata[:8] == b'KUPRES1\n'
+            version, page, logical, bitmap_size = struct.unpack_from('<IIQQ', metadata, 8)
+            assert version == 1 and page == 4096 and logical % page == 0
+            assert bitmap_size == (logical // page + 7) // 8
+            assert len(metadata) == 64 + bitmap_size and offset + page <= logical
+            assert zlib.crc32(metadata[:60] + metadata[64:]) == struct.unpack_from('<I', metadata, 60)[0]
+            assert payload.pax_headers['KUASAR.presence'] == '1'
+            block = offset // page
+            if not metadata[64 + block // 8] & (1 << (block % 8)):
+                assert stored == 0, 'payload in absent page'
+                continue
+        else:
+            assert 'KUASAR.presence' not in payload.pax_headers, 'missing presence entry'
+            if stored == 0:
+                continue
+            assert stored == page, 'partial lower mask'
+        data = carrier.extractfile(payload)
+        data.seek(offset)
+        assert data.read(page) == bytes(page)
+        print(json.dumps({'offset': offset, 'presence': 1, 'payload_bytes': stored,
+                          'carrier_bytes': (artifact.parent / name).stat().st_size,
+                          'mask_layer': layer}))
+        break
+else:
+    raise AssertionError('trim lost its lower mask through the complete chain')
+PY
 }
 assert_list() {
     local path=$1 expected=$2
@@ -198,13 +257,26 @@ for path in paths:
 PY
 }
 
-start cold "$PATH_ID" --config "$WORK/cold.yaml" --enable-checkpoint
+# Establish a portable nonzero lower first. A later Guest trim must mask that
+# lower through both local Checkpoint and portable export/restore paths.
+start trim-seed "seed-$PATH_ID" --config "$WORK/cold.yaml"
 guest /bin/sh -c 'set -e; for f in /checkpoint-payload /scratch/checkpoint-payload /data/checkpoint-payload; do dd if=/dev/urandom of="$f" bs=1048576 count=16 2>/dev/null; done; sync'
+guest python3 -c "$(cat "$E2E_LIB/sandboxer/trim_probe.py")" seed >"$OUT/trim-seed.json"
+"$BIN/sandbox-ctl" export --path-id "$CURRENT_PATH" --run-root "$RUN_ROOT" --resume \
+    --output "$WORK/trim-lower" >"$OUT/trim-lower.log" 2>&1
+stop_run
+start cold "$PATH_ID" --config "$WORK/restore.yaml" --from "$WORK/trim-lower/$SID.sandbox" --enable-checkpoint
+guest python3 -c "$(cat "$E2E_LIB/sandboxer/trim_probe.py")" trim >"$OUT/trim-completed.json"
+# Keep the historical-GC fixture in the active DIFF as well as in its lower.
+# In-place overwrite preserves allocated file extents, so it cannot reuse the
+# trimmed probe's free block and invalidate the later raw-zero observation.
+guest /bin/sh -c 'set -e; for f in /checkpoint-payload /scratch/checkpoint-payload /data/checkpoint-payload; do dd if=/dev/urandom of="$f" bs=1048576 count=16 conv=notrunc 2>/dev/null; done; sync'
 guest /bin/sh -c 'sha256sum /checkpoint-payload /scratch/checkpoint-payload /data/checkpoint-payload' >"$OUT/original.hashes"
 
 # Enabling the backend does not turn an ordinary export into a local version.
 "$BIN/sandbox-ctl" export --path-id "$PATH_ID" --run-root "$RUN_ROOT" --resume \
     --output "$WORK/ordinary" >"$OUT/ordinary.log" 2>&1
+check_exported_trim "$WORK/ordinary/$SID.sandbox" ordinary-trim
 python3 - "$WORK/ordinary/$SID.sandbox" <<'PY'
 import sys, tarfile, zipfile
 with tarfile.open(sys.argv[1]) as carrier:
@@ -312,6 +384,9 @@ stop_run
 # A different PathID also materializes versions, with checkpoint mode on or off.
 start cross-directory cross-slot --config "$WORK/restore.yaml" --restore "$S_B" --enable-checkpoint
 check_hashes cross-directory
+"$BIN/sandbox-ctl" export --path-id "$CURRENT_PATH" --run-root "$RUN_ROOT" --resume \
+    --output "$WORK/cross-trim" >"$OUT/cross-trim.log" 2>&1
+check_exported_trim "$WORK/cross-trim/$SID.sandbox" cross-trim
 assert_no_restore_pins "$CP_DIR"
 capture snapshot cross-d
 finish_capture
@@ -323,6 +398,9 @@ check_hashes cross-recapture
 stop_run
 start mode-disabled legacy-slot --config "$WORK/restore.yaml" --restore "$S_B"
 check_hashes mode-disabled
+"$BIN/sandbox-ctl" export --path-id "$CURRENT_PATH" --run-root "$RUN_ROOT" --resume \
+    --output "$WORK/single-trim" >"$OUT/single-trim.log" 2>&1
+check_exported_trim "$WORK/single-trim/$SID.sandbox" single-trim
 assert_no_restore_pins "$CP_DIR"
 set +e
 "$BIN/sandbox-ctl" export --path-id "$CURRENT_PATH" --run-root "$RUN_ROOT"     --checkpoint unsupported --resume >"$OUT/unsupported.log" 2>&1

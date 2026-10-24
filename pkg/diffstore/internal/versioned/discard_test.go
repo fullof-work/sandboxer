@@ -27,7 +27,7 @@ func TestDiscardFencesCheckpointAfterInitialMark(t *testing.T) {
 			t.Fatal(err)
 		}
 	}}
-	if err := s.Discard(gate, PageSize, PageSize); err != nil {
+	if err := s.Discard(gate, PageSize, PageSize, true); err != nil {
 		t.Fatal(err)
 	}
 	if s.CanResume("intervening") {
@@ -46,7 +46,7 @@ func TestDiscardReplaysRangeAfterReservationRetry(t *testing.T) {
 	s, _ := newTestStore(t, 64, nil)
 	stopTestGC(s)
 	putPages(t, s, []uint64{1, 2, 3, 50}, 1)
-	if err := s.Discard(ctx, 50*PageSize, PageSize); err != nil {
+	if err := s.Discard(ctx, 50*PageSize, PageSize, true); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Checkpoint(ctx, "before-discard"); err != nil {
@@ -60,7 +60,7 @@ func TestDiscardReplaysRangeAfterReservationRetry(t *testing.T) {
 		}
 		return nil
 	}
-	if err := s.Discard(ctx, PageSize, 2*PageSize); err != nil {
+	if err := s.Discard(ctx, PageSize, 2*PageSize, true); err != nil {
 		t.Fatal(err)
 	}
 	if !fired || s.Stats().GCPunched == 0 {

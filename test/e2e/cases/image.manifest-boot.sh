@@ -131,8 +131,8 @@ MKEY=$("$BIN/manifest-ctl" store --manifest-config "$WORK/manifest.yaml" --no-pr
 [[ "$MKEY" =~ ^[0-9a-f]{64}$ ]] || e2e_fail "manifest store returned a non-canonical key: $MKEY"
 
 DIFF_FILE="$WORK/root.ext4"
-truncate -s 1G "$DIFF_FILE"
-mkfs.ext4 -q -F -O ^has_journal "$DIFF_FILE"
+truncate -s 1G "$DIFF_FILE.template"
+mkfs.ext4 -q -F -O ^has_journal "$DIFF_FILE.template"
 cat >"$WORK/sandbox.yaml" <<EOF
 resources:
   capacity: { cpu: 1, memory: 512MiB }
@@ -148,7 +148,7 @@ boot:
   cmdline: "console=hvc0 printk.time=1"
   root:
     base: manifest://$MKEY
-    overlay: { diff: file://$DIFF_FILE }
+    overlay: { diff: file://$DIFF_FILE, diff_template: file://$DIFF_FILE.template }
 launch:
   args: ["-c", "import sys; print('PYBOOT-OK', sys.version_info.major*100+sys.version_info.minor)"]
   restart: never

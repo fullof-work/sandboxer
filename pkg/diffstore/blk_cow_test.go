@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"io"
-	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -104,19 +103,11 @@ func TestBlockCOW_BitmapRebuildFromExistingDiff(t *testing.T) {
 	diff := filepath.Join(dir, "diff.ext4")
 	const size = 8 * 4096
 
-	// Pre-create a sparse diff with data at block 2 only.
-	f, err := os.Create(diff)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := f.Truncate(size); err != nil {
-		t.Fatal(err)
-	}
+	// Persist one payload and its presence bit before reopening.
 	payload := bytes.Repeat([]byte{'A'}, 4096)
-	if _, err := f.WriteAt(payload, 2*4096); err != nil {
-		t.Fatal(err)
-	}
-	f.Close()
+	logical := make([]byte, size)
+	copy(logical[2*4096:], payload)
+	writeSparseWorkFile(t, diff, logical, []sparse.Extent{{Offset: 2 * 4096, Size: 4096}})
 
 	cow, err := OpenDisk(diff, nil, DiffInit{Existing: true})
 	if err != nil {
@@ -167,7 +158,7 @@ func TestBlockCOW_IOBoundsDoNotOverflow(t *testing.T) {
 	if _, err := cow.WriteAt(make([]byte, 1), maxOffset); err == nil {
 		t.Fatal("overflowing WriteAt was accepted")
 	}
-	if err := cow.Discard(maxOffset, 1); err == nil {
+	if err := cow.Discard(maxOffset, 1, true); err == nil {
 		t.Fatal("overflowing Discard was accepted")
 	}
 	reader := &cowSnapshotReaderAt{cow: cow, bitmap: append([]uint64(nil), cow.bitmap...)}

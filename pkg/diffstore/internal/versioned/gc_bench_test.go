@@ -12,6 +12,125 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// Observe allocated blocks separately from logical length and reader-retained
+// payload. Explicit GC gives each phase a reproducible completion boundary.
+func BenchmarkCheckpointZeroRetention(b *testing.B) {
+	for _, encrypted := range []bool{false, true} {
+		b.Run(fmt.Sprintf("encrypted=%t", encrypted), func(b *testing.B) {
+			const size = int64(64 << 20)
+			var totals = map[string]uint64{}
+			for cycle := 0; cycle < b.N; cycle++ {
+				path := fmt.Sprintf("%s/%d.diff", b.TempDir(), cycle)
+				opts := Options{DiffID: "retention", LogicalSize: size}
+				if encrypted {
+					opts.Key = &[32]byte{7}
+				}
+				s, err := Create(path, opts)
+				if err != nil {
+					b.Fatal(err)
+				}
+				stopTestGC(s)
+				chunk := bytes.Repeat([]byte{0x37}, MaxBatchPages*PageSize)
+				write := func() {
+					for off := int64(0); off < size; off += int64(len(chunk)) {
+						if _, err := s.WriteAt(chunk, off); err != nil {
+							b.Fatal(err)
+						}
+					}
+				}
+				space := func(label string) {
+					var st unix.Stat_t
+					if err := unix.Stat(path, &st); err != nil {
+						b.Fatal(err)
+					}
+					totals[label+"-allocated-B"] += uint64(st.Blocks * 512)
+					totals[label+"-length-B"] += uint64(st.Size)
+				}
+				gc := func() GCResult {
+					var total GCResult
+					for calls := 0; ; calls++ {
+						if calls > 100000 {
+							b.Fatal("GC did not finish")
+						}
+						r, err := s.GC(ctx, 64)
+						if err != nil {
+							b.Fatal(err)
+						}
+						total.FreedSlots += r.FreedSlots
+						if r.State != More {
+							total.State = r.State
+							return total
+						}
+					}
+				}
+				write()
+				if err := s.Checkpoint(ctx, "retained"); err != nil {
+					b.Fatal(err)
+				}
+				v, err := s.Export(ctx, "retained")
+				if err != nil {
+					b.Fatal(err)
+				}
+				space("before-trim")
+				before := s.Stats()
+				start := time.Now()
+				if err := s.Discard(ctx, 0, size, false); err != nil {
+					b.Fatal(err)
+				}
+				totals["discard-ns"] += uint64(time.Since(start))
+				totals["discard-redo-B"] += s.Stats().RedoWritten - before.RedoWritten
+				if r := gc(); r.State != Complete {
+					b.Fatal(r)
+				}
+				space("trim-retained")
+				if err := s.DeleteCheckpoint(ctx, "retained"); err != nil {
+					b.Fatal(err)
+				}
+				if r := gc(); r.State != BlockedByReaders {
+					b.Fatal(r)
+				}
+				space("deleted-pinned")
+				before = s.Stats()
+				for range 8 {
+					if r := gc(); r.State != BlockedByReaders {
+						b.Fatal(r)
+					}
+				}
+				after := s.Stats()
+				totals["blocked-metadata-B"] += after.IndexWritten - before.IndexWritten + after.RedoWritten - before.RedoWritten
+				buf := make([]byte, PageSize)
+				if _, err := v.ReadAt(ctx, buf, uint64(size-PageSize)); err != nil || !bytes.Equal(buf, chunk[:PageSize]) {
+					b.Fatal("retained data changed", err)
+				}
+				if _, err := s.ReadAt(buf, size-PageSize); err != nil || !bytes.Equal(buf, make([]byte, PageSize)) {
+					b.Fatal("active Zero changed", err)
+				}
+				if err := v.Close(); err != nil {
+					b.Fatal(err)
+				}
+				start = time.Now()
+				r := gc()
+				if r.State != Complete {
+					b.Fatal(r)
+				}
+				totals["gc-ns"] += uint64(time.Since(start))
+				totals["freed-slots"] += r.FreedSlots
+				space("released")
+				before = s.Stats()
+				write()
+				totals["reused-slots"] += s.Stats().Reused - before.Reused
+				space("reused")
+				if err := s.Close(); err != nil {
+					b.Fatal(err)
+				}
+			}
+			for name, value := range totals {
+				b.ReportMetric(float64(value)/float64(b.N), name+"/cycle")
+			}
+		})
+	}
+}
+
 // BenchmarkCheckpointReclamation is also source-compatible with the pre-#344
 // engine. It observes persisted backlog/free states rather than guessing that
 // a zero legacy GC return means completion. The explicit worker is stopped so

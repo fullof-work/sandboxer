@@ -396,8 +396,18 @@ func (s *Server) processChain(q *virtq, headIdx uint16) (int, error) {
 			statusValue = BlkStatusIOErr
 		}
 
+	case BlkTypeDiscard:
+		s.mu.Lock()
+		negotiated := s.features&bitVirtioBlkDiscard != 0
+		s.mu.Unlock()
+		if !s.discardSupported || !negotiated || backend.ReadOnly() || !backend.SupportsDiscard() {
+			statusValue = BlkStatusUnsupp
+		} else {
+			statusValue = discardChain(backend, c)
+		}
+
 	default:
-		// Optional commands, including DISCARD and WRITE_ZEROES, are not
+		// Optional commands, including WRITE_ZEROES, are not
 		// advertised by our minimal profile. Never report false success.
 		statusValue = BlkStatusUnsupp
 	}

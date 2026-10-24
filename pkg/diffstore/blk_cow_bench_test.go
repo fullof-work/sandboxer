@@ -259,7 +259,7 @@ func BenchmarkBlockCOWSnapshotView(b *testing.B) {
 
 func resetBenchmarkCOW(b *testing.B, cow *Disk) {
 	b.Helper()
-	if err := cow.Discard(0, cow.size); err != nil {
+	if err := cow.Discard(0, cow.size, true); err != nil {
 		b.Fatal(err)
 	}
 }

@@ -428,7 +428,7 @@ func TestCOWCacheFIFOContiguousBatchBoundAndHoles(t *testing.T) {
 	if err := cache.Drain(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if len(records) != 5 || records[0].pages != 256 || records[1].start != 256 || records[2].cow != b || records[3].start != 258 || records[3].pages != 256 || records[4].pages != 2 {
+	if len(records) != 4 || records[0].pages != 256 || records[1].start != 256 || records[1].pages != 256 || records[2].cow != b || records[3].start != 513 || records[3].pages != 3 {
 		t.Fatalf("FIFO batches: %+v", records)
 	}
 	bitmap, err := a.diff.scanDirtyBlocks()
@@ -579,7 +579,7 @@ func TestCOWCacheDiscardCannotResurrectWriteback(t *testing.T) {
 			writePage(t, cow, 0, 0x62)
 			awaitSignal(t, gate.entered)
 			done := make(chan error, 1)
-			go func() { done <- cow.Discard(0, cowBlockSize) }()
+			go func() { done <- cow.Discard(0, cowBlockSize, true) }()
 			if inflight {
 				awaitSignal(t, waiting)
 				gate.open()
@@ -610,14 +610,14 @@ type discardObserver struct {
 	before func(context.Context) error
 }
 
-func (d *discardObserver) punchHole(ctx context.Context, off, length int64) error {
+func (d *discardObserver) discard(ctx context.Context, off, length int64, hole bool) error {
 	d.calls = append(d.calls, [2]int64{off, length})
 	if d.before != nil {
 		if err := d.before(ctx); err != nil {
 			return err
 		}
 	}
-	return d.diffBackend.punchHole(ctx, off, length)
+	return d.diffBackend.discard(ctx, off, length, hole)
 }
 
 func TestCOWDiscardBoundedBatchesAcrossFormatsAndEdges(t *testing.T) {
@@ -655,7 +655,7 @@ func TestCOWDiscardBoundedBatchesAcrossFormatsAndEdges(t *testing.T) {
 			observer := &discardObserver{diffBackend: cow.diff}
 			cow.diff = observer
 			// Preserve edge pages 0 and 131; discard 130 complete pages in 3 calls.
-			if err := cow.Discard(17, blocks*cowBlockSize-34); err != nil {
+			if err := cow.Discard(17, blocks*cowBlockSize-34, true); err != nil {
 				t.Fatal(err)
 			}
 			if len(observer.calls) != 3 {
@@ -705,7 +705,7 @@ func TestCOWDiscardWaitsWholeBatchBeforeFreezingAndCancels(t *testing.T) {
 			cache.mu.Unlock()
 			ctx, cancel := context.WithCancel(context.Background())
 			done := make(chan error, 1)
-			go func() { done <- cache.discard(ctx, cow, 0, 63) }()
+			go func() { done <- cache.discard(ctx, cow, 0, 63, true) }()
 			awaitSignal(t, waiting)
 			cache.mu.Lock()
 			first := cache.pages[cacheKey{cow, 0}].state
@@ -762,7 +762,7 @@ func TestCOWDiscardFrozenBatchPublishesDespiteCancelOrFailsAndWakes(t *testing.T
 				return nil
 			}}
 			cow.diff = observer
-			err := cache.discard(ctx, cow, 0, 63)
+			err := cache.discard(ctx, cow, 0, 63, true)
 			if fail {
 				if !errors.Is(err, io.ErrUnexpectedEOF) || cache.Err() == nil {
 					t.Fatal(err)

@@ -206,6 +206,12 @@ func (s *Store) gcVersions(ctx context.Context, budget int) (bool, error) {
 				}
 			}
 			if cp.Pending && !cp.Retained {
+				released, err := t.releaseBitmap(&cp, budget-transfers)
+				if err != nil {
+					return err
+				}
+				transfers += released
+				moved += uint64(released)
 				if g.predecessorFor != g.cursor {
 					g.predecessorFor, g.predecessor = g.cursor, cp.Previous
 					g.predecessorEpoch = cp.Epoch
@@ -274,7 +280,7 @@ func (s *Store) gcVersions(ctx context.Context, budget int) (bool, error) {
 							return err
 						}
 					}
-					if cp.Garbage == 0 {
+					if cp.Garbage == 0 && cp.Bitmap == 0 {
 						cp.Pending = false
 						t.ctrl.Pending--
 					}

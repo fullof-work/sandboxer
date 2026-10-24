@@ -72,7 +72,7 @@ func TestMetadataIOFailureIsStickyButMissingIDIsNot(t *testing.T) {
 		t.Fatal("missing ID poisoned owner", err)
 	}
 	putPages(t, s, []uint64{1}, 1)
-	if err := s.Discard(ctx, PageSize, PageSize); err != nil {
+	if err := s.Discard(ctx, PageSize, PageSize, true); err != nil {
 		t.Fatal(err)
 	}
 	s.mu.Lock()

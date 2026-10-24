@@ -21,13 +21,16 @@ func TestCOWCacheAggregationDeadlineAndBacklog(t *testing.T) {
 		aggregating: func() { waiting <- struct{}{} },
 		beforeWrite: func([]*cachePage) error { writes <- struct{}{}; return nil },
 	})
-	cow := cachedCOW(t, cache, 32, nil)
-	writePage(t, cow, 0, 1)
+	var disks [8]*Disk
+	for i := range disks {
+		disks[i] = cachedCOW(t, cache, 32, nil)
+	}
+	writePage(t, disks[0], 0, 1)
 	awaitSignal(t, waiting)
 	// Consume the initial queued kick as well as later ordinary notifications.
 	// An unfired manual timer makes premature selection deterministic.
 	for i := 1; i < 8; i++ {
-		writePage(t, cow, i*2, byte(i+1))
+		writePage(t, disks[i], i*2, byte(i+1))
 		select {
 		case <-waiting:
 		case <-writes:
@@ -49,7 +52,7 @@ func TestCOWCacheAggregationDeadlineAndBacklog(t *testing.T) {
 	if timers.Load() != 1 {
 		t.Fatalf("backlog started %d aggregation windows", timers.Load())
 	}
-	if err := cow.Drain(context.Background()); err != nil {
+	if err := cache.Drain(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -108,7 +111,7 @@ func TestCOWCacheSpatialNeighboursKeepOldestAndUnselectedAge(t *testing.T) {
 	if err := cache.Drain(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	expected := []record{{a, 3, 5}, {b, 4, 1}, {a, 10, 1}, {a, 0, 1}}
+	expected := []record{{a, 3, 7}, {b, 4, 1}}
 	for _, want := range expected {
 		select {
 		case got := <-records:
@@ -130,6 +133,43 @@ func TestCOWCacheSpatialNeighboursKeepOldestAndUnselectedAge(t *testing.T) {
 	}
 	if bitmapBlockDirty(bitmap, 1) || bitmapBlockDirty(bitmap, 8) || bitmapBlockDirty(bitmap, 9) {
 		t.Fatal("coalescing filled a hole")
+	}
+}
+
+func TestCOWCacheDisjointFirstWritesMergePresence(t *testing.T) {
+	for _, encrypted := range []bool{false, true} {
+		t.Run(fmt.Sprint(encrypted), func(t *testing.T) {
+			gate := newWorkerGate()
+			defer gate.open()
+			cache := testCache(t, 128, 128, cacheHooks{beforeSelect: gate.wait})
+			var options []DiskOption
+			if encrypted {
+				options = append(options, WithDiffEncryption(testDiffKey(33), true))
+			}
+			cow := cachedCOW(t, cache, 128, nil, options...)
+			var writes atomic.Int32
+			cow.diff.(*diffFile).beforePresenceWrite = func(int) error { writes.Add(1); return nil }
+			for i := 0; i < 64; i++ {
+				writePage(t, cow, i*2, byte(i+1))
+			}
+			awaitSignal(t, gate.entered)
+			gate.open()
+			if err := cow.Drain(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if writes.Load() != 1 {
+				t.Fatal("rewrote the same P page within one disjoint batch", writes.Load())
+			}
+			for i := 0; i < 64; i++ {
+				got := make([]byte, cowBlockSize)
+				if _, err := cow.diff.ReadAt(got, int64(i*2*cowBlockSize)); err != nil || !bytes.Equal(got, bytes.Repeat([]byte{byte(i + 1)}, cowBlockSize)) {
+					t.Fatal("persisted data", i, err)
+				}
+				if bitmap, err := cow.diff.scanDirtyBlocks(); err != nil || bitmapBlockDirty(bitmap, int64(i*2+1)) {
+					t.Fatal("batch filled a hole", i, err)
+				}
+			}
+		})
 	}
 }
 

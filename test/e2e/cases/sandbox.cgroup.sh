@@ -87,8 +87,8 @@ run_case() {
     mkdir -p "$case_dir" "$run_root"
 
     local diff="$case_dir/root.diff"
-    truncate -s 1G "$diff"
-    mkfs.ext4 -q -F -O ^has_journal "$diff"
+    truncate -s 1G "$diff.template"
+    mkfs.ext4 -q -F -O ^has_journal "$diff.template"
 
     cat >"$case_dir/sandbox.yaml" <<EOF
 resources:
@@ -100,7 +100,7 @@ boot:
   cmdline: "console=hvc0 printk.time=1"
   root:
     base: $ROOT_REF
-    overlay: { diff: file://$diff }
+    overlay: { diff: file://$diff, diff_template: file://$diff.template }
 files:
   - path: /cgroup-fork-probe.b64
     mode: "0644"

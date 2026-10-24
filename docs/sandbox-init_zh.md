@@ -206,6 +206,26 @@ Usage 在上述受控 root/data 组装处保留每个可写盘的私有 CLOEXEC 
 保留, 不进入应用 exec, 与 init 一同关闭; 不可取消的在途读取保留原句柄/槽,
 直至实际结束 (§4.11).
 
+<a id="guest-block-discard"></a>
+
+#### Guest 块设备 DISCARD
+
+新建可写 virtio-blk 设备公布 `VIRTIO_BLK_F_DISCARD`，只读设备不公布。固定配置为
+`MaxDiscSeg=1`、`DiscSecAln=8`（4096 字节）、`MaxDiscSec=8192`（4 MiB）。
+能力在 server 创建时确定，池化 backend 绑定必须匹配。恢复设备沿用捕获时的 feature
+协商结果，旧快照不会在恢复时获得新能力。
+
+请求只包含一个 16 字节范围，可以跨多个可读 descriptor。Host 先校验 flags、原始扇区
+范围及溢出，再向内取整到完整 4 KiB 页。不支持的 flags 和 WRITE_ZEROES 返回 UNSUPP；
+畸形或越过容量的请求返回 IOERR。成功 DISCARD 移除上层 payload，但保留逻辑 presence，
+因此即使 lower 含非零内容，后续读取也返回零。未完整覆盖的边缘页保留原内容。
+Host 每批最多处理 64 页；完成不保证跨批原子性或稳定存储持久性。普通写零仍分配
+Data；Guest FLUSH 保持既有非持久化契约。
+
+在已挂载的可写 ext4 文件系统上执行 `fstrim` 验证真实 Guest 路径。验证须保留非零
+lower 内容，检查 discard 后、Checkpoint/导出及恢复后的零读取，并确认相应 upper
+范围没有 payload。仅 trim 返回的字节数不足以证明这些性质。
+
 ### 3.2 阶段 2:spec 应用 + stdio 接线 + 应用拉起
 
 阶段 1 的 JOIN 已拿到 LaunchSpec 与那条 vsock 连接(hello/launch 已收发)。阶段 2

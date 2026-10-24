@@ -1,8 +1,11 @@
 # Writable disk storage (`pkg/diffstore`)
 
 `pkg/diffstore` owns writable block storage independently of vhost transport. Both
-single-layer raw/v1 files and checkpoint-capable v2 files use the same `Disk`
-frontend. The refactor does not convert existing files or change format defaults.
+single-layer v3 files and checkpoint-capable v4 files use the same `Disk`
+frontend. Both store logical presence separately from physical payload. Legacy
+raw/v1/v2 working files are rejected without modification. Export
+them with the old executable before upgrading; existing portable tarstreams remain
+readable and can seed a new-format DIFF. There is no in-place migration.
 
 ## Layers and dependencies
 
@@ -12,35 +15,35 @@ frontend. The refactor does not convert existing files or change format defaults
 | `pkg/vhost` | Protocol, virtqueues, guest memory, request statistics; queue context forwarded to `Disk` | Writable files, COW cache or checkpoint transactions |
 | `pkg/diffstore.Disk` | Admission/lifetime, logical presence, partial writes, discard, shared cache attachment, template materialization and export boundaries | VM or multi-disk atomicity |
 | Private `diffBackend` | Synchronous logical-page I/O, presence, format-specific failure cleanup, sync and close | Frontend cache pages or ownership of borrowed page payloads |
-| Single-layer `diffFile` | Raw/v1 header, sparse file offsets, owned direct-I/O read/write workspaces | B+ tree or checkpoint references |
-| `internal/versioned` via `checkpointDiff` | v2 B+ tree, transactions, recovery, version references, reader pins, garbage collection | Frontend admission or cache draining |
+| Single-layer `diffFile` | v3 header, presence pages, sparse payload offsets, owned direct-I/O workspaces | B+ tree or checkpoint references |
+| `internal/versioned` via `checkpointDiff` | v4 presence, B+ tree, transactions, recovery, version references, reader pins, garbage collection | Frontend admission or cache draining |
 | `internal/directio`, `internal/sectorcrypt` | Shared mmap alignment/lifetime and logical 512-byte XTS transforms | Pool policy, file headers, authentication or mapping policy |
 
 The dependency direction is transport/application -> `pkg/diffstore` -> its
 private implementations. Filesystem preflight helpers sit above the physical
 backends; neither physical backend interprets ext4. Immutable fetch streams use
-`StreamReader` as a source adapter. The v2 implementation is inaccessible to other
+`StreamReader` as a source adapter. The v4 implementation is inaccessible to other
 packages through Go's `internal` rule.
 
 The public `Store`/`Options` aliases and `Create`, `Open`, `OpenMetadata`, `Probe`,
-`OpenExport`, and `LockDirectory` functions expose the existing v2 engine handle
+`OpenExport`, and `LockDirectory` functions expose the existing v4 engine handle
 for **offline** import, inspection and administration. They are intentionally
 separate from `OpenDisk`: they neither attach the sandbox cache nor provide a
 live disk's admission/drain boundary. Applications must not open a second writable
 `Store` for a live `Disk`, or use offline APIs to bypass that disk's checkpoint
 boundary. This refactor retains the administrative API instead of introducing a
-second implementation of version management. The v2 `ErrEncryptionRequired` and
-`ErrAuthentication` sentinels are public for `errors.Is` checks through all v2
+second implementation of version management. The v4 `ErrEncryptionRequired` and
+`ErrAuthentication` sentinels are public for `errors.Is` checks through all v4
 entry points; they are distinct from the single-layer `ErrDiff*` sentinels.
 
 ## Choosing a format
 
 ```go
-// Raw single-layer by default. WithDiffEncryption selects encrypted v1.
+// Single-layer v3 by default; WithDiffEncryption selects XTS payload encryption.
 disk, err := diffstore.OpenDisk(path, base, init,
     diffstore.WithCache(cache))
 
-// Explicit stable identities select checkpoint-capable v2.
+// Explicit stable identities select checkpoint-capable v4.
 disk, err := diffstore.OpenDisk(path, base, init,
     diffstore.WithCache(cache),
     diffstore.WithCheckpoint(diffID, baseID),
@@ -48,16 +51,16 @@ disk, err := diffstore.OpenDisk(path, base, init,
 ```
 
 Check `err` before using a disk. `DiffInit{Existing: true}` opens an existing file;
-`CreateSize` or `TemplatePath` provisions a fresh file. v2 opens authenticate and
-check the expected identity/base and never adopt raw/v1 files. A plaintext
+`CreateSize` or `TemplatePath` provisions a fresh file. v4 opens authenticate and
+check the expected identity/base and never adopt older files. A plaintext raw
 provisioning template remains allowed when the new active file must be encrypted.
 
-| Property | Single layer (raw/v1) | Versioned (v2) |
+| Property | Single layer (v3) | Versioned (v4) |
 | --- | --- | --- |
 | Runtime | Same `Disk` and shared `Cache` | Same `Disk` and shared `Cache` |
-| Existing-file presence | Eager sparse-file scan | Unknown/absent/present, bounded resolution on first access |
-| Writeback | Contiguous logical runs | Bounded transactions may contain disjoint logical pages |
-| Template staging | One 4 KiB page | Up to `maxWritebackPages` (256) 4 KiB pages |
+| Existing-file presence | Full logical P load; sparse scan identifies physical payload only | Full logical P load; bounded B+ queries identify payload |
+| Writeback | Bounded batches may contain disjoint pages; each changed P page is published once per batch | Bounded transactions may contain disjoint logical pages |
+| Template staging | Up to 64 pages (256 KiB) | Up to `maxWritebackPages` (256) 4 KiB pages |
 | Checkpoint capability | Unavailable | `CheckpointManager` |
 | Physical failure cleanup | Hole-punch only newly created upper pages | Transaction/allocation engine owns recovery; never punch guest offsets in the mixed physical file |
 
@@ -65,13 +68,15 @@ The private batch consists of logical block number, borrowed plaintext bytes and
 whether the upper page was fresh. It exposes no `cachePage`. The cache freezes and
 charges pages until write and failure cleanup finish, and publishes sticky failure
 before cleanup can block. The single-layer backend stages into its existing
-workspace; v2 performs its existing mapping commit. Buffer pools, request batching
+workspace; v4 performs its existing mapping commit. Buffer pools, request batching
 limits and encryption domains retain their existing policies.
 
 Fresh creation shares the claim/recheck/template/temp-file flow, and publication
 shares file sync, atomic rename, claim release and directory sync. Materialization
-uses one dispatcher and the same stripe/presence conflict checks. v2 retains
-batched template commits; single-layer retains one-page staging. Template bytes
+uses one dispatcher and the same stripe/presence conflict checks. v4 retains
+batched template commits; single-layer batches at most 64 pages to amortize
+presence publication and contiguous payload writes. Its temporary staging grows
+from 4 KiB to 256 KiB only while materialization runs. Template bytes
 are read before taking write stripes, then presence is rechecked so frontend
 writes/discards win. A fully superseded range may consequently be read and then
 skipped. `WaitMaterialReady` and `WaitMaterialized` retain distinct readiness and
@@ -120,24 +125,71 @@ with an independent pin. It survives subsequent writes and owner close; close th
 view to release its pin. `Export(ctx, ActiveDiff)` remains the lower-level spelling
 of an active view, while an empty ID is rejected by `OpenCheckpoint`.
 
-v2 live reopen does not wait for a full presence scan. Only an operation requiring
-a complete active sparse export resolves all unknown presence. Named version
-exports retain their independent index view. Errors never turn unknown presence
-into a lower-layer hole.
+Live reopen loads the complete logical presence bitmap, without a full B+ scan.
+Named exports load their own immutable bitmap and root. Payload lookup validates
+visited index pages and adjacent subtree boundaries; corruption is an error,
+never a Zero or lower-layer Hole. Unvisited subtrees are not audited at Open.
+
+## Presence and physical layout
+
+Writable logical capacity must be positive, divisible by 4096 and at most 32 GiB.
+The limit is checked before fresh file/device preparation and when opening a DIFF
+or template. It excludes read-only devices, RAM, artifact metadata tails and
+physical storage retained by old versions. One presence bit per 4 KiB page uses
+at most 1 MiB of net bitmap bytes; this is not a claim about total cache memory.
+
+| P | Effective payload | Logical result |
+| --- | --- | --- |
+| 0 | Ignored, even if stale physical bytes exist | Hole; read the lower layer |
+| 1 | None | Zero; mask the lower layer without a payload page |
+| 1 | Present, including accepted cache writes | Data |
+
+Ordinary writes set P and store Data without scanning for zero bytes. A partial
+write to Zero starts with zero-filled bytes, never lower data. Template and merge
+composition stop at Zero. Full template Zero pages set P without writing Data;
+partial Zero spans use ordinary page composition. The modification fence also
+applies to P-only changes. Guest FLUSH and materialization durability are unchanged.
+
+Single-layer v3 starts with a 4096-byte header describing logical capacity, body
+offset, bitmap offset/length/page count and encryption. Checksummed bitmap pages
+follow it; each has a 32-byte header, 4060 bitmap bytes and a 4-byte CRC. The body
+starts after all bitmap pages. Header/P allocation is excluded from payload extent
+enumeration. XTS uses logical 512-byte sectors and never decrypts a physical hole.
+Payload is written before publishing changed P pages; discard punches before P
+publication. Even P=0 to Zero removes residual payload first. A Zero's first Data
+write is fresh, allowing failed-write cleanup to restore its committed P state.
+
+Versioned v4 places the same bitmap pages at physical page 1600, after the bounded
+redo region and before the record area at page 2048. They are reserved on creation
+and loaded on Open. Changed P pages use the existing atomic metadata transaction;
+recovery and read-only redo interpretation validate their exact permitted range.
+The backend serializes bitmap updates and merges changed bits/pages; the frontend
+never overwrites backend P with a stale full bitmap.
+
+A Checkpoint atomically stores the root plus an independent complete P copy in
+ordinary allocator records (at most 259 pages, 1 MiB net). It copies no Data. Its
+cost includes bitmap copying, allocation and transaction metadata, including
+fragmented free slots; the redo limit remains 1536 existing page images. Reader
+pins protect both root-reachable data and bitmap records. Delete only withdraws
+the version and marks work pending. Bounded GC sends exclusive P records directly
+to the global reclaimable list, persists partial progress, and leaves the version
+pending until that copy is exhausted. It needs no payload decryption key.
 
 ## Discard and reclamation
 
-`Disk.Discard` withdraws complete 4 KiB pages from the active upper layer. Reads
-then fall back to the immutable lower layer; partial edge pages retain their
-contents. It does not mean Guest DISCARD, explicit zero pages or zero compression.
+`Disk.Discard(offset, length, hole)` changes only fully covered 4 KiB pages;
+partial edge pages retain their contents. `hole=true` withdraws upper content and
+sets P=0 so reads fall through to the immutable lower layer. Guest DISCARD uses
+`hole=false`: remove payload and set P=1, returning Zero without revealing base
+bytes. This does not add WRITE_ZEROES or zero compression.
 Each batch covers at most 64 full pages. It takes distinct stripe locks in numeric
 order, checks all existing cache pages under one cache lock, and only then freezes
 them together. Loading or writeback makes the whole batch wait without freezing
 any part. Uncached pages require no placeholder and unrelated dirty pages need no
 drain. Backend I/O runs without the cache lock and receives a context. Cancellation
 can stop a batch before freezing; afterward it must publish the whole batch or
-enter the existing sticky failure path and wake waiters. Success publishes absent
-presence and resolves template backfill for every page, including already absent
+enter the existing sticky failure path and wake waiters. Success publishes the
+selected logical state and resolves template backfill for every page, including absent
 pages. Separate batches do not provide an all-or-nothing range transaction.
 
 `DeleteCheckpoints` only withdraws visibility and immediately releases protection
@@ -175,9 +227,9 @@ adjacent ranges. Descriptor pages between each 128 record positions and all live
 pages split ranges. Punching finishes before one existing metadata/redo transaction
 removes the old chain entries and publishes free descriptors. The batch links in
 ascending address order, then joins the former free head. Failure before commit
-publishes no free slots; reopening may safely repeat a punch. No new format version,
-larger redo area, payload relocation, file truncation or global free-range index
-is introduced. Encryption and direct-I/O alignment retain their existing rules.
+publishes no free slots; reopening may safely repeat a punch. GC itself adds no
+format version, larger redo area, payload relocation, file truncation or global
+free-range index. Encryption and direct-I/O alignment retain their existing rules.
 
 `DirectoryMaintenance` borrows an acquired `DirectoryOwner`, validates its stable
 lock identity, and registers all active DiffIDs before enumeration. It never
@@ -211,8 +263,15 @@ whole-file withdrawal/deletion. Runtime and offline usage belongs to
 | Storage tests formerly in `pkg/vhost` | `pkg/diffstore` |
 | B+ engine tests formerly in `internal/diffstore` | `pkg/diffstore/internal/versioned` |
 
-This changes Go source imports; it does not change CLI/configuration or disk bytes.
-All repository callers migrate together. `vhost.BlockReader` remains a type alias
+The earlier package relocation in this table changed Go source imports without
+changing CLI/configuration or disk bytes. The presence-enabled v3/v4 formats are a
+separate, incompatible working-file change: export retained raw/v1/v2 work-file
+content with the old version before upgrading. Provisioning templates remain
+immutable inputs with their existing raw/encrypted input contract; their readers
+do not reopen or upgrade the source as an active working file. Existing raw ext4
+preparation and old portable tarstream import remain supported.
+
+All repository callers use the relocated API. `vhost.BlockReader` remains a type alias
 for the source accepted by read-only transport devices. Storage benchmark flags
 and `VHOST_*` environment names remain compatible; their compiled test package is
 now `./pkg/diffstore`. The existing ENOSPC script name remains a CI entry point.

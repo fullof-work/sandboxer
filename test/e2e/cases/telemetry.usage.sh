@@ -136,8 +136,8 @@ def main():
                                                 "deflate_on_oom": name in ("balloon", "oom")}},
                   "boot": {"kernel": f"file://{BIN / 'vmlinux'}", "runtime": f"file://{BIN / 'sandbox-runtime.bundle'}",
                            "cmdline": "console=hvc0 printk.time=1",
-                           "root": {"diff": f"file://{diff}"} if name == "single" else
-                           {"base": ref, "overlay": {"diff": f"file://{diff}"}}},
+                           "root": {"diff_template": f"file://{diff}"} if name == "single" else
+                           {"base": ref, "overlay": {"diff_template": f"file://{diff}"}}},
                   # Shared PID namespace makes /proc/1/exe the real init for
                   # artifact verification; the default private namespace's PID 1 is the app.
                   "launch": {"exec": "/probe", "args": ["wait"], "restart": "never", "pid_namespace": "shared"},
@@ -148,7 +148,7 @@ def main():
             for ordinal, target in enumerate(("/data", "/other")):
                 disk = work / f"data-{ordinal}.ext4"
                 ext4(disk)
-                config["boot"]["disks"].append({"name": f"data{ordinal}", "diff": f"file://{disk}"})
+                config["boot"]["disks"].append({"name": f"data{ordinal}", "diff_template": f"file://{disk}"})
                 config["mounts"].append({"type": "disk", "source": f"data{ordinal}", "target": target})
             config["mounts"].append({"type": "empty", "target": "/data/cache"})
         sb = Sandbox(work, name, config, ch_binary=LIB.joinpath("usage_oom_wrapper.py") if name == "oom" else None)

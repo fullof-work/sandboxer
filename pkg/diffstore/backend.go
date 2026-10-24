@@ -3,19 +3,18 @@ package diffstore
 import (
 	"context"
 	"io"
-	"math/bits"
 )
 
-// pageWrite borrows a complete plaintext page. Fresh describes logical upper
-// presence before this accepted write, for backend-specific failure cleanup.
+// pageWrite borrows a complete plaintext page. Before starting I/O the single
+// layer backend updates Fresh from effective payload existence for failure
+// cleanup: logical presence alone cannot distinguish Data from Zero.
 type pageWrite struct {
 	Block uint64
 	Data  []byte
 	Fresh bool
 }
 type batchPolicy struct {
-	disjointWrites bool
-	materialPages  int
+	materialPages int
 }
 
 // diffBackend owns physical storage only. It never owns/cache-mutates borrowed
@@ -31,66 +30,59 @@ type diffBackend interface {
 	withDirectRead(int, int64, func([]byte) error) error
 	writePages(context.Context, []pageWrite) error
 	cleanupWriteFailure([]pageWrite) error
-	scan(context.Context, func(uint64) error) error
 	scanDirtyBlocks() ([]uint64, error)
-	presence(context.Context, uint64, []bool) error
-	punchHole(context.Context, int64, int64) error
+	payloadPresence(context.Context, uint64, []bool) error
+	discard(context.Context, int64, int64, bool) error
 	markModified(context.Context) error
 	err() error
 	Sync() error
 	Close() error
 }
 
-func (d *diffFile) Size() int64                            { return d.logicalSize }
-func (d *diffFile) policy() batchPolicy                    { return batchPolicy{materialPages: 1} }
+func (d *diffFile) Size() int64 { return d.logicalSize }
+func (d *diffFile) policy() batchPolicy {
+	// Reuse writeback batching for template materialization. Cap each staging
+	// and stripe-lock window at 256 KiB instead of publishing P per 4 KiB page.
+	return batchPolicy{materialPages: (256 << 10) / cowBlockSize}
+}
 func (d *diffFile) markModified(ctx context.Context) error { return ctx.Err() }
 func (d *diffFile) err() error                             { return nil }
-func (d *diffFile) scan(ctx context.Context, visit func(uint64) error) error {
-	bitmap, err := d.scanDirtyBlocks()
-	if err != nil {
-		return err
-	}
-	for i, word := range bitmap {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		for word != 0 {
-			bit := bits.TrailingZeros64(word)
-			if err := visit(uint64(i*64 + bit)); err != nil {
-				return err
-			}
-			word &= word - 1
-		}
-	}
-	return nil
+func (d *checkpointDiff) Size() int64                      { return d.logicalSize }
+func (d *checkpointDiff) payloadPresence(ctx context.Context, start uint64, dst []bool) error {
+	return d.store.PayloadPresence(ctx, start, dst)
 }
-func (d *diffFile) presence(ctx context.Context, start uint64, dst []bool) error {
-	bitmap, err := d.scanDirtyBlocks()
-	if err != nil {
-		return err
-	}
+func (d *diffFile) payloadPresence(ctx context.Context, start uint64, dst []bool) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if start > uint64(d.logicalSize/cowBlockSize) || uint64(len(dst)) > uint64(d.logicalSize/cowBlockSize)-start {
+		return io.EOF
+	}
+	d.stateMu.RLock()
+	defer d.stateMu.RUnlock()
 	for i := range dst {
-		block := start + uint64(i)
-		dst[i] = block < uint64(d.logicalSize/cowBlockSize) && bitmap[block/64]&(1<<(block%64)) != 0
+		dst[i] = bitmapBlockDirty(d.payload, int64(start)+int64(i))
 	}
 	return nil
 }
-func (d *checkpointDiff) Size() int64  { return d.logicalSize }
 func (d *checkpointDiff) name() string { return d.path }
 func (d *checkpointDiff) policy() batchPolicy {
-	return batchPolicy{disjointWrites: true, materialPages: maxWritebackPages}
+	return batchPolicy{materialPages: maxWritebackPages}
 }
 func (d *checkpointDiff) cleanupWriteFailure([]pageWrite) error { return nil }
-func (d *checkpointDiff) punchHole(ctx context.Context, off, n int64) error {
-	return d.store.Discard(ctx, off, n)
+func (d *checkpointDiff) discard(ctx context.Context, off, n int64, hole bool) error {
+	return d.store.Discard(ctx, off, n, hole)
 }
 func (d *checkpointDiff) scanDirtyBlocks() ([]uint64, error) {
 	bitmap := make([]uint64, (d.logicalSize/cowBlockSize+63)/64)
-	err := d.scan(context.Background(), func(block uint64) error { bitmap[block/64] |= 1 << (block % 64); return nil })
-	return bitmap, err
+	p, err := d.store.PresenceBitmap(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	for i, v := range p {
+		bitmap[i/8] |= uint64(v) << (8 * (i % 8))
+	}
+	return bitmap, nil
 }
 
 var _ diffBackend = (*diffFile)(nil)

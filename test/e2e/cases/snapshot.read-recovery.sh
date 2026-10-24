@@ -251,7 +251,7 @@ boot:
   runtime: file://%s/sandbox-runtime.bundle
   root:
     base: manifest://%s
-    overlay: {diff: file://%s/seed.diff}
+    overlay: {diff_template: file://%s/seed.diff}
 launch:
   exec: /usr/local/bin/python3
   args: %s

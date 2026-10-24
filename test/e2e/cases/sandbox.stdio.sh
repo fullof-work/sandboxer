@@ -50,8 +50,8 @@ ROOT_REF="$(plaintext_tarstream_ref "$ROOT_IMAGE")"
 write_config() {
     local output=$1
     local diff=$2
-    truncate -s 1G "$diff"
-    mkfs.ext4 -q -F -O ^has_journal "$diff"
+    truncate -s 1G "$diff.template"
+    mkfs.ext4 -q -F -O ^has_journal "$diff.template"
     cat >"$output" <<EOF
 resources:
   capacity: { cpu: 1, memory: 512MiB }
@@ -69,6 +69,7 @@ boot:
     base: $ROOT_REF
     overlay:
       diff: file://$diff
+      diff_template: file://$diff.template
 launch:
   args: ["-c", "print('STDIO-MARKER-12345', flush=True)"]
   restart: never

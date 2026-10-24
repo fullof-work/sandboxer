@@ -47,6 +47,30 @@ from usage_vsock_relay import UsageHandler, UsageRelay, exact, frame, line
 from usage_report_relay import ReportRelay
 
 
+class RawTemplateTests(unittest.TestCase):
+    def test_ext4_provisioning_does_not_require_an_active_diff_cli(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory, "root")
+            root.mkdir()
+            (root / "fixture").write_text("raw provisioning template\n")
+            for populated in (False, True):
+                with self.subTest(populated=populated):
+                    path = Path(directory, f"{populated}.ext4")
+                    with patch.object(usage, "BIN", Path(directory, "no-product-binaries")):
+                        usage.ext4(path, root if populated else None)
+                    self.assertEqual(path.stat().st_size, 256 << 20)
+                    with path.open("rb") as stream:
+                        stream.seek(1024)
+                        superblock = stream.read(1024)
+                    self.assertEqual(superblock[56:58], b"\x53\xef")
+                    self.assertEqual(struct.unpack_from("<I", superblock, 92)[0] & 4, 0,
+                                     "fixture unexpectedly enables the ext4 journal")
+                    if populated:
+                        result = subprocess.run(["debugfs", "-R", "cat /fixture", str(path)],
+                                                check=True, text=True, capture_output=True)
+                        self.assertEqual(result.stdout, "raw provisioning template\n")
+
+
 class ReadRecoveryFatalCauseTests(unittest.TestCase):
     def test_capture_failure_diagnostics_are_bounded_and_redact_keys(self):
         script = (ROOT / "test/e2e/cases/snapshot.read-recovery.sh").read_text()

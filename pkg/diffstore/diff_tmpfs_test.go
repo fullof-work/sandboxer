@@ -153,7 +153,7 @@ func TestDiffTmpfsOwnedWorkspaceAndCopyout(t *testing.T) {
 				t.Fatal(err)
 			}
 			checkRead(t, cow, 0, want[:cowBlockSize])
-			if err := cow.Discard(cowBlockSize, cowBlockSize); err != nil {
+			if err := cow.Discard(cowBlockSize, cowBlockSize, true); err != nil {
 				t.Fatal(err)
 			}
 			checkRead(t, cow, 1, make([]byte, cowBlockSize))

@@ -70,6 +70,9 @@ func PrepareDiff(diffPath, templateURI string, baseSize int64) (diffstore.DiffIn
 		}
 		return diffstore.DiffInit{TemplatePath: templatePath}, nil
 	case baseSize > 0:
+		if err := diffstore.ValidateWritableSize(baseSize); err != nil {
+			return diffstore.DiffInit{}, err
+		}
 		return diffstore.DiffInit{CreateSize: baseSize}, nil
 	default:
 		return diffstore.DiffInit{}, fmt.Errorf("no ext4 source for a fresh overlay diff: set boot.root.overlay.diff_template or boot.root.overlay.base, or pre-format the diff at %s", diffPath)

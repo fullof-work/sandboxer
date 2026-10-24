@@ -1,13 +1,11 @@
 package diffstore
 
 import (
-	"bytes"
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/hmac"
 	"crypto/sha256"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -16,6 +14,7 @@ import (
 	"sync"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
+	"github.com/kuasar-sandbox/sandboxer/pkg/diffstore/internal/presence"
 	"github.com/kuasar-sandbox/sandboxer/pkg/diffstore/internal/versioned"
 	"golang.org/x/crypto/xts"
 	"golang.org/x/sys/unix"
@@ -30,15 +29,15 @@ const (
 	diffHeaderNonceSize  = 12
 	diffHeaderTagSize    = 16
 	diffHeaderSealedSize = diffHeaderNonceSize + diffHeaderPlainSize + diffHeaderTagSize
-	diffVersion          = uint16(1)
+	diffVersion          = uint16(3)
 	maxDiffScratchSize   = 1 << 20
 	ext4MagicOffset      = int64(1024 + 0x38)
 )
 
 var (
 	diffMagic           = [8]byte{0x89, 'K', 'D', 'X', 'T', 'S', '1', '\n'}
-	diffHeaderKeyDomain = []byte("kuasar/diff/header-key/aes-gcm/v1\x00")
-	diffHeaderAADDomain = []byte("kuasar/diff/header/v1\x00")
+	diffHeaderKeyDomain = []byte("kuasar/diff/header-key/aes-gcm/v3\x00")
+	diffHeaderAADDomain = []byte("kuasar/diff/header/v3\x00")
 	diffScratchPool     sync.Pool
 
 	ErrDiffEncryptionRequired = errors.New("diffstore: diff encryption required")
@@ -127,19 +126,23 @@ func parseDiskOptions(raw []DiskOption) (diskOptions, error) {
 	return options, nil
 }
 
-// diffFile implements single-layer raw/v1 storage. Plaintext and
-// encrypted files share the Disk logic; encrypted body offsets are shifted
-// by one fixed header region and transformed in fixed 512-byte XTS units.
+// diffFile implements single-layer v3 storage. Presence and payload allocation
+// jointly distinguish Hole, Zero and Data. Payload uses 512-byte XTS units when
+// encrypted; neither headers nor bitmaps belong to the logical data region.
 type diffFile struct {
-	path        string
-	f           *os.File
-	bodyIO      diffBodyIO
-	encrypted   bool
-	logicalSize int64
-	bodyOffset  int64
-	xts         *xts.Cipher
-	direct      *directWorkspace
-	syncFile    func() error
+	path                string
+	f                   *os.File
+	bodyIO              diffBodyIO
+	encrypted           bool
+	logicalSize         int64
+	bodyOffset          int64
+	xts                 *xts.Cipher
+	direct              *directWorkspace
+	syncFile            func() error
+	stateMu             sync.RWMutex
+	bitmap              []byte
+	payload             []uint64
+	beforePresenceWrite func(int) error
 }
 
 type diffBodyIO interface {
@@ -200,120 +203,14 @@ func openExistingDiffFile(path string, encryption *diffEncryption, required, rea
 		return fail(fmt.Errorf("diffstore: existing diff is empty"))
 	}
 
-	var magic [len(diffMagic)]byte
-	if info.Size() >= int64(len(magic)) {
-		if err := readFullAt(f, magic[:], 0); err != nil {
-			return fail(fmt.Errorf("diffstore: read diff magic: %w", err))
-		}
+	diff, err := readSingleHeader(f, info.Size(), encryption, required)
+	if err != nil {
+		return fail(err)
 	}
-	if magic == diffMagic {
-		if encryption == nil {
-			return fail(ErrDiffEncryptionRequired)
-		}
-		diff, err := openEncryptedDiffFile(f, info.Size(), encryption)
-		if err != nil {
-			return fail(err)
-		}
-		if !readOnly {
-			if err := diff.enableDirect(); err != nil {
-				return fail(err)
-			}
-		}
-		return diff, nil
-	}
-	if required {
-		return fail(ErrDiffPlaintextForbidden)
-	}
-	if err := validateDiffLogicalSize(info.Size()); err != nil {
-		return fail(fmt.Errorf("diffstore: plaintext diff: %w", err))
-	}
-	diff := &diffFile{f: f, bodyIO: f, logicalSize: info.Size()}
-	if !readOnly {
-		if err := diff.enableDirect(); err != nil {
-			return fail(err)
-		}
+	if err := diff.enableDirect(); err != nil {
+		return fail(err)
 	}
 	return diff, nil
-}
-
-func openEncryptedDiffFile(f *os.File, physicalSize int64, encryption *diffEncryption) (*diffFile, error) {
-	if physicalSize < diffHeaderRegionSize {
-		return nil, fmt.Errorf("diffstore: encrypted diff header is truncated")
-	}
-	region := make([]byte, diffHeaderRegionSize)
-	defer clear(region)
-	if err := readFullAt(f, region, 0); err != nil {
-		return nil, fmt.Errorf("diffstore: read encrypted diff header: %w", err)
-	}
-	prefix := region[:diffPrefixSize]
-	if !bytes.Equal(prefix[:len(diffMagic)], diffMagic[:]) {
-		return nil, fmt.Errorf("diffstore: encrypted diff magic changed during open")
-	}
-	if version := binary.BigEndian.Uint16(prefix[8:10]); version != diffVersion {
-		return nil, fmt.Errorf("diffstore: encrypted diff version %d is unsupported", version)
-	}
-	if size := binary.BigEndian.Uint16(prefix[10:12]); size != diffPrefixSize {
-		return nil, fmt.Errorf("diffstore: encrypted diff prefix size %d is invalid", size)
-	}
-	if flags := binary.BigEndian.Uint32(prefix[12:16]); flags != 0 {
-		return nil, fmt.Errorf("diffstore: encrypted diff flags 0x%x are unsupported", flags)
-	}
-	wrappedEnd := diffPrefixSize + diffHeaderSealedSize
-	if !allZero(region[wrappedEnd:]) {
-		return nil, fmt.Errorf("diffstore: encrypted diff header padding is not zero")
-	}
-	nonceEnd := diffPrefixSize + diffHeaderNonceSize
-	plaintext, err := encryption.header.Open(
-		region[nonceEnd:nonceEnd],
-		region[diffPrefixSize:nonceEnd],
-		region[nonceEnd:wrappedEnd],
-		diffHeaderAAD(prefix),
-	)
-	if err != nil {
-		return nil, ErrDiffAuthentication
-	}
-	if len(plaintext) != diffHeaderPlainSize {
-		return nil, fmt.Errorf("diffstore: encrypted diff header plaintext size is invalid")
-	}
-
-	logicalRaw := binary.BigEndian.Uint64(plaintext[0:8])
-	if logicalRaw > uint64(^uint64(0)>>1) {
-		return nil, fmt.Errorf("diffstore: encrypted diff logical size overflows int64")
-	}
-	logicalSize := int64(logicalRaw)
-	if err := validateDiffLogicalSize(logicalSize); err != nil {
-		return nil, fmt.Errorf("diffstore: encrypted diff: %w", err)
-	}
-	if blockSize := binary.BigEndian.Uint32(plaintext[8:12]); blockSize != cowBlockSize {
-		return nil, fmt.Errorf("diffstore: encrypted diff block size %d is invalid", blockSize)
-	}
-	if unitSize := binary.BigEndian.Uint32(plaintext[12:16]); unitSize != uint32(diffDataUnitSize) {
-		return nil, fmt.Errorf("diffstore: encrypted diff data-unit size %d is invalid", unitSize)
-	}
-	if bodyOffset := binary.BigEndian.Uint32(plaintext[16:20]); bodyOffset != uint32(diffHeaderRegionSize) {
-		return nil, fmt.Errorf("diffstore: encrypted diff body offset %d is invalid", bodyOffset)
-	}
-	if keySize := binary.BigEndian.Uint32(plaintext[20:24]); keySize != diffXTSKeySize {
-		return nil, fmt.Errorf("diffstore: encrypted diff XTS key size %d is invalid", keySize)
-	}
-	if !allZero(plaintext[88:]) {
-		return nil, fmt.Errorf("diffstore: encrypted diff reserved header bytes are not zero")
-	}
-	if logicalSize > int64(^uint64(0)>>1)-diffHeaderRegionSize || physicalSize != diffHeaderRegionSize+logicalSize {
-		return nil, fmt.Errorf("diffstore: encrypted diff physical size does not match its header")
-	}
-
-	var rawKey [diffXTSKeySize]byte
-	copy(rawKey[:], plaintext[24:88])
-	cipher, err := xts.NewCipher(aes.NewCipher, rawKey[:])
-	clear(rawKey[:])
-	if err != nil {
-		return nil, fmt.Errorf("diffstore: encrypted diff XTS cipher: %w", err)
-	}
-	return &diffFile{
-		f: f, bodyIO: f, encrypted: true, logicalSize: logicalSize,
-		bodyOffset: diffHeaderRegionSize, xts: cipher,
-	}, nil
 }
 
 func createFreshDiffFile(path string, init DiffInit, encryption *diffEncryption) (*freshDiffInit, error) {
@@ -348,67 +245,6 @@ func initializeFreshDiffFile(path string, logicalSize int64, encryption *diffEnc
 	return openExistingDiffFile(path, encryption, encryption != nil, false)
 }
 
-func createEncryptedDiffFile(f *os.File, logicalSize int64, encryption *diffEncryption, random io.Reader) (*diffFile, error) {
-	var rawKey [diffXTSKeySize]byte
-	var header [diffHeaderPlainSize]byte
-	defer clear(rawKey[:])
-	defer clear(header[:])
-	if _, err := io.ReadFull(random, rawKey[:]); err != nil {
-		return nil, fmt.Errorf("diffstore: generate XTS key: %w", err)
-	}
-	cipher, err := xts.NewCipher(aes.NewCipher, rawKey[:])
-	if err != nil {
-		return nil, fmt.Errorf("diffstore: create XTS cipher: %w", err)
-	}
-
-	prefix := marshalDiffPrefix()
-	binary.BigEndian.PutUint64(header[0:8], uint64(logicalSize))
-	binary.BigEndian.PutUint32(header[8:12], cowBlockSize)
-	binary.BigEndian.PutUint32(header[12:16], uint32(diffDataUnitSize))
-	binary.BigEndian.PutUint32(header[16:20], uint32(diffHeaderRegionSize))
-	binary.BigEndian.PutUint32(header[20:24], diffXTSKeySize)
-	copy(header[24:88], rawKey[:])
-	region := make([]byte, diffHeaderRegionSize)
-	copy(region, prefix[:])
-	nonceEnd := diffPrefixSize + diffHeaderNonceSize
-	if _, err := io.ReadFull(random, region[diffPrefixSize:nonceEnd]); err != nil {
-		clear(region)
-		return nil, fmt.Errorf("diffstore: generate diff header nonce: %w", err)
-	}
-	sealed := encryption.header.Seal(
-		region[nonceEnd:nonceEnd],
-		region[diffPrefixSize:nonceEnd],
-		header[:],
-		diffHeaderAAD(prefix[:]),
-	)
-	if len(sealed) != diffHeaderPlainSize+diffHeaderTagSize {
-		panic("diffstore: AES-GCM returned an unexpected diff header size")
-	}
-	if err := writeFullAt(f, region, 0); err != nil {
-		clear(region)
-		return nil, fmt.Errorf("diffstore: write encrypted diff header: %w", err)
-	}
-	clear(region)
-	if logicalSize > int64(^uint64(0)>>1)-diffHeaderRegionSize {
-		return nil, fmt.Errorf("diffstore: encrypted diff physical size overflow")
-	}
-	if err := f.Truncate(diffHeaderRegionSize + logicalSize); err != nil {
-		return nil, fmt.Errorf("diffstore: size encrypted diff: %w", err)
-	}
-	return &diffFile{
-		f: f, bodyIO: f, encrypted: true, logicalSize: logicalSize,
-		bodyOffset: diffHeaderRegionSize, xts: cipher,
-	}, nil
-}
-
-func marshalDiffPrefix() [diffPrefixSize]byte {
-	var prefix [diffPrefixSize]byte
-	copy(prefix[:8], diffMagic[:])
-	binary.BigEndian.PutUint16(prefix[8:10], diffVersion)
-	binary.BigEndian.PutUint16(prefix[10:12], diffPrefixSize)
-	return prefix
-}
-
 func diffHeaderAAD(prefix []byte) []byte {
 	aad := make([]byte, 0, len(diffHeaderAADDomain)+len(prefix))
 	aad = append(aad, diffHeaderAADDomain...)
@@ -417,12 +253,25 @@ func diffHeaderAAD(prefix []byte) []byte {
 }
 
 type diffEncryption struct {
-	header cipher.AEAD
+	header         cipher.AEAD
+	templateHeader cipher.AEAD
 }
 
 func newDiffEncryption(customerKey [32]byte) (*diffEncryption, error) {
+	header, err := newDiffHeaderCipher(customerKey, diffHeaderKeyDomain)
+	if err != nil {
+		return nil, err
+	}
+	templateHeader, err := newDiffHeaderCipher(customerKey, []byte("kuasar/diff/header-key/aes-gcm/v1\x00"))
+	if err != nil {
+		return nil, err
+	}
+	return &diffEncryption{header: header, templateHeader: templateHeader}, nil
+}
+
+func newDiffHeaderCipher(customerKey [32]byte, domain []byte) (cipher.AEAD, error) {
 	mac := hmac.New(sha256.New, customerKey[:])
-	_, _ = mac.Write(diffHeaderKeyDomain)
+	_, _ = mac.Write(domain)
 	var headerKey [sha256.Size]byte
 	mac.Sum(headerKey[:0])
 	defer clear(headerKey[:])
@@ -434,21 +283,16 @@ func newDiffEncryption(customerKey [32]byte) (*diffEncryption, error) {
 	if err != nil {
 		return nil, fmt.Errorf("diffstore: create diff header GCM: %w", err)
 	}
-	return &diffEncryption{header: header}, nil
+	return header, nil
 }
 
-func validateDiffLogicalSize(size int64) error {
-	if size <= 0 {
-		return fmt.Errorf("logical size must be > 0")
-	}
-	if size%cowBlockSize != 0 {
-		return fmt.Errorf("logical size %d is not aligned to %d", size, cowBlockSize)
-	}
-	if size > int64(^uint64(0)>>1)-diffHeaderRegionSize {
-		return fmt.Errorf("logical size is too large")
-	}
-	return nil
-}
+// MaxWritableSize bounds a DIFF's logical address space, not its history, a
+// read-only disk, guest RAM or an artifact's dense tail.
+const MaxWritableSize int64 = presence.MaxSize
+
+// ValidateWritableSize is shared by device planning and both storage formats.
+func ValidateWritableSize(size int64) error    { return presence.ValidateSize(size) }
+func validateDiffLogicalSize(size int64) error { return ValidateWritableSize(size) }
 
 func (d *diffFile) ReadAt(buf []byte, offset int64) (int, error) {
 	if len(buf) == 0 {
@@ -466,38 +310,11 @@ func (d *diffFile) ReadAt(buf []byte, offset int64) (int, error) {
 		n = int(d.logicalSize - offset)
 		eof = io.EOF
 	}
-	if d.direct != nil {
-		read, err := d.directReadAt(buf[:n], offset)
-		if err != nil {
-			return read, err
-		}
-		return read, eof
+	read, err := d.directReadAt(buf[:n], offset)
+	if err != nil {
+		return read, err
 	}
-	if !d.encrypted {
-		read, err := d.bodyIO.ReadAt(buf[:n], offset)
-		if err != nil && !(errors.Is(err, io.EOF) && read == n) {
-			return read, err
-		}
-		if read != n {
-			return read, io.ErrUnexpectedEOF
-		}
-		return n, eof
-	}
-
-	alignedStart := offset / diffDataUnitSize * diffDataUnitSize
-	alignedEnd := alignUp(offset+int64(n), diffDataUnitSize)
-	scratch := acquireDiffScratch(int(alignedEnd - alignedStart))
-	defer releaseDiffScratch(scratch)
-	buffer := scratch.buffer
-	if err := readFullAt(d.bodyIO, buffer, d.bodyOffset+alignedStart); err != nil {
-		return 0, err
-	}
-	for sectorOffset := int64(0); sectorOffset < int64(len(buffer)); sectorOffset += diffDataUnitSize {
-		sector := buffer[sectorOffset : sectorOffset+diffDataUnitSize]
-		d.xts.Decrypt(sector, sector, uint64((alignedStart+sectorOffset)/diffDataUnitSize))
-	}
-	copy(buf[:n], buffer[offset-alignedStart:offset-alignedStart+int64(n)])
-	return n, eof
+	return read, eof
 }
 
 func (d *diffFile) WriteAt(buf []byte, offset int64) (int, error) {
@@ -507,44 +324,10 @@ func (d *diffFile) WriteAt(buf []byte, offset int64) (int, error) {
 	if len(buf) == 0 {
 		return 0, nil
 	}
-	if d.direct != nil {
-		return d.directWriteAt(buf, offset)
-	}
-	if !d.encrypted {
-		written, err := d.bodyIO.WriteAt(buf, offset)
-		if err == nil && written != len(buf) {
-			err = io.ErrShortWrite
-		}
-		return written, err
-	}
-
-	end := offset + int64(len(buf))
-	alignedStart := offset / diffDataUnitSize * diffDataUnitSize
-	alignedEnd := alignUp(end, diffDataUnitSize)
-	scratch := acquireDiffScratch(int(alignedEnd - alignedStart))
-	defer releaseDiffScratch(scratch)
-	buffer := scratch.buffer
-	if alignedStart != offset || alignedEnd != end {
-		if err := readFullAt(d.bodyIO, buffer, d.bodyOffset+alignedStart); err != nil {
-			return 0, err
-		}
-		for sectorOffset := int64(0); sectorOffset < int64(len(buffer)); sectorOffset += diffDataUnitSize {
-			sector := buffer[sectorOffset : sectorOffset+diffDataUnitSize]
-			d.xts.Decrypt(sector, sector, uint64((alignedStart+sectorOffset)/diffDataUnitSize))
-		}
-	}
-	copy(buffer[offset-alignedStart:end-alignedStart], buf)
-	for sectorOffset := int64(0); sectorOffset < int64(len(buffer)); sectorOffset += diffDataUnitSize {
-		sector := buffer[sectorOffset : sectorOffset+diffDataUnitSize]
-		d.xts.Encrypt(sector, sector, uint64((alignedStart+sectorOffset)/diffDataUnitSize))
-	}
-	if err := writeFullAt(d.bodyIO, buffer, d.bodyOffset+alignedStart); err != nil {
-		return 0, err
-	}
-	return len(buf), nil
+	return d.directWriteAt(buf, offset)
 }
 
-func (d *diffFile) scanDirtyBlocks() ([]uint64, error) {
+func (d *diffFile) scanPayload() ([]uint64, error) {
 	numBlocks := d.logicalSize / cowBlockSize
 	words := (numBlocks + 63) / 64
 	if words > int64(int(^uint(0)>>1)) {
@@ -583,14 +366,11 @@ func (d *diffFile) scanDirtyBlocks() ([]uint64, error) {
 	return bitmap, nil
 }
 
-// validateFreshEncryptedBodySparse verifies the filesystem contract before a
+// validateFreshBodySparse verifies the filesystem contract before a
 // template can allocate legitimate body blocks. A filesystem whose allocation
 // granularity lets the header's data extent cross bodyOffset cannot safely
 // reconstruct the dirty bitmap after reopen, so creation fails closed.
-func (d *diffFile) validateFreshEncryptedBodySparse() error {
-	if !d.encrypted {
-		return nil
-	}
+func (d *diffFile) validateFreshBodySparse() error {
 	if err := d.Sync(); err != nil {
 		return fmt.Errorf("diffstore: sync encrypted diff header: %w", err)
 	}
@@ -606,15 +386,6 @@ func (d *diffFile) validateFreshEncryptedBodySparse() error {
 		return fmt.Errorf("diffstore: filesystem does not preserve the encrypted diff's 4 KiB header/body sparse boundary")
 	}
 	return nil
-}
-
-func (d *diffFile) punchHole(ctx context.Context, offset, length int64) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	return unix.Fallocate(int(d.f.Fd()),
-		unix.FALLOC_FL_PUNCH_HOLE|unix.FALLOC_FL_KEEP_SIZE,
-		d.bodyOffset+offset, length)
 }
 
 func (d *diffFile) Sync() error {
@@ -717,122 +488,15 @@ func (f *freshDiffInit) failMaterialization() error {
 }
 
 type fileDiffTemplate struct {
-	diff   *diffFile
-	bitmap []uint64
-}
-
-type lazyDiffTemplate struct {
 	diff *diffFile
 }
 
 func openLazyDiffTemplate(path string, encryption *diffEncryption) (diffTemplateSource, error) {
-	diff, err := openExistingDiffFile(path, encryption, false, true)
-	if err != nil {
-		return nil, err
-	}
-	return &lazyDiffTemplate{diff: diff}, nil
+	return openProvisioningTemplate(path, encryption)
 }
-
-func (s *lazyDiffTemplate) Size() uint64 { return uint64(s.diff.logicalSize) }
-
-func (s *lazyDiffTemplate) RunAt(offset, limit uint64) (sparse.Run, error) {
-	if offset >= s.Size() {
-		return nil, io.EOF
-	}
-	if limit == 0 {
-		return nil, fmt.Errorf("diffstore: diff template RunAt limit is zero")
-	}
-	end := offset + limit
-	if end < offset || end > s.Size() {
-		end = s.Size()
-	}
-
-	body := s.diff.bodyOffset
-	blockStart := uint64(int64(offset) / cowBlockSize * cowBlockSize)
-	physicalStart := body + int64(blockStart)
-	bodyEnd := body + s.diff.logicalSize
-
-	data, err := unix.Seek(int(s.diff.f.Fd()), physicalStart, unix.SEEK_DATA)
-	if err != nil {
-		if errors.Is(err, unix.ENXIO) {
-			return lazyDiffTemplateRun{source: s, offset: offset, end: end, kind: sparse.Hole}, nil
-		}
-		return nil, fmt.Errorf("diffstore: template SEEK_DATA at %d: %w", physicalStart, err)
-	}
-	if data >= bodyEnd {
-		return lazyDiffTemplateRun{source: s, offset: offset, end: end, kind: sparse.Hole}, nil
-	}
-
-	logicalData := uint64(data - body)
-	dataBlockStart := logicalData / cowBlockSize * cowBlockSize
-	if dataBlockStart > blockStart {
-		return lazyDiffTemplateRun{
-			source: s,
-			offset: offset,
-			end:    min(end, dataBlockStart),
-			kind:   sparse.Hole,
-		}, nil
-	}
-
-	hole, err := unix.Seek(int(s.diff.f.Fd()), data, unix.SEEK_HOLE)
-	if err != nil {
-		return nil, fmt.Errorf("diffstore: template SEEK_HOLE at %d: %w", data, err)
-	}
-	if hole > bodyEnd {
-		hole = bodyEnd
-	}
-	logicalHole := hole - body
-	presentEnd := uint64(alignUp(logicalHole, cowBlockSize))
-	if presentEnd > s.Size() {
-		presentEnd = s.Size()
-	}
-	if presentEnd <= offset {
-		presentEnd = min(end, blockStart+uint64(cowBlockSize))
-	}
-	return lazyDiffTemplateRun{
-		source: s,
-		offset: offset,
-		end:    min(end, presentEnd),
-		kind:   sparse.Data,
-	}, nil
-}
-
-type lazyDiffTemplateRun struct {
-	source *lazyDiffTemplate
-	offset uint64
-	end    uint64
-	kind   sparse.RunKind
-}
-
-func (r lazyDiffTemplateRun) Offset() uint64       { return r.offset }
-func (r lazyDiffTemplateRun) End() uint64          { return r.end }
-func (r lazyDiffTemplateRun) Kind() sparse.RunKind { return r.kind }
-func (r lazyDiffTemplateRun) ReadAt(ctx context.Context, buf []byte, innerOffset uint64) (int, error) {
-	if r.kind == sparse.Hole || r.kind == sparse.Zero {
-		clear(buf)
-		return len(buf), nil
-	}
-	return r.source.ReadAt(ctx, buf, r.offset+innerOffset)
-}
-func (s *lazyDiffTemplate) ReadAt(ctx context.Context, buf []byte, offset uint64) (int, error) {
-	if err := ctx.Err(); err != nil {
-		return 0, err
-	}
-	return s.diff.ReadAt(buf, int64(offset))
-}
-func (s *lazyDiffTemplate) Close() error { return s.diff.Close() }
 
 func openDiffTemplate(path string, encryption *diffEncryption) (diffTemplateSource, error) {
-	diff, err := openExistingDiffFile(path, encryption, false, true)
-	if err != nil {
-		return nil, err
-	}
-	bitmap, err := diff.scanDirtyBlocks()
-	if err != nil {
-		_ = diff.Close()
-		return nil, err
-	}
-	return &fileDiffTemplate{diff: diff, bitmap: bitmap}, nil
+	return openProvisioningTemplate(path, encryption)
 }
 
 func (s *fileDiffTemplate) Size() uint64 { return uint64(s.diff.logicalSize) }
@@ -844,25 +508,8 @@ func (s *fileDiffTemplate) RunAt(offset, limit uint64) (sparse.Run, error) {
 	if limit == 0 {
 		return nil, fmt.Errorf("diffstore: diff template RunAt limit is zero")
 	}
-	end := offset + limit
-	if end < offset || end > s.Size() {
-		end = s.Size()
-	}
-	block := int64(offset) / cowBlockSize
-	dirty := bitmapBlockDirty(s.bitmap, block)
-	runEnd := min(uint64((block+1)*cowBlockSize), end)
-	for runEnd < end {
-		nextBlock := int64(runEnd) / cowBlockSize
-		if bitmapBlockDirty(s.bitmap, nextBlock) != dirty {
-			break
-		}
-		runEnd = min(uint64((nextBlock+1)*cowBlockSize), end)
-	}
-	kind := sparse.Hole
-	if dirty {
-		kind = sparse.Data
-	}
-	return fileDiffTemplateRun{source: s, offset: offset, end: runEnd, kind: kind}, nil
+	kind, end := s.diff.classify(offset, limit)
+	return fileDiffTemplateRun{source: s, offset: offset, end: end, kind: kind}, nil
 }
 
 type fileDiffTemplateRun struct {
@@ -905,36 +552,7 @@ func (s *fileDiffTemplate) ReadAt(ctx context.Context, buf []byte, offset uint64
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
-	if offset >= s.Size() {
-		return 0, io.EOF
-	}
-	n := len(buf)
-	var eof error
-	if uint64(n) > s.Size()-offset {
-		n = int(s.Size() - offset)
-		eof = io.EOF
-	}
-	written := 0
-	for written < n {
-		position := int64(offset) + int64(written)
-		block := position / cowBlockSize
-		blockEnd := min((block+1)*cowBlockSize, int64(offset)+int64(n))
-		chunk := buf[written : written+int(blockEnd-position)]
-		if bitmapBlockDirty(s.bitmap, block) {
-			read, err := s.diff.ReadAt(chunk, position)
-			written += read
-			if err != nil && !(errors.Is(err, io.EOF) && read == len(chunk)) {
-				return written, err
-			}
-			if read != len(chunk) {
-				return written, io.ErrUnexpectedEOF
-			}
-			continue
-		}
-		clear(chunk)
-		written += len(chunk)
-	}
-	return written, eof
+	return s.diff.ReadAt(buf, int64(offset))
 }
 
 func (s *fileDiffTemplate) Close() error { return s.diff.Close() }
@@ -958,9 +576,17 @@ func seedDiffTemplate(ctx context.Context, target diffBackend, source diffTempla
 				start = nextSeed
 			}
 			seedEnd := uint64(alignUp(int64(end), cowBlockSize))
-			for position := start; position < seedEnd; position += cowBlockSize {
+			for position := start; position < seedEnd; {
 				if err := ctx.Err(); err != nil {
 					return err
+				}
+				if kind == sparse.Zero && position >= offset && position+cowBlockSize <= end {
+					zeroEnd := min(end/cowBlockSize*cowBlockSize, position+64*cowBlockSize)
+					if err := target.discard(ctx, int64(position), int64(zeroEnd-position), false); err != nil {
+						return err
+					}
+					position = zeroEnd
+					continue
 				}
 				read, err := source.ReadAt(ctx, block, position)
 				if err != nil && !(errors.Is(err, io.EOF) && read == len(block)) {
@@ -976,6 +602,7 @@ func seedDiffTemplate(ctx context.Context, target diffBackend, source diffTempla
 				if written != len(block) {
 					return io.ErrShortWrite
 				}
+				position += cowBlockSize
 			}
 			nextSeed = seedEnd
 		}
