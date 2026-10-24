@@ -138,10 +138,9 @@ assert scratch.get('Base') and not scratch.get('Overlay'), scratch
 assert dataset_overlay and dataset_overlay.get('Base'), dataset
 PY
 
-# Empty uppers inherit the captured filesystem metadata and content. Formatting
-# these files here would intentionally destroy the snapshot-backed state.
-truncate -s 512M "$WORK/root-restore.ext4"
-truncate -s 256M "$WORK/dataset-restore.ext4"
+# Restore creates active DIFFs from the captured filesystem and capacity.
+test ! -e "$WORK/root-restore.ext4"
+test ! -e "$WORK/dataset-restore.ext4"
 cat >"$WORK/restore.yaml" <<EOF
 resources: { capacity: { cpu: 1, memory: 512MiB }, allocatable: { cpu: 1, memory: 512MiB } }
 network: { tap: $TAP_NAME, interface: eth0, ip: 169.254.1.1/31, hostname: snapshot-disks-r }
