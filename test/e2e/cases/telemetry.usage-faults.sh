@@ -137,7 +137,8 @@ def main():
         config = {"resources": {"capacity": {"cpu": 1, "memory": "512MiB"},
                                 "allocatable": {"cpu": 1, "memory": "512MiB", "deflate_on_oom": False}},
                   "boot": {"kernel": f"file://{BIN / 'vmlinux'}", "runtime": f"file://{BIN / 'sandbox-runtime.bundle'}",
-                           "root": {"base": ref, "overlay": {"diff_template": f"file://{diff}"}}},
+                           "root": {"base": ref, "overlay": {"diff_template": f"file://{diff}",
+                                                              "diff": f"file://{diff}.active"}}},
                   "launch": {"exec": "/probe", "args": ["cpu-ms", "200"] if name == "short" else ["wait"],
                              "restart": "never", "pid_namespace": "shared"},
                   "usage": {"enabled": True, "sample_interval": "1s", "flush_interval": "5s"}}
@@ -148,8 +149,11 @@ def main():
             ext4(restart_diff)
             restart_config = copy.deepcopy(config)
             restart_config["boot"]["root"]["overlay"]["diff_template"] = f"file://{restart_diff}"
+            restart_config["boot"]["root"]["overlay"]["diff"] = f"file://{restart_diff}.active"
         mount = None
         if name == "enospc":
+            # Only usage storage belongs on this tiny filesystem. The raw
+            # template and fresh active output above stay on the real disk.
             mount = work / "enospc-base"
             mount.mkdir()
             run("mount", "-t", "tmpfs", "-o", "size=256k", "tmpfs", mount)
