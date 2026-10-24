@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Measure actual 64 MiB template materialization: three rounds, raw/v1/v2/XTS."""
+"""Measure 64 MiB raw-template materialization under four active-DIFF policies."""
 import argparse
 import hashlib
 import json
