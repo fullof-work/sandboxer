@@ -3202,10 +3202,12 @@ and XTS modes. This distinguishes an empty List from an actually released reader
 The checkpoint case also writes a nonzero file into an immutable lower, unlinks
 it and executes Guest `fstrim`. Direct block-device reads verify zero after trim,
 local/historical/cross-directory restore, and portable publication/restore. Carrier
-inspection follows the exported layer chain: its first present layer must be Zero
-with no payload extent. An empty new active layer above that immutable Zero is
-valid; requiring the active layer itself to contain the mask would reject normal
-layer reuse. Both single-layer and checkpoint restore paths are exercised.
+inspection follows the exported layer chain: its first present layer must provide
+zero and mask the nonzero lower. Legacy tarstream stores explicit zero Data;
+tarstream's independent Zero optimization can omit that payload. Storage tests
+verify Zero before serialization; carrier tests own payload omission. An empty
+active layer above that immutable mask is valid. Both single-layer and checkpoint
+restore paths are exercised.
 
 Presence regressions cover allocated Data zeros, payload-free Zero, upper/base partial
 writes, accepted but unflushed overwrites, concurrent discard, cancellation,

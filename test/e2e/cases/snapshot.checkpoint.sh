@@ -142,7 +142,8 @@ position = json.load(open(sys.argv[3]))
 disk = next(d for d in config['Boot']['Disks'] if d['Name'] == 'scratch')
 assert disk.get('Overlay') is None, disk
 # A restored active layer can be Hole above an immutable Zero layer. Resolve
-# the real chain: its first present layer must omit payload and mask the seed.
+# the real chain: its first present layer must provide zero and mask the seed.
+# Legacy carriers store explicit zero Data; payload omission is independent.
 for layer, ref in enumerate([disk['Base']] + (disk.get('BaseFromRefs') or [])):
     name = ref.removeprefix('file://').split('@', 1)[0]
     assert name == pathlib.Path(name).name, ref
@@ -150,27 +151,37 @@ for layer, ref in enumerate([disk['Base']] + (disk.get('BaseFromRefs') or [])):
         members = carrier.getmembers()
         bitmaps = [m for m in members if m.name == '.kuasar.presence.v1']
         payloads = [m for m in members if m.isfile() and not m.name.startswith('.kuasar.')]
-        assert len(bitmaps) == len(payloads) == 1, members
-        metadata = carrier.extractfile(bitmaps[0]).read()
-        assert metadata[:8] == b'KUPRES1\n'
-        version, page, logical, bitmap_size = struct.unpack_from('<IIQQ', metadata, 8)
-        assert version == 1 and page == 4096 and len(metadata) == 64 + bitmap_size
-        assert zlib.crc32(metadata[:60] + metadata[64:]) == struct.unpack_from('<I', metadata, 60)[0]
-        offset = position['offset']
-        assert offset + page <= logical and offset % page == 0
-        block = offset // page
-        if not metadata[64 + block // 8] & (1 << (block % 8)):
-            continue
+        assert len(payloads) == 1 and len(bitmaps) <= 1, members
         payload = payloads[0]
-        assert payload.pax_headers['KUASAR.presence'] == '1'
-        assert payload.sparse is not None
-        assert all(length == 0 or start + length <= offset or start >= offset + page
-                   for start, length in payload.sparse), 'trimmed page became stored payload'
         payload.size = int(payload.pax_headers.get('GNU.sparse.realsize', payload.size))
+        page = 4096
+        offset = position['offset']
+        assert offset + page <= payload.size and offset % page == 0
+        extents = payload.sparse if payload.sparse is not None else [(0, payload.size)]
+        stored = sum(max(0, min(start + length, offset + page) - max(start, offset))
+                     for start, length in extents)
+        if bitmaps:
+            metadata = carrier.extractfile(bitmaps[0]).read()
+            assert metadata[:8] == b'KUPRES1\n'
+            version, page, logical, bitmap_size = struct.unpack_from('<IIQQ', metadata, 8)
+            assert version == 1 and page == 4096 and logical % page == 0
+            assert bitmap_size == (logical // page + 7) // 8
+            assert len(metadata) == 64 + bitmap_size and offset + page <= logical
+            assert zlib.crc32(metadata[:60] + metadata[64:]) == struct.unpack_from('<I', metadata, 60)[0]
+            assert payload.pax_headers['KUASAR.presence'] == '1'
+            block = offset // page
+            if not metadata[64 + block // 8] & (1 << (block % 8)):
+                assert stored == 0, 'payload in absent page'
+                continue
+        else:
+            assert 'KUASAR.presence' not in payload.pax_headers, 'missing presence entry'
+            if stored == 0:
+                continue
+            assert stored == page, 'partial lower mask'
         data = carrier.extractfile(payload)
         data.seek(offset)
         assert data.read(page) == bytes(page)
-        print(json.dumps({'offset': offset, 'presence': 1, 'payload_bytes': 0,
+        print(json.dumps({'offset': offset, 'presence': 1, 'payload_bytes': stored,
                           'carrier_bytes': (artifact.parent / name).stat().st_size,
                           'mask_layer': layer}))
         break
