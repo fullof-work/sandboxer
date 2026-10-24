@@ -48,8 +48,8 @@ ip link set "$TAP_NAME" up
 ROOT_IMAGE="$WORK/root.img"
 docker save "$E2E_IMAGE" | "$BIN/flatten-ctl" export --output "$ROOT_IMAGE" --no-progress
 [ -s "$ROOT_IMAGE" ] || e2e_fail "flatten produced an empty root artifact"
-truncate -s 512M "$WORK/root-up.ext4"
-mkfs.ext4 -q -F -O ^has_journal "$WORK/root-up.ext4"
+truncate -s 512M "$WORK/root-up.ext4.template"
+mkfs.ext4 -q -F -O ^has_journal "$WORK/root-up.ext4.template"
 truncate -s 256M "$WORK/scratch.ext4"
 mkfs.ext4 -q -F -O ^has_journal "$WORK/scratch.ext4"
 mkdir -p "$WORK/dataset-source"
@@ -71,7 +71,7 @@ boot:
   cmdline: "console=hvc0 printk.time=1"
   root:
     base: $ROOT_REF
-    overlay: { diff: file://$WORK/root-up.ext4 }
+    overlay: { diff: file://$WORK/root-up.ext4, diff_template: file://$WORK/root-up.ext4.template }
   disks:
     - { name: scratch, diff_template: file://$WORK/scratch.ext4 }
     - { name: dataset, base: $DATASET_REF, overlay: { diff_template: file://$WORK/dataset-up.ext4 } }

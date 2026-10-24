@@ -92,8 +92,8 @@ ROOT_REF="$(plaintext_tarstream_ref "$ROOT_IMAGE")"
 GUEST_MAC="02:00:00:00:80:01"
 
 mkdiff() {
-    truncate -s 1G "$1"
-    mkfs.ext4 -q -F -O ^has_journal "$1"
+    truncate -s 1G "$1.template"
+    mkfs.ext4 -q -F -O ^has_journal "$1.template"
 }
 
 write_config() {
@@ -118,7 +118,7 @@ EOF
   cmdline: "console=hvc0"
   root:
     base: $ROOT_REF
-    overlay: { diff: file://$diff }
+    overlay: { diff: file://$diff, diff_template: file://$diff.template }
 launch:
   args: ["-c", "import time; print('MTU='+open('/sys/class/net/eth0/mtu').read().strip(), flush=True); print('NETUP', flush=True); time.sleep(60)"]
   restart: never
@@ -182,7 +182,7 @@ SNAPSHOT="$SNAP_DIR/$SID.snapshot"
 [ -f "$SNAPSHOT" ] || e2e_fail "snapshot output is missing"
 
 DIFF1="$WORK/restore.diff"
-mkdiff "$DIFF1"
+# Restore creates its active DIFF from the captured disk graph.
 write_config "$WORK/restore.yaml" "$RESTORE_GUEST_IP" "$DIFF1" "$RESTORE_HOST_CIDR" 0
 SIDR="tapfd-restore-$BASHPID"
 RESTORE_LOG="$OUT/restore.log"

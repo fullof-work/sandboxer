@@ -89,8 +89,8 @@ new_cgroup() { # $1 = stable leaf label
 }
 
 make_diff() { # $1 = path
-    truncate -s 1G "$1"
-    mkfs.ext4 -q -F -O ^has_journal "$1"
+    truncate -s 1G "$1.template"
+    mkfs.ext4 -q -F -O ^has_journal "$1.template"
 }
 
 write_config() { # $1=path $2=cgroup $3=headroom $4=startup $5=diff
@@ -109,7 +109,7 @@ boot:
   cmdline: "console=hvc0 printk.time=1"
   root:
     base: $BLK0_REF
-    overlay: { diff: file://$diff }
+    overlay: { diff: file://$diff, diff_template: file://$diff.template }
 launch:
   exec: /usr/local/bin/python3
   args:
@@ -558,7 +558,7 @@ restore_case() { # $1=key $2=resident-floor-bytes
     stats="$RESULT_ROOT/$key-stats.json"
     mincore="$RESULT_ROOT/$key-restore.mincore"
     checksum="${CHECKSUMS[$key]}"
-    make_diff "$diff"
+    # Restore creates its active DIFF from the captured disk graph.
     # Omit the optional host startup policy here. Restore reserves the
     # Snapshot's captured BudgetAtSnapshot regardless of that policy.
     write_restore_config "$cfg" "$cgroup" "${HEADROOMS[$key]}" "$diff"

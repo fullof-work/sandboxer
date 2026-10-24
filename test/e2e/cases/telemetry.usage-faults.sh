@@ -137,7 +137,7 @@ def main():
         config = {"resources": {"capacity": {"cpu": 1, "memory": "512MiB"},
                                 "allocatable": {"cpu": 1, "memory": "512MiB", "deflate_on_oom": False}},
                   "boot": {"kernel": f"file://{BIN / 'vmlinux'}", "runtime": f"file://{BIN / 'sandbox-runtime.bundle'}",
-                           "root": {"base": ref, "overlay": {"diff": f"file://{diff}"}}},
+                           "root": {"base": ref, "overlay": {"diff_template": f"file://{diff}"}}},
                   "launch": {"exec": "/probe", "args": ["cpu-ms", "200"] if name == "short" else ["wait"],
                              "restart": "never", "pid_namespace": "shared"},
                   "usage": {"enabled": True, "sample_interval": "1s", "flush_interval": "5s"}}
@@ -147,7 +147,7 @@ def main():
             restart_diff = work / "kill-restarted.ext4"
             ext4(restart_diff)
             restart_config = copy.deepcopy(config)
-            restart_config["boot"]["root"]["overlay"]["diff"] = f"file://{restart_diff}"
+            restart_config["boot"]["root"]["overlay"]["diff_template"] = f"file://{restart_diff}"
         mount = None
         if name == "enospc":
             mount = work / "enospc-base"

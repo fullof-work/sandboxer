@@ -82,8 +82,8 @@ EOF
 ROOT_IMAGE="$WORK/root.img"
 docker save "$E2E_IMAGE" | "$BIN/flatten-ctl" export --output "$ROOT_IMAGE" --no-progress
 BLK0_REF="$(plaintext_tarstream_ref "$ROOT_IMAGE")"
-truncate -s 512M "$WORK/root-upper.ext4"
-mkfs.ext4 -q -F -O ^has_journal "$WORK/root-upper.ext4"
+truncate -s 512M "$WORK/root-upper.ext4.template"
+mkfs.ext4 -q -F -O ^has_journal "$WORK/root-upper.ext4.template"
 truncate -s 256M "$WORK/scratch-template.ext4"
 mkfs.ext4 -q -F -O ^has_journal "$WORK/scratch-template.ext4"
 
@@ -96,7 +96,7 @@ boot:
   cmdline: "console=hvc0 printk.time=1"
   root:
     base: $BLK0_REF
-    overlay: { diff: file://$WORK/root-upper.ext4 }
+    overlay: { diff: file://$WORK/root-upper.ext4, diff_template: file://$WORK/root-upper.ext4.template }
   disks:
     - { name: scratch, diff_template: file://$WORK/scratch-template.ext4 }
 mounts:
@@ -244,8 +244,6 @@ PY
 write_restore_yaml() {
     local output=$1 hostname=$2 root_diff=$3
     rm -f "$root_diff"
-    truncate -s 512M "$root_diff"
-    mkfs.ext4 -q -F -O ^has_journal "$root_diff"
     cat >"$output" <<EOF
 resources: { capacity: { cpu: 1, memory: 512MiB }, allocatable: { cpu: 1, memory: 512MiB } }
 network: { tap: $TAP_NAME, interface: eth0, ip: 169.254.1.1/31, hostname: $hostname }

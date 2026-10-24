@@ -79,8 +79,8 @@ ROOT_IMAGE="$WORK/root.img"
 docker save "$E2E_IMAGE" | "$BIN/flatten-ctl" export --output "$ROOT_IMAGE" --no-progress
 ROOT_REF=$(plaintext_tarstream_ref "$ROOT_IMAGE")
 ROOT_DIFF="$WORK/root.diff"
-truncate -s 1G "$ROOT_DIFF"
-mkfs.ext4 -q -F -O ^has_journal "$ROOT_DIFF"
+truncate -s 1G "$ROOT_DIFF.template"
+mkfs.ext4 -q -F -O ^has_journal "$ROOT_DIFF.template"
 
 cat >"$WORK/cold.yaml" <<EOF
 resources: { capacity: { cpu: 1, memory: 512MiB }, allocatable: { cpu: 1, memory: 512MiB } }
@@ -91,7 +91,7 @@ boot:
   cmdline: "console=hvc0 printk.time=1"
   root:
     base: $ROOT_REF
-    overlay: { diff: file://$ROOT_DIFF }
+    overlay: { diff: file://$ROOT_DIFF, diff_template: file://$ROOT_DIFF.template }
 launch:
   exec: /usr/local/bin/python3
   args: ["-c", "import os,time\nfd=os.open('/ticks.dat',os.O_RDWR|os.O_CREAT,0o644)\ni=0\nwhile True:\n os.pwrite(fd,('TICK%08d'%i).encode().ljust(4096,b'.'),i*4096); os.fsync(fd); blk0=os.pread(fd,12,0).decode(); print('TICK %d DISK blk0=%s'%(i,blk0),flush=True); i+=1; time.sleep(.10)"]
@@ -125,7 +125,6 @@ last_tick() {
 }
 write_host_config() {
     local path=$1 diff=$2 hostname=$3
-    truncate -s 1G "$diff"
     cat >"$path" <<EOF
 resources: { capacity: { cpu: 1, memory: 512MiB }, allocatable: { cpu: 1, memory: 512MiB } }
 network: { tap: $TAP_NAME, interface: eth0, ip: 169.254.1.1/31, hostname: $hostname }

@@ -158,8 +158,6 @@ wait_run_exit
 SNAPSHOT="$WORK/snapshot/$SID1.snapshot"
 [ -f "$SNAPSHOT" ] || e2e_fail "journal snapshot is missing"
 
-truncate -s 512M "$WORK/restored.ext4"
-mkfs.ext4 -q -F -O ^has_journal "$WORK/restored.ext4"
 cat >"$WORK/restore.yaml" <<EOF
 resources:
   capacity: {cpu: 1, memory: 512MiB}

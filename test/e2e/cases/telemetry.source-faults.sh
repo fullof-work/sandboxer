@@ -125,13 +125,13 @@ def filesystem_config(work, name, ref):
     config = {"resources": {"capacity": {"cpu": 1, "memory": "512MiB"},
                             "allocatable": {"cpu": 1, "memory": "512MiB", "deflate_on_oom": False}},
               "boot": {"kernel": f"file://{BIN / 'vmlinux'}", "runtime": f"file://{BIN / 'sandbox-runtime.bundle'}",
-                       "root": {"base": ref, "overlay": {"diff": f"file://{diff}"}}, "disks": []},
+                       "root": {"base": ref, "overlay": {"diff_template": f"file://{diff}"}}, "disks": []},
               "mounts": [], "launch": {"exec": "/probe", "args": ["wait"], "restart": "never", "pid_namespace": "shared"},
               "usage": {"enabled": True, "sample_interval": "1s", "flush_interval": "5s"}}
     for ordinal, target in enumerate(("/data", "/other")):
         disk = work / f"{name}-data-{ordinal}.ext4"
         ext4(disk)
-        config["boot"]["disks"].append({"name": f"data{ordinal}", "diff": f"file://{disk}"})
+        config["boot"]["disks"].append({"name": f"data{ordinal}", "diff_template": f"file://{disk}"})
         config["mounts"].append({"type": "disk", "source": f"data{ordinal}", "target": target})
     return config
 
@@ -827,7 +827,7 @@ def ch_case(work, ref, mode):
     config = {"resources": {"capacity": {"cpu": 1, "memory": "512MiB"},
                             "allocatable": {"cpu": 1, "memory": "256MiB", "deflate_on_oom": False}},
               "boot": {"kernel": f"file://{BIN / 'vmlinux'}", "runtime": f"file://{BIN / 'sandbox-runtime.bundle'}",
-                       "root": {"base": ref, "overlay": {"diff": f"file://{diff}"}}},
+                       "root": {"base": ref, "overlay": {"diff_template": f"file://{diff}"}}},
               "launch": {"exec": "/probe", "args": ["wait"], "restart": "never", "pid_namespace": "shared"},
               "usage": {"enabled": True, "sample_interval": "1s", "flush_interval": "5s"}}
     sb = Sandbox(work, f"ch-{mode}", config, ch_binary=LIB.joinpath("usage_ch_wrapper.py"))

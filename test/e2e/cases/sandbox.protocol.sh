@@ -53,8 +53,8 @@ ip link set "$TAP_NAME" up
 docker save "$E2E_IMAGE" | "$BIN/flatten-ctl" export --output "$BLK0_IMAGE" --no-progress
 [ -s "$BLK0_IMAGE" ] || e2e_fail "flatten produced an empty root artifact"
 BLK0_REF="$(plaintext_tarstream_ref "$BLK0_IMAGE")"
-truncate -s 1G "$DIFF_FILE"
-mkfs.ext4 -q -F -O ^has_journal "$DIFF_FILE"
+truncate -s 1G "$DIFF_FILE.template"
+mkfs.ext4 -q -F -O ^has_journal "$DIFF_FILE.template"
 
 cat >"$WORK/sandbox.yaml" <<EOF
 resources:
@@ -77,6 +77,7 @@ boot:
     base: $BLK0_REF
     overlay:
       diff: file://$DIFF_FILE
+      diff_template: file://$DIFF_FILE.template
 launch:
   args:
     - "-c"

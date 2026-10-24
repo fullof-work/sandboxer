@@ -52,8 +52,8 @@ ROOT_IMAGE="$WORK/root.img"
 docker save "$E2E_IMAGE" | "$BIN/flatten-ctl" export --output "$ROOT_IMAGE" --no-progress
 ROOT_REF=$(plaintext_tarstream_ref "$ROOT_IMAGE")
 SOURCE_DIFF="$WORK/source.diff"
-truncate -s 1G "$SOURCE_DIFF"
-mkfs.ext4 -q -F -O ^has_journal "$SOURCE_DIFF"
+truncate -s 1G "$SOURCE_DIFF.template"
+mkfs.ext4 -q -F -O ^has_journal "$SOURCE_DIFF.template"
 
 cat >"$WORK/source.yaml" <<EOF
 resources: { capacity: { cpu: 1, memory: 512MiB }, allocatable: { cpu: 1, memory: 512MiB } }
@@ -64,7 +64,7 @@ boot:
   cmdline: "console=hvc0 printk.time=1"
   root:
     base: $ROOT_REF
-    overlay: { diff: file://$SOURCE_DIFF }
+    overlay: { diff: file://$SOURCE_DIFF, diff_template: file://$SOURCE_DIFF.template }
 files:
   - { path: /etc/kuasar-persistent, content: declared }
 ephemeral_files:
@@ -145,7 +145,6 @@ SOURCE_PID=""
 run_from_export() {
     local artifact=$1 expected=$2 suffix=$3
     local diff="$WORK/from-$suffix.diff" cfg="$WORK/from-$suffix.yaml" log="$OUT/from-$suffix.log" clone="export-from-$suffix-$BASHPID"
-    truncate -s 1G "$diff"
     cat >"$cfg" <<EOF
 network: { tap: $TAP_NAME, interface: eth0, ip: 169.254.1.1/31, hostname: export-from-$suffix }
 boot:
