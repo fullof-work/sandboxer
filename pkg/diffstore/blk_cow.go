@@ -565,17 +565,19 @@ func (c *Disk) runMaterializer(ctx context.Context) {
 	c.bitmapMu.Lock()
 	c.materialResolved = nil
 	c.bitmapMu.Unlock()
+	// Publish failed health before waking waiters; report only after completion.
+	var report func(error)
+	if err != nil {
+		c.cache.mu.Lock()
+		report = c.cache.failLocked(fmt.Errorf("diffstore: diff template materialization: %w", err))
+		c.cache.mu.Unlock()
+	}
 	c.signalMaterialReady()
 	if done != nil {
 		close(done)
 	}
-	if err != nil {
-		c.cache.mu.Lock()
-		report := c.cache.failLocked(fmt.Errorf("diffstore: diff template materialization: %w", err))
-		c.cache.mu.Unlock()
-		if report != nil {
-			report(err)
-		}
+	if report != nil {
+		report(err)
 	}
 }
 
