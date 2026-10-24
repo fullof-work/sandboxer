@@ -14,7 +14,7 @@ source "$SANDBOXER_LIB/tarstream.sh"
 
 require_root
 require_kvm
-for command in docker dumpe2fs ip mkfs.ext4 timeout truncate; do
+for command in docker ip mkfs.ext4 python3 timeout; do
     require_command "$command"
 done
 for binary in sandbox-ctl flatten-ctl cloud-hypervisor; do
@@ -49,9 +49,21 @@ ROOT_REF="$(plaintext_tarstream_ref "$ROOT_IMAGE")"
 
 TEMPLATE="$WORK/basic.ext4"
 "$BIN/sandbox-ctl" diff create --output "$TEMPLATE" --size 512M >/dev/null
-FEATURES="$(LC_ALL=C dumpe2fs -h "$TEMPLATE" | sed -n 's/^Filesystem features: *//p')"
-[ -n "$FEATURES" ] || e2e_fail "could not read ext4 template features"
-[[ " $FEATURES " != *" has_journal "* ]] || e2e_fail "diff template unexpectedly contains an ext4 journal"
+# The provisioning template is a v3 DIFF; ext4 starts inside its data region.
+# Inspect the actual superblock without copying the whole sparse disk to raw.
+python3 - "$TEMPLATE" <<'PY'
+import struct, sys
+with open(sys.argv[1], 'rb') as f:
+    header = f.read(4096)
+    assert header[:8] == b'\x89KDXTS1\n', 'invalid DIFF magic'
+    assert struct.unpack_from('>H', header, 8)[0] == 3, 'not a v3 template'
+    assert struct.unpack_from('>I', header, 12)[0] == 0, 'template is not plaintext'
+    body = struct.unpack_from('>Q', header, 32)[0]
+    f.seek(body + 1024)
+    superblock = f.read(1024)
+assert len(superblock) == 1024 and struct.unpack_from('<H', superblock, 0x38)[0] == 0xef53, 'invalid ext4 superblock'
+assert not struct.unpack_from('<I', superblock, 0x5c)[0] & 4, 'diff template unexpectedly contains an ext4 journal'
+PY
 
 cat >"$WORK/sandbox.yaml" <<EOF
 resources:
