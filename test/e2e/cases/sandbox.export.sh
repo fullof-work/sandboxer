@@ -104,6 +104,14 @@ wait_exec "$SID" "$SOURCE_PID" "$SOURCE_LOG"
 C0="$RUN_ROOT/$SID/sandbox.runtime.cfg"
 [ -f "$C0" ] || e2e_fail "immutable C0 was not written"
 C0_SHA=$(sha256sum "$C0" | awk '{print $1}')
+# Guest readiness may precede lazy template materialization and atomic file
+# publication. Observe the published binding before checking its stability.
+for _ in $(seq 1 120); do
+    [ -f "$SOURCE_DIFF" ] && break
+    kill -0 "$SOURCE_PID" 2>/dev/null || { tail -80 "$SOURCE_LOG" >&2 || true; e2e_fail "source exited before DIFF publication"; }
+    sleep 1
+done
+[ -f "$SOURCE_DIFF" ] || e2e_fail "source DIFF was not published"
 DIFF_BINDING=$(stat -Lc '%d:%i' "$SOURCE_DIFF")
 assert_live_baseline() {
     local phase=$1
