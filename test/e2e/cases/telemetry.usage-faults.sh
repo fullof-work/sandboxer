@@ -25,6 +25,7 @@ ENOSPC is real bounded tmpfs exhaustion. Write errors and blocked writes are
 explicit syscall injection, not hardware failure or a power-loss experiment.
 """
 import atexit
+import copy
 import errno
 import json
 import os
@@ -140,6 +141,13 @@ def main():
                   "launch": {"exec": "/probe", "args": ["cpu-ms", "200"] if name == "short" else ["wait"],
                              "restart": "never", "pid_namespace": "shared"},
                   "usage": {"enabled": True, "sample_interval": "1s", "flush_interval": "5s"}}
+        if name == "kill":
+            # Usage recovery does not require work-disk crash recovery. Prepare
+            # the next Guest's disk now to preserve the immediate restart path.
+            restart_diff = work / "kill-restarted.ext4"
+            ext4(restart_diff)
+            restart_config = copy.deepcopy(config)
+            restart_config["boot"]["root"]["overlay"]["diff"] = f"file://{restart_diff}"
         mount = None
         if name == "enospc":
             mount = work / "enospc-base"
@@ -190,7 +198,7 @@ def main():
                 write_json(sb.dir / "killed-saved.json", saved)
                 assert not saved["saved"]["snapshot"]["closed"]
                 assert int(metric(saved["saved"]["snapshot"], "counters", "guest.cpu")["known_total_ns"]) <= int(metric(live["live"], "counters", "guest.cpu")["known_total_ns"])
-                child = Sandbox(work, "kill-restarted", config, sandbox_id=name, base_root=sb.baseroot)
+                child = Sandbox(work, "kill-restarted", restart_config, sandbox_id=name, base_root=sb.baseroot)
                 try:
                     child.ready()
                     time.sleep(2)
