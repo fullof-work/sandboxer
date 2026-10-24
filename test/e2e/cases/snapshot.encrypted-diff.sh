@@ -163,7 +163,9 @@ assert_encrypted_diff() {
     magic=$(od -An -tx1 -N8 "$path" | tr -d ' \n')
     [ "$magic" = 894b44585453310a ] || e2e_fail "$path does not have the KDXTS1 header"
     physical=$(stat -c %s "$path")
-    [ "$physical" -eq $((logical + 4096)) ] || e2e_fail "$path lost encrypted length geometry"
+    [ "$(od -An -tx1 -j8 -N2 "$path" | tr -d ' \n')" = 0003 ] || e2e_fail "$path does not use single-layer DIFF v3"
+    local bitmap_pages=$(( (((logical / 4096 + 7) / 8) + 4059) / 4060 ))
+    [ "$physical" -eq $((logical + (1 + bitmap_pages) * 4096)) ] || e2e_fail "$path lost encrypted length geometry"
     read -r blocks block_size < <(stat -c '%b %B' "$path")
     allocated=$((blocks * block_size))
     [ "$allocated" -lt "$physical" ] || e2e_fail "$path lost sparse-body semantics"

@@ -189,12 +189,15 @@ wait_active_diffs() {
 wait_active_diffs 120 "$ROOT_DIFF" "$SCRATCH_DIFF" "$DATASET_DIFF"
 
 assert_diff() {
-    local path=$1 logical=$2 magic physical blocks block_size allocated
+    local path=$1 logical=$2 magic physical blocks block_size allocated version bitmap_pages
     [ -f "$path" ] || e2e_fail "missing active diff: $path"
     magic=$(od -An -tx1 -N8 "$path" | tr -d ' \n')
     [ "$magic" = 894b44585453310a ] || e2e_fail "$path does not have the KDXTS1 header"
+    version=$(od -An -tx1 -j8 -N2 "$path" | tr -d ' \n')
+    [ "$version" = 0003 ] || e2e_fail "$path does not use single-layer DIFF v3"
     physical=$(stat -c %s "$path")
-    [ "$physical" -eq $((logical + 4096)) ] || e2e_fail "$path is not length-preserving plus its 4KiB header"
+    bitmap_pages=$(( (((logical / 4096 + 7) / 8) + 4059) / 4060 ))
+    [ "$physical" -eq $((logical + (1 + bitmap_pages) * 4096)) ] || e2e_fail "$path has invalid header/presence/body geometry"
     read -r blocks block_size < <(stat -c '%b %B' "$path")
     allocated=$((blocks * block_size))
     [ "$allocated" -lt "$physical" ] || e2e_fail "$path lost sparse-body semantics"
