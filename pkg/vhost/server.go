@@ -26,8 +26,10 @@ type Backend interface {
 	WriteAt(buf []byte, offset int64) (int, error)
 	// Flush checks health; COW uses the documented non-durable no-op.
 	Flush() error
-	// Discard hints that a range is no longer needed (may be no-op).
+	// Discard removes complete pages and masks the lower layer with zero.
 	Discard(offset, length int64) error
+	// SupportsDiscard is immutable for the backend's lifetime.
+	SupportsDiscard() bool
 	// Size returns the visible block-device size in bytes.
 	Size() int64
 	// ReadOnly reports whether writes are disallowed.
@@ -45,6 +47,7 @@ func (b *ReadOnlyBackend) Flush() error                       { return nil }
 func (b *ReadOnlyBackend) Discard(offset, length int64) error { return nil }
 func (b *ReadOnlyBackend) Size() int64                        { return b.R.Size() }
 func (b *ReadOnlyBackend) ReadOnly() bool                     { return true }
+func (b *ReadOnlyBackend) SupportsDiscard() bool              { return false }
 
 // CowBackend wraps a BlockCOW.
 type CowBackend struct{ C *diffstore.Disk }
@@ -52,9 +55,10 @@ type CowBackend struct{ C *diffstore.Disk }
 func (b *CowBackend) ReadAt(buf []byte, offset int64) (int, error)  { return b.C.ReadAt(buf, offset) }
 func (b *CowBackend) WriteAt(buf []byte, offset int64) (int, error) { return b.C.WriteAt(buf, offset) }
 func (b *CowBackend) Flush() error                                  { return b.C.Flush() }
-func (b *CowBackend) Discard(offset, length int64) error            { return b.C.Discard(offset, length) }
+func (b *CowBackend) Discard(offset, length int64) error            { return b.C.Discard(offset, length, false) }
 func (b *CowBackend) Size() int64                                   { return b.C.Size() }
 func (b *CowBackend) ReadOnly() bool                                { return false }
+func (b *CowBackend) SupportsDiscard() bool                         { return true }
 func (b *CowBackend) BackendStats() map[string]any                  { return b.C.BackendStats() }
 
 // ErrReadOnly is returned by WriteAt on a read-only backend.
@@ -64,12 +68,13 @@ var ErrReadOnly = fmt.Errorf("vhost: backend is read-only")
 // hypervisor master connects exactly once; on disconnect, the server
 // reaps virtq workers and stops.
 type Server struct {
-	socketPath  string
-	backend     Backend
-	logf        func(format string, args ...any)
-	stats       *Stats
-	ctx         context.Context
-	onReadFatal func(error)
+	socketPath       string
+	backend          Backend
+	logf             func(format string, args ...any)
+	stats            *Stats
+	ctx              context.Context
+	onReadFatal      func(error)
+	discardSupported bool // fixed at device construction, including pooled devices
 
 	// unified-memfd invariant (docs/cloud-hypervisor.md §3.1): SET_MEM_TABLE must arrive with
 	// fds whose inode matches memfdInode; mmapBytes are sub-slices of
@@ -131,11 +136,12 @@ func NewServer(socketPath string, backend Backend, logf func(format string, args
 		logf = func(string, ...any) {}
 	}
 	return &Server{
-		socketPath: socketPath,
-		backend:    backend,
-		logf:       logf,
-		queues:     make([]*virtq, NumQueues),
-		stop:       make(chan struct{}),
+		socketPath:       socketPath,
+		backend:          backend,
+		discardSupported: !backend.ReadOnly() && backend.SupportsDiscard(),
+		logf:             logf,
+		queues:           make([]*virtq, NumQueues),
+		stop:             make(chan struct{}),
 	}
 }
 
@@ -545,14 +551,15 @@ const (
 	bitProtocolConfig = uint64(1) << 9
 )
 
-// advertisedFeatures is the fixed minimal device profile. Do not advertise
-// optional features merely because their config fields exist on the wire.
-// Existing snapshots keep this same feature set; inactive config bytes do
-// not require a new snapshot version or renegotiation.
+// Existing snapshots may restore any supported subset. In particular, an old
+// GuestSnapshot keeps its saved features without gaining DISCARD on restore.
 func (s *Server) advertisedFeatures() uint64 {
 	feats := bitVirtioVersion1 | bitVhostProtocolFeatures | bitVirtioBlkFlush
 	if s.backend.ReadOnly() {
 		feats |= bitVirtioBlkRO
+	}
+	if s.discardSupported {
+		feats |= bitVirtioBlkDiscard
 	}
 	return feats
 }
@@ -619,10 +626,14 @@ func (s *Server) handleGetConfig(conn *net.UnixConn, m *Message) error {
 		return SendReply(conn, m.Header.Request, nil)
 	}
 
-	// The pinned CH frontend reads the full 60-byte wire layout. Only
-	// capacity is active in our profile; all feature-gated bytes are zero.
+	// The pinned CH frontend reads the full 60-byte wire layout.
 	// GET flags are echoed, including CH's normal WRITABLE request flag.
 	cfg := BlkConfig{Capacity: uint64(s.backend.Size()) / SectorSize}
+	if s.discardSupported {
+		cfg.MaxDiscSec = maxDiscardSectors
+		cfg.MaxDiscSeg = 1
+		cfg.DiscSecAln = 8
+	}
 	full := cfg.Marshal()
 	out := make([]byte, configHeaderSize+int(size))
 	copy(out[:configHeaderSize], m.Payload[:configHeaderSize])

@@ -603,8 +603,9 @@ sandbox-ctl snapshot --path-id worker --checkpoint cp-001 --json
 `PathID` 默认等于 `SandboxID`。`--config`、`--from` 和 `--restore` 都沿用
 `CheckpointDir = BaseRoot/PathID/checkpoint`；根盘和数据盘的可写文件位于
 `CheckpointDir/diffs/<DiffID>.diff`，正常退出后保留。不增加第二个启动目录配置。
-新启动分配新的磁盘身份。已有 raw/v1 可写 DIFF 不会被隐式接管；需要其内容时按模板
-导入。显式指定派生目录之外的可写路径，或文件系统不支持所需锁操作，会在启动前失败。
+新启动分配新的磁盘身份。已有 raw/v1/v2 工作文件及模板被拒绝；升级前用旧程序导出，
+再把便携制品恢复到新文件。显式指定派生目录之外的可写路径，或文件系统不支持所需锁
+操作，会在启动前失败。
 
 启用后端不会改变默认捕获：不带 `--checkpoint` 的 snapshot/export 仍复制磁盘内容。
 非空 `--checkpoint` 在同一捕获屏障内为全部可写磁盘创建这个 ID。允许
@@ -685,10 +686,10 @@ SDK 使用同一契约：`RuntimeSpec.EnableCheckpoint`、`RunOptions.EnableChec
 块层的 `Disk.Checkpoint(ctx, id)`、`ListCheckpoints(ctx)`、
 `DeleteCheckpoint(ctx, id)` 和 `Export(ctx, id)` 使用 `vhost.CheckpointID`。
 命名 `Export` 返回持有 reader pin 的 sparse source 和 closer，用完后必须关闭。
-`Export(ctx, vhost.ActiveDiff)` 则要求调用者保持活动磁盘静止。raw/v1 后端的
+`Export(ctx, vhost.ActiveDiff)` 则要求调用者保持活动磁盘静止。单层 v3 后端的
 命名版本操作返回 `vhost.ErrCheckpointUnsupported`。
 
-Checkpoint DIFF v2 每盘使用一个本地文件保存稀疏 4 KiB 映射及保留根；物理文件长度
+Checkpoint DIFF v4 每盘使用一个本地文件保存稀疏 4 KiB 映射及保留根；物理文件长度
 不是磁盘容量。Hole 向下读取不可变 base，显式写零覆盖 lower 数据。加密沿用本地
 crypto policy 和进程 customer key；读取磁盘内容需要 key，列举/删除元数据不解密
 guest 数据。目录只有一个 writer owner，固定版本的独立 read pin 可与恢复后的活动
@@ -697,29 +698,18 @@ guest 数据。目录只有一个 writer owner，固定版本的独立 read pin 
 可能增加索引和数据 COW。不承诺整个 pause 恒定耗时、所有负载都更快，也不扩大既有
 FLUSH 契约之外的宿主崩溃或掉电 guest 数据持久性保证。
 
-重开已有 v2 DIFF 时按需确认上层块是否存在。Open 返回之前仍会完成 writer 所有权、
-身份/密钥/容量检查、已提交 redo 重放、根节点校验及当前 Checkpoint 元数据健康检查；
-同目录继续运行不再等待全量索引
-扫描。未知块与空洞严格区分。读取及部分写入按最多 256 个块（1 MiB）的范围查询当前
-索引。完整页覆盖也会在发布缓存内容前校验未知元数据，但不读取旧 payload；Discard
-在移除映射前同样校验未知范围。
-已接受的写入和 discard 优先于索引查询结果。
-查询还会沿有界的边缘路径校验相关前驱/后继子树的边界，即使页校验和有效，也拒绝
-不一致的相邻边界。发现索引错误会进入 fatal 状态，不会回退读 base。
-因此子节点损坏可能在首次访问时
-发现，而非 Open 时发现。
-这只检查已访问路径及相邻边界，不是全树检查。未遍历子树中的任意逻辑损坏可能延后
-到访问相应路径或完整扫描时才发现；按需 Open 不等于全树完整性审计。
+重开 v4 DIFF 会加载完整的 presence 位图 P，每个逻辑 4 KiB 页占一位，
+32 GiB 可写容量上限对应最多 1 MiB 净位图。P=0 是 Hole，向下读取 base；
+P=1 且没有 payload 是 Zero，遮蔽 base；P=1 且有 payload 是 Data。
+已接受的缓存写入也算 Data。普通写零仍保存为 Data，不扫描或压缩零内容。
+Open 返回前仍校验所有权、身份/密钥/容量、已提交 redo、根及当前 Checkpoint，
+但不扫描整棵 B+ 树。信任不存在结果之前会校验访问的映射及相邻子树边界；
+发现损坏进入 fatal 状态，不能返回 Zero 或回退 base。未访问子树的损坏可能延后发现。
 
-没有全盘后台预热。首次访问未知范围需要支付索引查询成本，其影响取决于访问局部性
-和存储延迟。在已有 presence 位图之外，每个逻辑 4 KiB 块增加一个已知状态位
-（30 GiB 磁盘约增加 0.94 MiB）。`diff_presence_complete` 为 false 时，
-`diff_dirty_blocks` 和 `diff_dirty_percent` 是下界；`diff_presence_known_blocks`
-表示已确认范围。全新 DIFF 和 raw/v1 仍提供精确计数。普通 `SnapshotView` 和活动层
-导出在提供空洞信息前通过完整索引遍历补齐剩余 presence，因此扫描成本可能转移到
-这个已静止的操作。补齐使用一份临时位图，枚举已映射 key，而非稀疏磁盘的每个逻辑范围。
-命名捕获/导出不依赖此位图。历史或跨目录恢复仍需物化选定版本，按需 presence
-不会消除这部分成本。
+原未知状态位图及恢复扫描已移除。Open 后 presence 覆盖完整，dirty-block 统计按 P
+计数，包括 Zero 页。导出通过有界查询区分物理 Data；命名导出持有不可变根及 P 副本，
+活动导出包含已接受但尚未回写的缓存内容。历史/跨目录恢复仍需物化选定版本，
+完整 Zero 页保留为无 payload 的状态。这不消除模板、解密及 Data 复制成本。
 
 恢复来源读者是临时资源。同目录热恢复和冷启动（CLI、SDK `Start` 以及
 `StartRuntime` + `Launch`）持有完整来源集合，直到根盘和每个数据盘 writer 全部打开
@@ -1230,18 +1220,17 @@ COW base 属于可写 ext4 upper，不是只读 EROFS 镜像。这些规则同�
 这些键；无关配置字段和不透明的 metadata 不受影响。
 
 对于新建的可丢弃 ext4 工作盘（overlay upper、单盘 root，以及 scratch 或数据盘测试
-文件），使用 `mkfs.ext4 -O ^has_journal` 格式化稀疏模板，避免文件系统 journal
+文件），使用 `sandbox-ctl diff create` 创建 v3 模板，避免文件系统 journal
 占用及元数据日志写入；这不影响 journald 或应用日志。COW 不能替代 journal，
-此默认约定不承诺中断后工作盘的崩溃恢复。已有带 journal 的模板、用户自带镜像和
-快照继续兼容；guest sync/quiesce 与快照/恢复语义保持不变。不要为应用此建议而
+此默认约定不承诺中断后工作盘的崩溃恢复。带 journal 的新格式模板（`--journal`）及
+便携快照仍受支持；guest sync/quiesce 与快照/恢复语义保持不变。不要为应用此建议而
 重新格式化已有数据盘。
 
 对于一个**新建的**、空白的 512 MiB scratch 文件系统，可以准备新模板，使用时不再指定
 大小覆盖项：
 
 ```bash
-truncate -s 512M /tmp/scratch-512m.ext4
-mkfs.ext4 -F -O ^has_journal /tmp/scratch-512m.ext4
+sandbox-ctl diff create --output /tmp/scratch-512m.ext4 --size 512MiB
 ```
 
 ```yaml
@@ -1255,6 +1244,14 @@ mounts:
     type: disk
     source: scratch
 ```
+
+`diff create` 只接受新输出路径，默认创建含 ext4 的明文 v3 DIFF。`--directory DIR`
+为新文件系统填充初始文件，`--journal` 启用 journal。`--filesystem none` 创建全 Hole
+DIFF，供显式选择的恢复/lower 来源使用，本身不是已格式化的独立文件系统。
+容量必须为正数、4 KiB 对齐且不超过 32 GiB。命令内部生成私有 raw 文件系统，按已分配
+区间复制后移除，不导入旧工作文件。输出原子发布，拒绝替换包括空文件在内的任何已有
+路径。文件后缀不代表格式。新版运行时拒绝直接 `truncate`/`mkfs` 生成的 raw 文件及旧
+raw/v1/v2 DIFF/模板；升级前用旧程序导出便携制品，再恢复到新文件。
 
 必须使用新的活动 diff：已有 diff 优先，因此更换模板不会调整容量或替换已有数据。
 不要通过截断已有文件系统来实施更小的限制。Sandboxer 不会自动调整文件系统大小，
@@ -2343,7 +2340,8 @@ Worker 通过有界页索引收集同文件连续脏邻居，不要求到达顺�
 
 健康且合法的 guest **FLUSH 是 no-op**，不发起回写、不等待脏页、不调用 Drain、fsync 或
 fdatasync。请求顺序和 fatal 状态检查保留。为兼容 Cloud Hypervisor 快照，保留现有 wire
-features；不增加 CONFIG_WCE 或 wire discard。
+features。新建可写设备公布 DISCARD，只读设备不公布；不增加 CONFIG_WCE 或
+WRITE_ZEROES。参见 [Guest discard ABI](sandbox-init_zh.md#guest-block-discard)。
 
 写入完成仅承诺完整最新字节已进入有界逻辑 COW 状态。写入与 FLUSH 都不保证
 `sandbox-ctl` 崩溃、宿主断电或存储故障后的数据存续。这明确不同于
@@ -2361,8 +2359,8 @@ Direct I/O 本身也不是持久化屏障。
 新目标在 **seeding 前**完成上述初始化；已有活动文件校验、运行与快照读取使用同一路径。
 运行时代码不检查文件系统类型、名称、挂载策略或文件系统专有 inode flags。
 Header/格式探测在并发 body I/O 前有界完成；template/base 保留 buffered/read-only 行为。
-明文与密文文件格式、固定 4 KiB 密文 header、本地加密 off/auto/required 策略和
-512 字节 XTS 数据单元编号不变。
+明文与密文分别采用单层 v3 或多版本 v4 格式，均含固定 4 KiB header 及带校验的 P 页。
+本地加密 off/auto/required 策略和 512 字节逻辑 XTS 数据单元编号不变。
 
 对已打开 fd 查询 `STATX_DIOALIGN`，区分 buffer 地址与 offset/length 约束。
 报告的正数约束必须满足工作区上限与 4 KiB COW 几何要求；偏移对齐必须整除 4096，
@@ -2382,7 +2380,7 @@ private heap/fork 风险。任意调用者切片和子页读取经过这些 buff
 缓存整页回写避免读改写。短写报错，不重试未对齐余下切片；参见
 [write(2)](https://man7.org/linux/man-pages/man2/write.2.html)。
 
-### 11.4.5 多版本 DIFF v2 存储与恢复
+### 11.4.5 多版本 DIFF v4 存储与恢复
 
 可选后端位于 [`pkg/diffstore/internal/versioned`](../pkg/diffstore/internal/versioned)。每个逻辑 4 KiB 块经
 B+ 树映射到物理槽。4 KiB 索引页包含 16 字节页头和最多 255 个 16 字节项；
@@ -2409,19 +2407,23 @@ B+ 树映射到物理槽。4 KiB 索引页包含 16 字节页头和最多 255 �
 
 | 物理页 | 内容 |
 | --- | --- |
-| 0 | 不可变 header：既有 DIFF magic、big-endian version 2 前缀、身份/容量和封装密钥 |
+| 0 | 不可变 header：既有 DIFF magic、big-endian version 4 前缀、身份/容量和封装密钥 |
 | 1 | 可变 control 页 |
 | 2 | redo commit descriptor |
 | 3–5 | redo home-address 索引，不是 B+ 索引页 |
 | 6–1541 | 最多 1,536 个已有元数据页镜像 |
+| 1600 起，最多 259 页 | 活动 P 位图，确切页数由容量决定 |
 | 2048 起 | 每组一页 descriptor，随后 128 个槽 |
 
-创建时预留 0–1541 页（6,316,032 字节），使新 payload 分配遇到空间不足时仍能写
+创建时预留 0–1541 页（6,316,032 字节）及活动 P 页，使新 payload 分配遇到空间不足时仍能写
 redo 和既有 control 页。初始稀疏文件长度为 8 MiB，不是 guest 容量。元数据页包含
 校验和；加密 header 使用 AES-GCM 封装随机 64 字节 XTS key，不可变 header 字段
-作为 associated data，并使用 v2 专用 header-key 派生域。
+作为 associated data，并使用 v4 专用 header-key 派生域。
 
-创建版本只登记活动根并推进 epoch，不扫描或复制 payload。出生时间晚于最新 retained
+创建版本原子登记活动根及独立完整 P 副本并推进 epoch，不扫描或复制 Data。
+P 副本最多使用 259 个普通分配记录；空闲槽碎片化时也使用原 redo 预算。Pin 同时保护
+根和 P。Delete 不回收 P 记录；有界 GC 持久化 P 副本的部分回收游标，将这些独占记录
+直接转入全局垃圾链，再结束已删除版本的待处理状态。出生时间晚于最新 retained
 epoch 的槽属于活动版本私有；反复覆盖可原位写入，不改索引、不产生元数据 redo。
 共享的数据槽及其共享索引路径通过 COW 保护。guest 写入修改明文 COW cache 之前，
 `MarkModified` 每个捕获周期先清除一次当前捕获标记；直接后端写入也执行相同屏障。
@@ -2480,9 +2482,11 @@ materializer 仍可完成工作，避免排空与模板物化互相等待。
 应列举并删除它们的精确身份，重试捕获时使用新 ID。仅客户端传输失败不能证明没有
 产物或版本提交。
 
-底层 Discard 在对完整块打洞并清除 upper 归属前，与写入及在途回写同步。部分边缘不变。
-Discard 使 base 再次可见，不是能遮蔽 base 的显式零。Wire profile 仍拒绝 DISCARD 和
-WRITE_ZEROES。写零仍物化 upper 数据，不能视为 hole。
+`Disk.Discard(offset, length, hole)` 与写入及在途回写同步，每批最多 64 个完整页，
+部分边缘保持原内容。内部 `hole=true` 清除 P 并显露 base；Guest `hole=false`
+移除 payload 并设置 P，以 Zero 遮蔽 base。每个成功批次还将模板回填标为已处理，
+包括原本没有内容的页。多个批次不是一次原子范围事务；冻结前取消及冻结后 sticky
+failure 沿用既有缓存协调规则。
 
 内部 `Drain` 等待已接受写入完成，不 fsync。普通 Close 停止新前台工作、取消额度等待、
 排空健康已接受写入、join I/O、清除明文并关闭文件。前台取消不取消健康后台回写。
@@ -2835,7 +2839,13 @@ artifact 测试覆盖精确发布后删除、Bundle/外部来源、重写、来�
 显式 Delete、继续写入、再次捕获、发布及便携产物恢复，从而区分 List 为空与读者
 已真正释放。
 
-按需 presence 回归覆盖已分配零页、未知上层/base 块的部分写入、已接受但未回写的
+Checkpoint 用例还先把非零文件写入不可变下层，再删除文件并执行 Guest `fstrim`。
+通过块设备直接读取，验证 trim、本地/历史/跨目录恢复及便携发布/恢复后仍为零。
+载体检查沿导出的分层引用链查找，要求第一个提供内容的层是没有 payload 区间的
+Zero。不可变 Zero 上方的新活动层可以为空；要求活动层本身必须保存掩码会错误拒绝
+正常的分层复用。单层与 Checkpoint 恢复路径均覆盖。
+
+presence 回归覆盖全量 P 加载、Zero 与已分配零页、上层/base 块的部分写入、已接受但未回写的
 整页覆盖、并发 discard、取消、sticky 索引故障及普通导出完整性。presence harness
 分别记录 Open/索引字节、首读、带延迟分位数的 1,024 次启动读取、重复热读及完整
 活动 `SnapshotView` 构建。应比较 Open 加首批负载的总时间，不能只比较 Open；这些
@@ -2854,18 +2864,34 @@ payload 的验证。
 性能 driver 记录主机、文件系统、构建身份、原始日志、前端及 checkpoint 的
 p50/p95/p99、包含最终 Drain 的吞吐、数据/索引/redo/GC 物理字节计数、cache hit
 及进程 CPU/RSS。工作集 64 MiB 大于 32 MiB COW cache；有意设计的 hot 用例为
-4 MiB。至少运行三轮，每轮覆盖两次工作集。plaintext v2 与 raw、encrypted v2 与
-v1 分别比较，并区分无版本、共享首写、已私有覆盖。这些命令提供复现方法，不代表
+4 MiB。至少运行三轮。覆盖用例每轮遍历工作集两次；`first-sequential` 和 `first-random`
+在新磁盘上每页只写一次。为便于主干对照，保留 `raw`、`v1`、`v2-*` 历史模式标签，
+候选分别使用 v3 明文、v3 XTS 和 v4。单层与 Checkpoint 的明文/XTS 分别比较，
+并区分无版本、共享首写、已私有覆盖。这些命令提供复现方法，不代表
 性能门槛或全部特权测试已经通过。
 
-模板驱动单独测量三轮全新 64 MiB raw、v1 XTS、v2 明文与 v2 XTS 初始化。
+以下配套探针区分内部 Hole discard 与 Guest Zero discard，并记录 trim 前、已删除
+Checkpoint 仍被读者固定、读者释放并完成 GC 后，以及复用后的实际分配空间：
+
+```bash
+go test ./pkg/diffstore -run '^$' -bench '^BenchmarkCheckpoint(Guest)?Discard$' -benchtime=3x
+go test ./pkg/diffstore/internal/versioned -run '^$' -bench '^BenchmarkCheckpointZeroRetention$' -benchtime=3x
+```
+
+Discard 记录进程 CPU、后端调用、位图/索引/redo 字节及结构提交数。版本化计数可能
+包含并发后台 GC。Hole 会改变 P；已有 Data 转为 Zero 时 P 保持为 1，无需重写位图。
+旧后端没有 Guest Zero discard，不能把它的 Hole 结果当作语义相同的操作。报告将
+读者保留空间及不变的文件长度与可回收 payload 分开。运行探针时避免并发执行产品
+E2E 或全量 race，并把原始结果保留在 PR/Issue。
+
+模板驱动单独测量三轮全新 64 MiB 单层明文/XTS 和 Checkpoint 明文/XTS 初始化。
 它记录 Open、Ready、Materialized 和总耗时，总耗时包含首次同步及正式发布，
 随后在计时窗口之外验证全量 payload SHA256。来源准备不计入耗时；进程峰值
 RSS 仍包含这部分准备阶段。
 
 规模 driver 在进入下一档前删除上一档历史，分别报告 checkpoint 注册、control 重开
-和 presence 重建；其中显式全扫描的耗时会随映射页数增长。v2 Disk 重开现在将
-这部分工作推迟到访问对应范围或后续普通活动层导出时执行。vhost helper
+和 presence 重建；其中显式全扫描的耗时会随映射页数增长。v4 Disk 重开加载 P，
+不再从树重建 presence；payload 查询仍有界。vhost helper
 在回写前固定恰好 32 个脏页（128 KiB），分别记录模板 readiness、Drain、最终
 materialization、元数据登记、捕获总耗时和重开。不使用 helper 时，登记样本的待写
 payload 为零。捕获总耗时不含最初 open 和 guest 写入准入，也不含 VM 内存捕获。

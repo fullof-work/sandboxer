@@ -32,6 +32,8 @@ func (m *memBackend) Flush() error                    { return nil }
 func (m *memBackend) Discard(off, length int64) error { return nil }
 func (m *memBackend) Size() int64                     { return int64(len(m.data)) }
 func (m *memBackend) ReadOnly() bool                  { return false }
+func (m *memBackend) SupportsDiscard() bool           { return true }
+func (m *memBackend) Close() error                    { return nil }
 func (m *memBackend) BackendStats() map[string]any    { return nil }
 
 // TestServer_AcceptsAfterMasterDisconnect verifies the regression fix

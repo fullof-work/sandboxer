@@ -342,7 +342,7 @@ func TestActiveReadProtectsSlotsAcrossMutationAndGC(t *testing.T) {
 	}
 	mutations := []func() error{
 		func() error { return s.WritePages(ctx, []Page{{127, pageFor(127, 202)}}) },
-		func() error { return s.Discard(ctx, 126*PageSize, PageSize) },
+		func() error { return s.Discard(ctx, 126*PageSize, PageSize, true) },
 		func() error { _, err := s.GC(ctx, 64); return err },
 	}
 	started := make(chan struct{}, len(mutations))

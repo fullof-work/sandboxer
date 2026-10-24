@@ -38,15 +38,9 @@ type checkpointDiff struct {
 
 func (d *checkpointDiff) ReadAt(p []byte, off int64) (int, error)  { return d.store.ReadAt(p, off) }
 func (d *checkpointDiff) WriteAt(p []byte, off int64) (int, error) { return d.store.WriteAt(p, off) }
-func (d *checkpointDiff) scan(ctx context.Context, visit func(uint64) error) error {
-	return d.store.Scan(ctx, visit)
-}
-func (d *checkpointDiff) presence(ctx context.Context, start uint64, present []bool) error {
-	return d.store.Presence(ctx, start, present)
-}
-func (d *checkpointDiff) markModified(ctx context.Context) error { return d.store.MarkModified(ctx) }
-func (d *checkpointDiff) Sync() error                            { return d.store.Sync() }
-func (d *checkpointDiff) err() error                             { return d.store.Err() }
+func (d *checkpointDiff) markModified(ctx context.Context) error   { return d.store.MarkModified(ctx) }
+func (d *checkpointDiff) Sync() error                              { return d.store.Sync() }
+func (d *checkpointDiff) err() error                               { return d.store.Err() }
 func (d *checkpointDiff) Close() error {
 	d.readMu.Lock()
 	defer d.readMu.Unlock()
@@ -132,13 +126,9 @@ func (d *diffFile) name() string {
 	return d.f.Name()
 }
 func (d *diffFile) cleanupWriteFailure(pages []pageWrite) error {
-	var err error
-	for _, p := range pages {
-		if p.Fresh {
-			err = errors.Join(err, d.punchHole(context.Background(), int64(p.Block)*cowBlockSize, cowBlockSize))
-		}
-	}
-	return err
+	d.direct.writeMu.Lock()
+	defer d.direct.writeMu.Unlock()
+	return d.cleanupWritesLocked(pages)
 }
 
 func (c *Disk) markModified(ctx context.Context) error {
@@ -156,6 +146,23 @@ func (c *Disk) markModified(ctx context.Context) error {
 		return fatal
 	}
 	return nil
+}
+
+// Metadata corruption is sticky in the checkpoint backend. A foreground read
+// can discover it before the writeback worker; notify the shared runtime owner
+// immediately through the same fatal path, without poisoning ordinary cancels.
+func (c *Disk) propagateBackendFailure(err error) error {
+	if err == nil || c.diff.err() == nil {
+		return err
+	}
+	c.cache.mu.Lock()
+	report := c.cache.failLocked(err)
+	fatal := c.cache.err
+	c.cache.mu.Unlock()
+	if report != nil {
+		report(fatal)
+	}
+	return fatal
 }
 
 type CheckpointID string
@@ -336,14 +343,11 @@ func (c *Disk) Export(ctx context.Context, id CheckpointID) (ExportView, error) 
 		ctx = context.Background()
 	}
 	if id == ActiveDiff {
-		reader, holes, err := c.activeView(ctx)
+		reader, _, err := c.activeView(ctx)
 		if err != nil {
 			return nil, err
 		}
-		source, err := sparse.NewSource(reader, uint64(c.size), holes)
-		if err != nil {
-			return nil, err
-		}
+		source := &activeSource{reader: reader}
 		return &activeExportView{source: source, size: uint64(c.size)}, nil
 	}
 	d, err := c.checkpointBackend()
@@ -430,6 +434,39 @@ func (c *Disk) materializeRange(ctx context.Context, template diffTemplateSource
 			return err
 		}
 		offset = next
+	}
+	return nil
+}
+
+// A full template Zero is a logical mask and needs no payload allocation.
+// Frontend changes and earlier discards win under the same stripe locks.
+func (c *Disk) materializeZero(ctx context.Context, start, end uint64) error {
+	for first := int64(start) / cowBlockSize; first < int64(end)/cowBlockSize; first += maxDiscardPages {
+		last := min(first+maxDiscardPages, int64(end)/cowBlockSize) - 1
+		c.lockBlockRange(first, last)
+		var err error
+		for block := first; block <= last; {
+			if c.blockDirty(block) || c.materialBlockResolved(block) {
+				block++
+				continue
+			}
+			next := block + 1
+			for next <= last && !c.blockDirty(next) && !c.materialBlockResolved(next) {
+				next++
+			}
+			err = c.cache.discard(ctx, c, block, next-1, false)
+			if err != nil {
+				break
+			}
+			for b := block; b < next; b++ {
+				c.markMaterialResolved(b)
+			}
+			block = next
+		}
+		c.unlockBlockRange(first, last)
+		if err != nil {
+			return err
+		}
 	}
 	return nil
 }

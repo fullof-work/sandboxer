@@ -110,7 +110,7 @@ func TestDiskBackendPublicContract(t *testing.T) {
 						t.Fatal("empty named ID accepted")
 					}
 				}
-				if err := disk.Discard(4096, 4096); err != nil {
+				if err := disk.Discard(4096, 4096, true); err != nil {
 					t.Fatal(err)
 				}
 				if _, err := disk.ReadAt(got, 0); err != nil {

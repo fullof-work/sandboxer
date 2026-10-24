@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/kuasar-sandbox/sandboxer/pkg/diffstore/internal/presence"
 	"golang.org/x/crypto/xts"
 	"golang.org/x/sys/unix"
 )
@@ -54,15 +55,17 @@ type control struct {
 	Tx        uint64
 }
 type checkpoint struct {
-	ID       string
-	Epoch    uint64
-	Root     uint64
-	Next     uint64
-	Previous uint64
-	Garbage  uint64
-	Visible  bool
-	Retained bool
-	Pending  bool
+	ID         string
+	Epoch      uint64
+	Root       uint64
+	Next       uint64
+	Previous   uint64
+	Garbage    uint64
+	Visible    bool
+	Retained   bool
+	Pending    bool
+	Bitmap     uint64 // head of the exclusive presence-copy chain
+	BitmapDone uint64 // durable GC cursor; live checkpoints always have zero
 }
 
 const (
@@ -71,6 +74,7 @@ const (
 	kindIndex
 	kindCheckpoint
 	kindGarbage
+	kindBitmap
 )
 
 type descriptor struct{ Birth, Next, Kind uint64 }
@@ -129,7 +133,7 @@ func decodeJSON(b []byte, kind string, v any) error {
 }
 func wrapCipher(key *[32]byte) (cipher.AEAD, error) {
 	mac := hmac.New(sha256.New, key[:])
-	mac.Write([]byte("kuasar/diff/header-key/aes-gcm/v2\x00"))
+	mac.Write([]byte("kuasar/diff/header-key/aes-gcm/v4\x00"))
 	raw := mac.Sum(nil)
 	defer clear(raw)
 	block, err := aes.NewCipher(raw)
@@ -178,7 +182,7 @@ func createHeader(o Options) ([]byte, *xts.Cipher, error) {
 	}
 	b := make([]byte, PageSize)
 	copy(b, magic[:])
-	binary.BigEndian.PutUint16(b[8:], 2)
+	binary.BigEndian.PutUint16(b[8:], 4)
 	binary.BigEndian.PutUint16(b[10:], 16)
 	if o.Key != nil {
 		binary.BigEndian.PutUint32(b[12:], 1)
@@ -195,8 +199,8 @@ func validateInfo(i Info) error {
 	if len(i.DiffID) == 0 || len(i.DiffID) > 128 || filepath.Base(i.DiffID) != i.DiffID || i.DiffID == "." || i.DiffID == ".." {
 		return fmt.Errorf("diffstore: invalid DIFF identity")
 	}
-	if i.LogicalSize <= 0 || i.LogicalSize%PageSize != 0 {
-		return fmt.Errorf("diffstore: invalid logical capacity")
+	if err := presence.ValidateSize(i.LogicalSize); err != nil {
+		return err
 	}
 	if len(i.BaseID) > 2048 {
 		return fmt.Errorf("diffstore: base identity too long")
@@ -204,14 +208,14 @@ func validateInfo(i Info) error {
 	return nil
 }
 func parseHeader(b []byte, key *[32]byte, metadata bool) (Info, *xts.Cipher, error) {
-	if len(b) < 16 || !bytes.Equal(b[:8], magic[:]) || binary.BigEndian.Uint16(b[8:]) != 2 {
+	if len(b) < 16 || !bytes.Equal(b[:8], magic[:]) || binary.BigEndian.Uint16(b[8:]) != 4 {
 		return Info{}, nil, ErrFormat
 	}
 	if err := checkPage(b); err != nil {
 		return Info{}, nil, err
 	}
 	if binary.BigEndian.Uint16(b[10:]) != 16 || binary.BigEndian.Uint32(b[12:]) > 1 {
-		return Info{}, nil, fmt.Errorf("diffstore: invalid v2 prefix")
+		return Info{}, nil, fmt.Errorf("diffstore: invalid v4 prefix")
 	}
 	n := int(le.Uint32(b[16:]))
 	if n > PageSize-24 {
@@ -324,15 +328,24 @@ func Create(path string, o Options) (*Store, error) {
 		return fail(err)
 	}
 	ctrl := control{Next: 1, Epoch: 1}
-	b, _ := encodeJSON("KDCONT2", ctrl)
+	b, _ := encodeJSON("KDCONT4", ctrl)
 	if err = writeFull(f, b, 1); err != nil {
 		return fail(err)
 	}
 	if err = writeFull(f, make([]byte, PageSize), logCommitPage); err != nil {
 		return fail(err)
 	}
+	bitmap := make([]byte, presence.Bytes(o.LogicalSize))
+	if err = unix.Fallocate(int(f.Fd()), unix.FALLOC_FL_KEEP_SIZE, int64(presenceAreaPage)*PageSize, int64(presence.Pages(o.LogicalSize))*PageSize); err != nil {
+		return fail(err)
+	}
+	for i := 0; i < presence.Pages(o.LogicalSize); i++ {
+		if err = writeFull(f, presence.Encode(bitmap, o.LogicalSize, i), presenceAreaPage+uint64(i)); err != nil {
+			return fail(err)
+		}
+	}
 	info, _, _ := parseHeader(h, nil, true)
-	s := &Store{file: f, lock: lock, lockPath: lockPath, info: info, cipher: xc, ctrl: ctrl, cache: newCache(cachePages)}
+	s := &Store{presence: bitmap, file: f, lock: lock, lockPath: lockPath, info: info, cipher: xc, ctrl: ctrl, cache: newCache(cachePages)}
 	s.startGC()
 	return s, nil
 }
@@ -374,7 +387,7 @@ func openStore(path string, o Options, metadata bool) (*Store, error) {
 	if err = ofd(lock, unix.F_WRLCK, metadataByte, true); err != nil {
 		return fail(err)
 	}
-	records, err := readRedo(f, nil)
+	records, err := readRedo(f, nil, info.LogicalSize)
 	if err == nil {
 		for _, r := range records {
 			if err = writeFull(f, r.data, r.page); err != nil {
@@ -390,7 +403,7 @@ func openStore(path string, o Options, metadata bool) (*Store, error) {
 	}
 	var ctrl control
 	if err == nil {
-		err = decodeJSON(b, "KDCONT2", &ctrl)
+		err = decodeJSON(b, "KDCONT4", &ctrl)
 	}
 	unlock := ofd(lock, unix.F_UNLCK, metadataByte, false)
 	if err == nil {
@@ -406,6 +419,10 @@ func openStore(path string, o Options, metadata bool) (*Store, error) {
 		return fail(fmt.Errorf("diffstore: invalid control generation"))
 	}
 	s := &Store{file: f, lock: lock, lockPath: lockPath, info: info, cipher: xc, ctrl: ctrl, cache: newCache(cachePages), metadataOnly: metadata}
+	s.presence, err = loadPresence(s.readPage, info.LogicalSize)
+	if err != nil {
+		return fail(err)
+	}
 	// Read only the root before exposing a data owner. Full presence discovery
 	// is on demand; replay, identity and this minimum tree check still finish
 	// synchronously. Metadata-only cleanup remains possible for a damaged tree.
@@ -448,7 +465,7 @@ func (s *Store) readCheckpoint(slot uint64, t *transaction) (checkpoint, error) 
 		return checkpoint{}, err
 	}
 	var cp checkpoint
-	err = decodeJSON(b, "KDCP2", &cp)
+	err = decodeJSON(b, "KDCP4", &cp)
 	return cp, err
 }
 

@@ -116,8 +116,7 @@ ROOT_REF="$(key_bound_ref "$ROOT_PLAIN" "$WORK/root.encrypted")"
 DATASET_REF="$(key_bound_ref "$WORK/dataset.plain" "$WORK/dataset.encrypted")"
 
 make_template() {
-    truncate -s "$2" "$1"
-    mkfs.ext4 -q -F -O ^has_journal "$1"
+    "$BIN/sandbox-ctl" diff create --output "$1" --size "$2" >/dev/null
 }
 make_template "$WORK/root-template.ext4" 512M
 make_template "$WORK/scratch-template.ext4" 256M
@@ -163,7 +162,9 @@ assert_encrypted_diff() {
     magic=$(od -An -tx1 -N8 "$path" | tr -d ' \n')
     [ "$magic" = 894b44585453310a ] || e2e_fail "$path does not have the KDXTS1 header"
     physical=$(stat -c %s "$path")
-    [ "$physical" -eq $((logical + 4096)) ] || e2e_fail "$path lost encrypted length geometry"
+    [ "$(od -An -tx1 -j8 -N2 "$path" | tr -d ' \n')" = 0003 ] || e2e_fail "$path does not use single-layer DIFF v3"
+    local bitmap_pages=$(( (((logical / 4096 + 7) / 8) + 4059) / 4060 ))
+    [ "$physical" -eq $((logical + (1 + bitmap_pages) * 4096)) ] || e2e_fail "$path lost encrypted length geometry"
     read -r blocks block_size < <(stat -c '%b %B' "$path")
     allocated=$((blocks * block_size))
     [ "$allocated" -lt "$physical" ] || e2e_fail "$path lost sparse-body semantics"

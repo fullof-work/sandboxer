@@ -52,8 +52,7 @@ ROOT_IMAGE="$WORK/root.img"
 docker save "$E2E_IMAGE" | "$BIN/flatten-ctl" export --output "$ROOT_IMAGE" --no-progress
 ROOT_REF=$(plaintext_tarstream_ref "$ROOT_IMAGE")
 SOURCE_DIFF="$WORK/source.diff"
-truncate -s 1G "$SOURCE_DIFF"
-mkfs.ext4 -q -F -O ^has_journal "$SOURCE_DIFF"
+"$BIN/sandbox-ctl" diff create --output "$SOURCE_DIFF" --size 1G >/dev/null
 
 cat >"$WORK/source.yaml" <<EOF
 resources: { capacity: { cpu: 1, memory: 512MiB }, allocatable: { cpu: 1, memory: 512MiB } }
@@ -145,7 +144,7 @@ SOURCE_PID=""
 run_from_export() {
     local artifact=$1 expected=$2 suffix=$3
     local diff="$WORK/from-$suffix.diff" cfg="$WORK/from-$suffix.yaml" log="$OUT/from-$suffix.log" clone="export-from-$suffix-$BASHPID"
-    truncate -s 1G "$diff"
+    "$BIN/sandbox-ctl" diff create --output "$diff" --size 1G --filesystem none >/dev/null
     cat >"$cfg" <<EOF
 network: { tap: $TAP_NAME, interface: eth0, ip: 169.254.1.1/31, hostname: export-from-$suffix }
 boot:

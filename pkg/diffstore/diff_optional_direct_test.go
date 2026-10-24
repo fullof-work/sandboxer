@@ -17,17 +17,11 @@ func optionalDirectFixture(t *testing.T, encrypted bool) *diffFile {
 	if err != nil {
 		t.Fatal(err)
 	}
-	d := &diffFile{f: f, bodyIO: f, logicalSize: 3 * cowBlockSize}
+	var codec *diffEncryption
 	if encrypted {
-		codec, e := newDiffEncryption(testDiffKey(27))
-		if e != nil {
-			_ = f.Close()
-			t.Fatal(e)
-		}
-		d, err = createEncryptedDiffFile(f, 3*cowBlockSize, codec, rand.Reader)
-	} else {
-		err = f.Truncate(d.logicalSize)
+		codec = mustDiffEncryption(t, testDiffKey(27))
 	}
+	d, err := createDiffFile(f, 3*cowBlockSize, codec, rand.Reader)
 	if err != nil {
 		_ = f.Close()
 		t.Fatal(err)

@@ -15,6 +15,7 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
+	"github.com/kuasar-sandbox/sandboxer/pkg/diffstore"
 	"github.com/kuasar-sandbox/sandboxer/pkg/sandboxfile"
 	"github.com/kuasar-sandbox/sandboxer/pkg/snapshot"
 	"github.com/kuasar-sandbox/sandboxer/pkg/snapshotfile"
@@ -91,7 +92,15 @@ func TestPreflightRestoreDiskGraphRejectsUnformattedActiveDiff(t *testing.T) {
 		t.Fatal(err)
 	}
 	diffPath := filepath.Join(dir, "active.diff")
-	if err := os.WriteFile(diffPath, make([]byte, len(ext4)), 0o600); err != nil {
+	d, err := diffstore.OpenDisk(diffPath, nil, diffstore.DiffInit{CreateSize: int64(len(ext4))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.WriteAt(make([]byte, len(ext4)), 0); err != nil {
+		d.Close()
+		t.Fatal(err)
+	}
+	if err := d.Close(); err != nil {
 		t.Fatal(err)
 	}
 	cfg := &config.SandboxConfig{Boot: config.BootConfig{Root: config.RootConfig{

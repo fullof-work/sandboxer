@@ -3,6 +3,7 @@ package versioned
 import (
 	"context"
 	"fmt"
+	"github.com/kuasar-sandbox/sandboxer/pkg/diffstore/internal/presence"
 	"hash/crc32"
 	"io"
 	"sort"
@@ -19,7 +20,7 @@ type node struct {
 
 func encodeNode(n node) []byte {
 	b := make([]byte, PageSize)
-	copy(b, "KDBTREE2")
+	copy(b, "KDBTREE4")
 	le.PutUint16(b[8:], uint16(len(n.entries)))
 	if n.leaf {
 		b[10] = 1
@@ -36,7 +37,7 @@ func encodeNode(n node) []byte {
 	return b
 }
 func decodeNode(b []byte) (node, error) {
-	if len(b) != PageSize || string(b[:8]) != "KDBTREE2" {
+	if len(b) != PageSize || string(b[:8]) != "KDBTREE4" {
 		return node{}, fmt.Errorf("diffstore: invalid B+ page")
 	}
 	h := crc32.NewIEEE()
@@ -74,18 +75,25 @@ func readNode(r pageReader, slot uint64) (node, error) {
 func inspectNode(r pageReader, slot uint64) (node, error) {
 	var cache *pageCache
 	var stats *Stats
+	var next, total uint64
 	switch source := r.(type) {
 	case storeReader:
 		cache = source.s.cache
 		stats = &source.s.stats
+		next, total = source.s.ctrl.Next, uint64(source.s.Size()/PageSize)
 	case *View:
 		cache = source.cache
+		next, total = source.next, source.Size()/PageSize
 	case *transaction:
 		if n, ok := source.nodes[slot]; ok {
 			return n, nil
 		}
 		cache = source.store.cache
 		stats = &source.store.stats
+		next, total = source.ctrl.Next, uint64(source.store.Size()/PageSize)
+	}
+	if next != 0 && (slot == 0 || slot >= next) {
+		return node{}, fmt.Errorf("diffstore: B+ slot outside allocation")
 	}
 	if cache != nil {
 		if n, ok := cache.getNode(slotPage(slot)); ok {
@@ -100,6 +108,15 @@ func inspectNode(r pageReader, slot uint64) (node, error) {
 		return node{}, err
 	}
 	n, err := decodeNode(b)
+	if err == nil && next != 0 {
+		// Validate once before caching the decoded node. A mapped page must
+		// not bypass the capacity/allocation checks merely because P is set.
+		for _, e := range n.entries {
+			if e.key >= total || e.slot >= next {
+				return node{}, fmt.Errorf("diffstore: B+ entry outside capacity or allocation")
+			}
+		}
+	}
 	if err == nil && cache != nil {
 		cache.putNode(slotPage(slot), n)
 	}
@@ -410,10 +427,25 @@ func (s *Store) WritePages(ctx context.Context, pages []Page) error {
 				}
 				unique[p.Block] = p.Data
 			}
+			checked := append([]uint64(nil), order...)
+			sort.Slice(checked, func(i, j int) bool { return checked[i] < checked[j] })
+			for i := 0; i < len(checked); {
+				j := i + 1
+				for j < len(checked) && checked[j] == checked[j-1]+1 {
+					j++
+				}
+				if err := s.validatePayloadRange(ctx, checked[i], checked[j-1]+1); err != nil {
+					return err
+				}
+				i = j
+			}
 			// Reserve the batch's data slots before allocating any B+ pages. This
 			// keeps unrelated logical pages physically adjacent whenever possible.
 			var mappings []entry
 			for _, block := range order {
+				if err := t.setPresence(block, true); err != nil {
+					return err
+				}
 				slot, err := lookup(t, t.ctrl.Root, block)
 				if err != nil {
 					return err
@@ -479,11 +511,22 @@ func (s *Store) ReadAt(p []byte, off int64) (int, error) {
 		block := uint64(pos / PageSize)
 		inner := int(pos % PageSize)
 		n := min(count-done, PageSize-inner)
+		if !presence.Has(s.presence, block) {
+			clear(p[done : done+n])
+			done += n
+			continue
+		}
 		slot, err := lookup(storeReader{s}, s.ctrl.Root, block)
 		if err != nil {
 			return done, s.fail(err)
 		}
 		if slot == 0 {
+			// Only an absence answer needs the neighboring subtree checks.
+			// Eagerly validating later pages would lose a readable prefix when
+			// lookahead encounters corruption in a different leaf.
+			if err := s.validatePayloadRange(context.Background(), block, block+1); err != nil {
+				return done, err
+			}
 			clear(p[done : done+n])
 			done += n
 			continue
@@ -494,6 +537,9 @@ func (s *Store) ReadAt(p []byte, off int64) (int, error) {
 		pages := 1
 		var lookupErr error
 		for pages < 256 && pages*PageSize-inner < count-done {
+			if !presence.Has(s.presence, block+uint64(pages)) {
+				break
+			}
 			var next uint64
 			next, lookupErr = lookup(storeReader{s}, s.ctrl.Root, block+uint64(pages))
 			if lookupErr != nil || next == 0 || slotPage(next) != slotPage(slot)+uint64(pages) {
@@ -528,7 +574,7 @@ func (s *Store) Scan(ctx context.Context, visit func(uint64) error) error {
 	}
 	return s.scanActive(ctx, s.ctrl.Root, 0, uint64(s.Size()/PageSize)-1, 0, visit)
 }
-func (s *Store) Discard(ctx context.Context, off, length int64) error {
+func (s *Store) Discard(ctx context.Context, off, length int64, hole bool) error {
 	if off < 0 || length < 0 || off%PageSize != 0 || length%PageSize != 0 || off > s.Size() || length > s.Size()-off {
 		return fmt.Errorf("diffstore: invalid discard range")
 	}
@@ -553,10 +599,16 @@ func (s *Store) Discard(ctx context.Context, off, length int64) error {
 			// A concurrent direct caller may checkpoint after the optimistic
 			// MarkModified call. Publish invalidation with this mapping change.
 			t.ctrl.Current = 0
+			if err := s.validatePayloadRange(ctx, uint64(pos/PageSize), uint64(end/PageSize)); err != nil {
+				return err
+			}
 			// mutate may retry after reservation pressure and foreground GC. Its
 			// closure must not advance the caller's range before a commit succeeds.
 			for current := pos; current < end; current += PageSize {
 				block := uint64(current / PageSize)
+				if err := t.setPresence(block, !hole); err != nil {
+					return err
+				}
 				slot, err := lookup(t, t.ctrl.Root, block)
 				if err != nil {
 					return err

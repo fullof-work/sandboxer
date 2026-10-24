@@ -48,8 +48,7 @@ trap cleanup EXIT
 docker save "$E2E_IMAGE" | "$BIN/flatten-ctl" export --output "$WORK/root.img" --no-progress
 ROOT_REF="$(plaintext_tarstream_ref "$WORK/root.img")"
 for disk in root scratch dataset; do
-    truncate -s 256M "$WORK/$disk.ext4"
-    mkfs.ext4 -q -F -O ^has_journal "$WORK/$disk.ext4"
+    "$BIN/sandbox-ctl" diff create --output "$WORK/$disk.ext4" --size 256M >/dev/null
 done
 cat >"$WORK/cold.yaml" <<EOF
 resources: { capacity: { cpu: 1, memory: 512MiB }, allocatable: { cpu: 1, memory: 512MiB } }
@@ -130,6 +129,54 @@ PY
 check_hashes() {
     guest /bin/sh -c 'sha256sum /checkpoint-payload /scratch/checkpoint-payload /data/checkpoint-payload' >"$OUT/$1.hashes"
     cmp "$OUT/original.hashes" "$OUT/$1.hashes"
+    guest python3 -c "$(cat "$E2E_LIB/sandboxer/trim_probe.py")" check >"$OUT/$1.trim.json"
+}
+check_exported_trim() {
+    local artifact=$1 label=$2
+    "$BIN/sandbox-ctl" info --json "$artifact" >"$OUT/$label.info.json"
+    python3 - "$artifact" "$OUT/$label.info.json" "$OUT/trim-seed.json" >"$OUT/$label.payload.json" <<'PY'
+import json, pathlib, struct, sys, tarfile, zlib
+artifact = pathlib.Path(sys.argv[1])
+config = json.load(open(sys.argv[2]))
+position = json.load(open(sys.argv[3]))
+disk = next(d for d in config['Boot']['Disks'] if d['Name'] == 'scratch')
+assert disk.get('Overlay') is None, disk
+# A restored active layer can be Hole above an immutable Zero layer. Resolve
+# the real chain: its first present layer must omit payload and mask the seed.
+for layer, ref in enumerate([disk['Base']] + (disk.get('BaseFromRefs') or [])):
+    name = ref.removeprefix('file://').split('@', 1)[0]
+    assert name == pathlib.Path(name).name, ref
+    with tarfile.open(artifact.parent / name) as carrier:
+        members = carrier.getmembers()
+        bitmaps = [m for m in members if m.name == '.kuasar.presence.v1']
+        payloads = [m for m in members if m.isfile() and not m.name.startswith('.kuasar.')]
+        assert len(bitmaps) == len(payloads) == 1, members
+        metadata = carrier.extractfile(bitmaps[0]).read()
+        assert metadata[:8] == b'KUPRES1\n'
+        version, page, logical, bitmap_size = struct.unpack_from('<IIQQ', metadata, 8)
+        assert version == 1 and page == 4096 and len(metadata) == 64 + bitmap_size
+        assert zlib.crc32(metadata[:60] + metadata[64:]) == struct.unpack_from('<I', metadata, 60)[0]
+        offset = position['offset']
+        assert offset + page <= logical and offset % page == 0
+        block = offset // page
+        if not metadata[64 + block // 8] & (1 << (block % 8)):
+            continue
+        payload = payloads[0]
+        assert payload.pax_headers['KUASAR.presence'] == '1'
+        assert payload.sparse is not None
+        assert all(length == 0 or start + length <= offset or start >= offset + page
+                   for start, length in payload.sparse), 'trimmed page became stored payload'
+        payload.size = int(payload.pax_headers.get('GNU.sparse.realsize', payload.size))
+        data = carrier.extractfile(payload)
+        data.seek(offset)
+        assert data.read(page) == bytes(page)
+        print(json.dumps({'offset': offset, 'presence': 1, 'payload_bytes': 0,
+                          'carrier_bytes': (artifact.parent / name).stat().st_size,
+                          'mask_layer': layer}))
+        break
+else:
+    raise AssertionError('trim lost its lower mask through the complete chain')
+PY
 }
 assert_list() {
     local path=$1 expected=$2
@@ -198,13 +245,26 @@ for path in paths:
 PY
 }
 
-start cold "$PATH_ID" --config "$WORK/cold.yaml" --enable-checkpoint
+# Establish a portable nonzero lower first. A later Guest trim must mask that
+# lower through both local Checkpoint and portable export/restore paths.
+start trim-seed "seed-$PATH_ID" --config "$WORK/cold.yaml"
 guest /bin/sh -c 'set -e; for f in /checkpoint-payload /scratch/checkpoint-payload /data/checkpoint-payload; do dd if=/dev/urandom of="$f" bs=1048576 count=16 2>/dev/null; done; sync'
+guest python3 -c "$(cat "$E2E_LIB/sandboxer/trim_probe.py")" seed >"$OUT/trim-seed.json"
+"$BIN/sandbox-ctl" export --path-id "$CURRENT_PATH" --run-root "$RUN_ROOT" --resume \
+    --output "$WORK/trim-lower" >"$OUT/trim-lower.log" 2>&1
+stop_run
+start cold "$PATH_ID" --config "$WORK/restore.yaml" --from "$WORK/trim-lower/$SID.sandbox" --enable-checkpoint
+guest python3 -c "$(cat "$E2E_LIB/sandboxer/trim_probe.py")" trim >"$OUT/trim-completed.json"
+# Keep the historical-GC fixture in the active DIFF as well as in its lower.
+# In-place overwrite preserves allocated file extents, so it cannot reuse the
+# trimmed probe's free block and invalidate the later raw-zero observation.
+guest /bin/sh -c 'set -e; for f in /checkpoint-payload /scratch/checkpoint-payload /data/checkpoint-payload; do dd if=/dev/urandom of="$f" bs=1048576 count=16 conv=notrunc 2>/dev/null; done; sync'
 guest /bin/sh -c 'sha256sum /checkpoint-payload /scratch/checkpoint-payload /data/checkpoint-payload' >"$OUT/original.hashes"
 
 # Enabling the backend does not turn an ordinary export into a local version.
 "$BIN/sandbox-ctl" export --path-id "$PATH_ID" --run-root "$RUN_ROOT" --resume \
     --output "$WORK/ordinary" >"$OUT/ordinary.log" 2>&1
+check_exported_trim "$WORK/ordinary/$SID.sandbox" ordinary-trim
 python3 - "$WORK/ordinary/$SID.sandbox" <<'PY'
 import sys, tarfile, zipfile
 with tarfile.open(sys.argv[1]) as carrier:
@@ -312,6 +372,9 @@ stop_run
 # A different PathID also materializes versions, with checkpoint mode on or off.
 start cross-directory cross-slot --config "$WORK/restore.yaml" --restore "$S_B" --enable-checkpoint
 check_hashes cross-directory
+"$BIN/sandbox-ctl" export --path-id "$CURRENT_PATH" --run-root "$RUN_ROOT" --resume \
+    --output "$WORK/cross-trim" >"$OUT/cross-trim.log" 2>&1
+check_exported_trim "$WORK/cross-trim/$SID.sandbox" cross-trim
 assert_no_restore_pins "$CP_DIR"
 capture snapshot cross-d
 finish_capture
@@ -323,6 +386,9 @@ check_hashes cross-recapture
 stop_run
 start mode-disabled legacy-slot --config "$WORK/restore.yaml" --restore "$S_B"
 check_hashes mode-disabled
+"$BIN/sandbox-ctl" export --path-id "$CURRENT_PATH" --run-root "$RUN_ROOT" --resume \
+    --output "$WORK/single-trim" >"$OUT/single-trim.log" 2>&1
+check_exported_trim "$WORK/single-trim/$SID.sandbox" single-trim
 assert_no_restore_pins "$CP_DIR"
 set +e
 "$BIN/sandbox-ctl" export --path-id "$CURRENT_PATH" --run-root "$RUN_ROOT"     --checkpoint unsupported --resume >"$OUT/unsupported.log" 2>&1

@@ -89,8 +89,7 @@ new_cgroup() { # $1 = stable leaf label
 }
 
 make_diff() { # $1 = path
-    truncate -s 1G "$1"
-    mkfs.ext4 -q -F -O ^has_journal "$1"
+    "$BIN/sandbox-ctl" diff create --output "$1" --size 1G >/dev/null
 }
 
 write_config() { # $1=path $2=cgroup $3=headroom $4=startup $5=diff

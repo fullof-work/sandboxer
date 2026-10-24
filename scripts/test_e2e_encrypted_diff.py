@@ -77,8 +77,8 @@ touch "$ROOT_DIFF" "$SCRATCH_DIFF" "$DATASET_DIFF"
     def test_valid_sparse_header_geometry_still_passes(self):
         setup = '''
 for path in "$ROOT_DIFF" "$SCRATCH_DIFF" "$DATASET_DIFF"; do
-    printf '\\211KDXTS1\\n' > "$path"
-    truncate -s 12288 "$path"
+    printf '\\211KDXTS1\\n\\000\\003' > "$path"
+    truncate -s 16384 "$path"
 done
 '''
         result, _ = self.run_case(setup, assertions='''
@@ -88,10 +88,12 @@ assert_diff "$DATASET_DIFF" 8192
 ''')
         self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_final_assertion_block_is_unchanged(self):
+    def test_final_assertions_include_presence_geometry(self):
         suffix = SOURCE[SOURCE.index('assert_diff() {'):]
-        self.assertEqual(hashlib.sha256(suffix.encode()).hexdigest(),
-                         '95ae89125d09aed81cdfa6f46a021b9785c9dc1dc3632298b3ada80b5cb47629')
+        for assertion in ['[ "$version" = 0003 ]', 'bitmap_pages', 'logical + (1 + bitmap_pages) * 4096',
+                          '[ "$allocated" -lt "$physical" ]', 'ROOT_TEMPLATE_SHA',
+                          'SCRATCH_TEMPLATE_SHA', 'DATASET_TEMPLATE_SHA', '[ "$HEADERS" -eq 3 ]']:
+            self.assertIn(assertion, suffix)
 
     def test_production_budget_and_assertions_remain_wired(self):
         self.assertIn('wait_active_diffs 120 "$ROOT_DIFF" "$SCRATCH_DIFF" "$DATASET_DIFF"', SOURCE)

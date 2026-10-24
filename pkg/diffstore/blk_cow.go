@@ -18,11 +18,8 @@ import (
 // plaintext page. Reads prefer latest cached data; only misses reach the diff.
 // First partial writes materialize from base/zeros. A shared bounded cache
 // asynchronously writes frozen full pages. Block stripes serialize frontend
-// access; the worker never acquires them. Reopened v2 diffs resolve unknown
-// presence from the index on demand; raw/v1 rebuild presence from extents.
-//
-// The vhost profile does not advertise DISCARD or WRITE_ZEROES and rejects
-// those wire requests. The low-level Discard helper has hole semantics below.
+// access; the worker never acquires them. Both formats load their complete
+// capacity-sized presence bitmap before accepting frontend operations.
 type Disk struct {
 	opMu      sync.RWMutex // lifetime of frontend operations; never taken by writeback
 	lifeCtx   context.Context
@@ -36,8 +33,7 @@ type Disk struct {
 	versions  *checkpointDiff
 	size      int64
 	bitmapMu  sync.RWMutex
-	bitmap    []uint64 // each bit = one 4K block; meaningful when known
-	known     []uint64 // nil means all presence is known (raw/v1 or a fresh diff)
+	bitmap    []uint64 // each bit = logical presence of one 4 KiB block
 	blockMu   []sync.RWMutex
 	blockSize int64
 
@@ -61,8 +57,8 @@ const (
 )
 
 // OpenDisk opens or atomically creates the active diff described by init,
-// pairs it with the optional base, and resolves logical upper presence. Existing
-// v2 diffs start with unknown presence instead of scanning the whole index.
+// pairs it with the optional base, and loads logical upper presence without
+// scanning the checkpoint payload index.
 //
 // If base is nil, reads to clean blocks return zeros. A supplied base is borrowed:
 // the caller keeps it open through Disk.Close and remains responsible for closing it.
@@ -75,15 +71,14 @@ func OpenDisk(diffPath string, base BlockReader, init DiffInit, rawOptions ...Di
 	var diff diffBackend
 	var fresh *freshDiffInit
 	var bitmap []uint64
-	var known []uint64
 	if options.checkpoint != nil {
 		diff, fresh, err = openCheckpointDiff(diffPath, init, options)
 		if err != nil {
 			return nil, err
 		}
-		bitmap = make([]uint64, int((diff.Size()/cowBlockSize+63)/64))
-		if init.Existing {
-			known = make([]uint64, len(bitmap))
+		bitmap, err = diff.scanDirtyBlocks()
+		if err != nil {
+			return nil, errors.Join(err, diff.Close())
 		}
 	} else if !init.Existing && init.TemplatePath != "" {
 		fresh, err = createFreshDiffFile(diffPath, init, options.encryption)
@@ -120,7 +115,6 @@ func OpenDisk(diffPath string, base BlockReader, init DiffInit, rawOptions ...Di
 		diff:           diff,
 		size:           size,
 		bitmap:         bitmap,
-		known:          known,
 		blockMu:        make([]sync.RWMutex, cowLockStripes),
 		blockSize:      cowBlockSize,
 		discardOnClose: options.discardOnClose,
@@ -165,8 +159,8 @@ func OpenDisk(diffPath string, base BlockReader, init DiffInit, rawOptions ...Di
 	return cow, nil
 }
 
-// DirtyCount returns the number of known upper-present blocks. It is a lower
-// bound until BackendStats reports diff_presence_complete after a v2 reopen.
+// DirtyCount returns the exact number of upper-present blocks, including Zero
+// and accepted unflushed writes.
 func (c *Disk) DirtyCount() int {
 	dirty, _ := c.presenceCounts()
 	return dirty
@@ -178,19 +172,12 @@ func (c *Disk) presenceCounts() (dirty, known int) {
 	for _, w := range c.bitmap {
 		dirty += popcount64(w)
 	}
-	if c.known == nil {
-		known = int(c.size / c.blockSize)
-	} else {
-		for _, w := range c.known {
-			known += popcount64(w)
-		}
-	}
+	known = int(c.size / c.blockSize)
 	return dirty, known
 }
 
 // BackendStats reports cow-specific metrics. Implements StatsReporter.
-// Counts include accepted unflushed writes. After a v2 reopen the dirty count
-// and percentage are lower bounds until diff_presence_complete is true.
+// Counts include Zero and accepted unflushed writes; presence is complete at open.
 func (c *Disk) BackendStats() map[string]any {
 	dirty, known := c.presenceCounts()
 	total := c.size / c.blockSize
@@ -231,18 +218,12 @@ func (c *Disk) markDirty(blk int64) {
 	c.bitmapMu.Lock()
 	defer c.bitmapMu.Unlock()
 	c.bitmap[blk/64] |= 1 << (uint64(blk) % 64)
-	if c.known != nil {
-		c.known[blk/64] |= 1 << (uint64(blk) % 64)
-	}
 }
 
 func (c *Disk) markAbsent(blk int64) {
 	c.bitmapMu.Lock()
 	defer c.bitmapMu.Unlock()
 	c.bitmap[blk/64] &^= 1 << (uint64(blk) % 64)
-	if c.known != nil {
-		c.known[blk/64] |= 1 << (uint64(blk) % 64)
-	}
 }
 
 func (c *Disk) materialBlockResolved(blk int64) bool {
@@ -306,18 +287,14 @@ func (c *Disk) readRange(ctx context.Context, buf []byte, offset int64, bitmap [
 		c.runlockBlockRange(first, last)
 		done += n
 		if err != nil {
-			return done, err
+			return done, c.propagateBackendFailure(err)
 		}
 	}
 	return done, nil
 }
 
 func (c *Disk) readRangeLocked(ctx context.Context, buf []byte, offset int64, bitmap []uint64) (int, error) {
-	if bitmap == nil {
-		if err := c.resolvePresenceLocked(ctx, offset/cowBlockSize, (offset+int64(len(buf))-1)/cowBlockSize); err != nil {
-			return 0, err
-		}
-	}
+
 	done := 0
 	end := offset + int64(len(buf))
 	for done < len(buf) {
@@ -421,7 +398,7 @@ func (c *Disk) WriteAtContext(ctx context.Context, buf []byte, offset int64) (in
 		}
 		written += n
 		if err != nil {
-			return written, err
+			return written, c.propagateBackendFailure(err)
 		}
 	}
 	return written, nil
@@ -431,12 +408,7 @@ func (c *Disk) WriteAtContext(ctx context.Context, buf []byte, offset int64) (in
 // The worker never takes the caller's block stripe, including while it waits.
 func (c *Disk) writeBlockLocked(ctx context.Context, buf []byte, offset, blk int64) (int, error) {
 	start := blk * c.blockSize
-	// Validate unknown index metadata before accepting any mutation, including
-	// complete overwrites. Known blocks keep the fast path, and complete writes
-	// still initialize the cache page without reading the old payload.
-	if err := c.resolvePresenceLocked(ctx, blk, blk); err != nil {
-		return 0, err
-	}
+
 	upper := c.blockDirty(blk)
 	return c.cache.write(ctx, c, buf, offset, blk, upper, func(page []byte) error {
 		if offset == start && int64(len(buf)) == c.blockSize {
@@ -478,7 +450,19 @@ func (c *Disk) readLower(ctx context.Context, buf []byte, offset int64) (int, er
 			if err != nil && !errors.Is(err, io.EOF) {
 				return done, err
 			}
-			if err == nil && run.Kind() != sparse.Hole && run.Kind() != sparse.Zero {
+			if err == nil {
+				if run.End() <= uint64(pos) || run.End() > uint64(pos)+uint64(length) {
+					return done, fmt.Errorf("diffstore: invalid template run boundary")
+				}
+				length = int(run.End() - uint64(pos))
+				chunk = chunk[:length]
+				if run.Kind() == sparse.Zero {
+					clear(chunk)
+					done += length
+					continue
+				}
+			}
+			if err == nil && run.Kind() != sparse.Hole {
 				n, readErr := template.ReadAt(ctx, chunk, uint64(pos))
 				done += n
 				if readErr != nil && !(errors.Is(readErr, io.EOF) && n == len(chunk)) {
@@ -606,7 +590,12 @@ func (c *Disk) materializeTemplate(ctx context.Context) error {
 		if run.Kind() != sparse.Hole {
 			start := uint64(int64(offset) / cowBlockSize * cowBlockSize)
 			seedEnd := uint64(alignUp(int64(end), cowBlockSize))
-			if err := c.materializeRange(ctx, template, start, seedEnd, staging); err != nil {
+			if run.Kind() == sparse.Zero && offset%cowBlockSize == 0 && end%cowBlockSize == 0 {
+				err = c.materializeZero(ctx, start, seedEnd)
+			} else {
+				err = c.materializeRange(ctx, template, start, seedEnd, staging)
+			}
+			if err != nil {
 				return err
 			}
 		}
@@ -672,12 +661,10 @@ func (c *Disk) SetFatalHandler(report func(error)) { c.cache.SetFatalHandler(rep
 // Drain is an internal completion boundary, not a guest durability operation.
 func (c *Disk) Drain(ctx context.Context) error { return c.cache.drain(ctx, c) }
 
-// Discard punches complete blocks in the diff and clears their dirty bits.
-// Subsequent reads fall through to the base, or return zeros without a base;
-// this helper does not create an explicit zero that masks lower-layer data.
-// Partial edge blocks retain their contents. The current vhost dispatcher
-// does not call this helper: DISCARD and WRITE_ZEROES requests are unsupported.
-func (c *Disk) Discard(offset, length int64) error {
+// Discard removes payload for fully covered pages. hole=true reverts to the
+// lower layer; hole=false publishes an explicit Zero that masks the lower layer.
+// Partial edge pages retain their original contents.
+func (c *Disk) Discard(offset, length int64, hole bool) error {
 	ctx, endOp, err := c.begin(nil)
 	if err != nil {
 		return err
@@ -707,11 +694,7 @@ func (c *Disk) Discard(offset, length int64) error {
 	for first := startBlk; first < endBlk; first += maxDiscardPages {
 		last := min(first+maxDiscardPages, endBlk) - 1
 		c.lockBlockRange(first, last)
-		// A discarded mapping must pass the same metadata validation as a write.
-		err := c.resolvePresenceLocked(ctx, first, last)
-		if err == nil {
-			err = c.cache.discard(ctx, c, first, last)
-		}
+		err := c.cache.discard(ctx, c, first, last, hole)
 		if err == nil {
 			for blk := first; blk <= last; blk++ {
 				c.markMaterialResolved(blk)
@@ -769,11 +752,7 @@ func (c *Disk) activeView(ctx context.Context) (*cowSnapshotReaderAt, []sparse.E
 		return nil, nil, err
 	}
 	defer c.end(endOp)
-	// Ordinary exports need exact holes. Enumerate remaining presence before
-	// copying the bitmap; named checkpoints do not take this path.
-	if err := c.resolveAllPresence(ctx); err != nil {
-		return nil, nil, err
-	}
+
 	c.bitmapMu.RLock()
 	bitmap := append([]uint64(nil), c.bitmap...)
 	c.bitmapMu.RUnlock()
@@ -903,6 +882,9 @@ func (c *Disk) Size() int64 { return c.size }
 // AfterFunc only runs on Close; runtime queue cancellation remains independent
 // from the cache worker, which must drain healthy accepted writes.
 func (c *Disk) begin(ctx context.Context) (context.Context, func(), error) {
+	if ctx != nil && ctx.Err() != nil {
+		return nil, nil, ctx.Err()
+	}
 	c.opMu.RLock()
 	if err := c.Err(); err != nil {
 		c.opMu.RUnlock()

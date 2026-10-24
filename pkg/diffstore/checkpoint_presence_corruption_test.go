@@ -69,7 +69,7 @@ func corruptCheckpointPresenceBoundary(t *testing.T, path, mode string, encrypte
 	}
 	rootPage := func() (int64, []byte) {
 		control := readPage(cowBlockSize)
-		if string(control[:7]) != "KDCONT2" {
+		if string(control[:7]) != "KDCONT4" {
 			t.Fatal("unexpected control page")
 		}
 		var fields struct{ Root uint64 }
@@ -82,7 +82,7 @@ func corruptCheckpointPresenceBoundary(t *testing.T, path, mode string, encrypte
 		}
 		offset := slotOffset(fields.Root)
 		page := readPage(offset)
-		if string(page[:8]) != "KDBTREE2" || page[10] != 0 || binary.LittleEndian.Uint16(page[8:]) < 2 {
+		if string(page[:8]) != "KDBTREE4" || page[10] != 0 || binary.LittleEndian.Uint16(page[8:]) < 2 {
 			t.Fatal("fixture must have an internal root with neighboring leaves")
 		}
 		return offset, page
@@ -107,7 +107,7 @@ func corruptCheckpointPresenceBoundary(t *testing.T, path, mode string, encrypte
 		}
 		offset = slotOffset(binary.LittleEndian.Uint64(page[40:]))
 		page = readPage(offset)
-		if string(page[:8]) != "KDBTREE2" || page[10] != 1 || binary.LittleEndian.Uint64(page[16:]) <= target {
+		if string(page[:8]) != "KDBTREE4" || page[10] != 1 || binary.LittleEndian.Uint64(page[16:]) <= target {
 			t.Fatal("fixture must have a right leaf above the selected hole")
 		}
 		binary.LittleEndian.PutUint64(page[16:], target)
@@ -117,7 +117,7 @@ func corruptCheckpointPresenceBoundary(t *testing.T, path, mode string, encrypte
 		offset = slotOffset(binary.LittleEndian.Uint64(page[24:]))
 		page = readPage(offset)
 		count := int(binary.LittleEndian.Uint16(page[8:]))
-		if string(page[:8]) != "KDBTREE2" || page[10] != 1 || count < 2 {
+		if string(page[:8]) != "KDBTREE4" || page[10] != 1 || count < 2 {
 			t.Fatal("fixture must have a populated first leaf")
 		}
 		target = binary.LittleEndian.Uint64(page[16:])
@@ -148,7 +148,7 @@ func corruptCheckpointPresenceBoundary(t *testing.T, path, mode string, encrypte
 	return target
 }
 
-func TestCheckpointLazyPresenceCorruptionNeverFallsBack(t *testing.T) {
+func TestCheckpointPayloadCorruptionNeverMasqueradesAsZero(t *testing.T) {
 	for _, encrypted := range []bool{false, true} {
 		for _, mode := range []string{"skipped-left-tail", "skipped-final-tail", "skipped-right-low", "leaf-capacity", "leaf-allocation"} {
 			for _, operation := range []string{"read", "partial-write", "full-write", "discard"} {
@@ -163,7 +163,7 @@ func TestCheckpointLazyPresenceCorruptionNeverFallsBack(t *testing.T) {
 					}
 					cow, err := OpenDisk(path, base, DiffInit{Existing: true, CreateSize: size}, opts...)
 					if err != nil {
-						t.Fatal("open should leave descendant validation to presence", err)
+						t.Fatal("open should leave descendant validation to payload access", err)
 					}
 					defer cow.Close()
 					backend, err := cow.checkpointBackend()
@@ -172,7 +172,14 @@ func TestCheckpointLazyPresenceCorruptionNeverFallsBack(t *testing.T) {
 					}
 					before := backend.store.Stats()
 					var reports atomic.Int64
-					cow.SetFatalHandler(func(error) { reports.Add(1) })
+					reported := make(chan struct{}, 1)
+					cow.SetFatalHandler(func(error) {
+						reports.Add(1)
+						select {
+						case reported <- struct{}{}:
+						default:
+						}
+					})
 					var n int
 					switch operation {
 					case "read":
@@ -182,27 +189,58 @@ func TestCheckpointLazyPresenceCorruptionNeverFallsBack(t *testing.T) {
 					case "full-write":
 						n, err = cow.WriteAt(bytes.Repeat([]byte{0x99}, cowBlockSize), int64(target)*cowBlockSize)
 					case "discard":
-						err = cow.Discard(int64(target)*cowBlockSize, cowBlockSize)
+						err = cow.Discard(int64(target)*cowBlockSize, cowBlockSize, true)
 					}
-					if n != 0 || err == nil {
-						t.Fatalf("logical corruption became a successful %s: n=%d err=%v baseReads=%d", operation, n, err, base.reads.Load())
+					// P=0 is authoritative even if unrelated payload metadata is
+					// corrupt. It need not inspect the index to fall through.
+					hole := target%2 == 1
+					if operation == "read" && hole {
+						if err != nil || n != cowBlockSize || base.reads.Load() != 1 || cow.Err() != nil {
+							t.Fatal("explicit Hole inspected payload index", n, err, base.reads.Load())
+						}
+						return
 					}
-					if base.reads.Load() != 0 || cow.BackendStats()["diff_presence_known_blocks"] != 0 || cow.DirtyCount() != 0 {
-						t.Fatal("corrupt absence reached base or cache", base.reads.Load(), cow.BackendStats())
+					// Full writes and partial writes into Hole may be accepted
+					// in the cache. Backend validation must fail before writing
+					// payload or publishing the replacement mapping/bitmap.
+					accepted := operation == "full-write" || operation == "partial-write" && hole
+					if accepted {
+						if err != nil || n == 0 {
+							t.Fatal("cache acceptance failed", n, err)
+						}
+						err = cow.Drain(context.Background())
+					} else if n != 0 {
+						t.Fatal("failed operation returned bytes", n, err)
 					}
+					if err == nil {
+						t.Fatalf("corrupt payload index became successful %s", operation)
+					}
+					wantBase := int64(0)
+					if operation == "partial-write" && hole {
+						wantBase = 1
+					}
+					if base.reads.Load() != wantBase || cow.BackendStats()["diff_presence_complete"] != true {
+						t.Fatal("incorrect base fallback", base.reads.Load(), cow.BackendStats())
+					}
+
 					// This fixture has no Current checkpoint to invalidate. A rejected
 					// operation must not commit a replacement/deletion of its mappings.
 					after := backend.store.Stats()
 					if after.DataWritten != before.DataWritten || after.IndexWritten != before.IndexWritten || after.RedoWritten != before.RedoWritten {
 						t.Fatalf("rejected %s changed persistent data/index: before=%+v after=%+v", operation, before, after)
 					}
-					if !errors.Is(cow.Err(), err) || !errors.Is(cow.Flush(), err) || reports.Load() != 1 {
+					fatal := cow.Err()
+					// Failure becomes visible before the worker invokes the handler
+					// outside the cache lock. Drain may observe that sticky failure
+					// first; wait for the callback before asserting its exact count.
+					awaitSignal(t, reported)
+					if fatal == nil || !errors.Is(err, fatal) && !errors.Is(fatal, err) || !errors.Is(cow.Flush(), fatal) || reports.Load() != 1 {
 						t.Fatal("logical corruption was not sticky", err, cow.Err(), reports.Load())
 					}
-					if _, next := cow.ReadAt(make([]byte, cowBlockSize), 0); !errors.Is(next, err) {
+					if _, next := cow.ReadAt(make([]byte, cowBlockSize), 0); !errors.Is(next, fatal) {
 						t.Fatal("read continued after fatal presence", next)
 					}
-					if _, next := cow.WriteAt(make([]byte, cowBlockSize), 0); !errors.Is(next, err) {
+					if _, next := cow.WriteAt(make([]byte, cowBlockSize), 0); !errors.Is(next, fatal) {
 						t.Fatal("write continued after fatal presence", next)
 					}
 				})

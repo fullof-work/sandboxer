@@ -61,8 +61,7 @@ docker save "$E2E_IMAGE" | "$BIN/flatten-ctl" export --output "$ROOT_IMAGE" --no
 [ -s "$ROOT_IMAGE" ] || e2e_fail "flatten produced an empty root artifact"
 ROOT_REF="$(plaintext_tarstream_ref "$ROOT_IMAGE")"
 DIFF="$WORK/root.diff"
-truncate -s 1G "$DIFF"
-mkfs.ext4 -q -F -O ^has_journal "$DIFF"
+"$BIN/sandbox-ctl" diff create --output "$DIFF" --size 1G >/dev/null
 
 # Capture from v1. On restore, the recorded path is deliberately removed; the
 # supplied v2 path must fail digest/basename validation and the sibling v1 must win.
@@ -149,8 +148,7 @@ cp --reflink=auto --sparse=always "$SELECTED_RUNTIME" "$DEFAULT_RUNTIME"
 find "$WORK/snapshot" -maxdepth 1 -type f -print0 | sort -z | xargs -0 sha256sum >"$WORK/source.sha256"
 
 RESTORE_DIFF="$WORK/restore.diff"
-truncate -s 1G "$RESTORE_DIFF"
-mkfs.ext4 -q -F -O ^has_journal "$RESTORE_DIFF"
+"$BIN/sandbox-ctl" diff create --output "$RESTORE_DIFF" --size 1G >/dev/null
 cat >"$WORK/restore.yaml" <<EOF
 resources:
   capacity: { cpu: 1, memory: 512MiB }

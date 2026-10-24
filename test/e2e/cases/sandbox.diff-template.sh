@@ -48,8 +48,7 @@ docker save "$E2E_IMAGE" | "$BIN/flatten-ctl" export --output "$ROOT_IMAGE" --no
 ROOT_REF="$(plaintext_tarstream_ref "$ROOT_IMAGE")"
 
 TEMPLATE="$WORK/basic.ext4"
-truncate -s 512M "$TEMPLATE"
-mkfs.ext4 -q -F -O ^has_journal "$TEMPLATE"
+"$BIN/sandbox-ctl" diff create --output "$TEMPLATE" --size 512M >/dev/null
 FEATURES="$(LC_ALL=C dumpe2fs -h "$TEMPLATE" | sed -n 's/^Filesystem features: *//p')"
 [ -n "$FEATURES" ] || e2e_fail "could not read ext4 template features"
 [[ " $FEATURES " != *" has_journal "* ]] || e2e_fail "diff template unexpectedly contains an ext4 journal"

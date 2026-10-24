@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Run current base/working-snapshot sparse-disk preparation without a VM."""
 import os
+import json
 from pathlib import Path
 import subprocess
 import tempfile
@@ -12,21 +13,25 @@ CASES = Path(__file__).resolve().parents[1] / "test/e2e/cases"
 class RestoreDiskPreparationTest(unittest.TestCase):
     def check_restore(self, case, root_name, data_name, end):
         source = (CASES / case).read_text()
-        start = source.index(f'truncate -s 512M "$WORK/{root_name}"')
+        start = source.index(f'"$BIN/sandbox-ctl" diff create --output "$WORK/{root_name}"')
         block = source[start:source.index(end, start)]
         with tempfile.TemporaryDirectory(prefix="restore-disks-") as directory:
             work = Path(directory)
+            # Exercise the actual shell selection. The Go provisioning tests
+            # separately verify new-format all-Hole bytes and no replacement.
+            binary = work / "sandbox-ctl"
+            binary.write_text('#!/usr/bin/env python3\nimport json,os,sys\n'
+                              'with open(os.environ["WORK"]+"/calls", "a") as f: f.write(json.dumps(sys.argv[1:])+"\\n")\n')
+            binary.chmod(0o755)
             script = 'set -euo pipefail\nmkfs.ext4() { echo invoked >> "$WORK/formats"; }\n' + block
             env = {k: v for k, v in os.environ.items() if k not in ("BASH_ENV", "ENV")}
-            result = subprocess.run(["bash", "-c", script], env={**env, "WORK": directory}, capture_output=True, text=True, timeout=5)
+            result = subprocess.run(["bash", "-c", script], env={**env, "WORK": directory, "BIN": directory}, capture_output=True, text=True, timeout=5)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertFalse((work / "formats").exists(), "restore must not format captured filesystem state")
-            for name, size in ((root_name, 512 << 20), (data_name, 256 << 20)):
-                path = work / name
-                self.assertEqual(path.stat().st_size, size)
-                self.assertEqual(path.stat().st_blocks, 0)
-                with path.open("rb") as stream:
-                    self.assertEqual(stream.read(4096), bytes(4096))
+            calls = [json.loads(line) for line in (work / "calls").read_text().splitlines()]
+            self.assertEqual(calls, [["diff", "create", "--output", str(work / name), "--size", size,
+                                      "--filesystem", "none"]
+                                     for name, size in ((root_name, "512M"), (data_name, "256M"))])
 
     def test_base_restore_inherits_filesystem(self):
         self.check_restore("snapshot.disks.sh", "root-restore.ext4", "dataset-restore.ext4", 'cat >"$WORK/restore.yaml"')

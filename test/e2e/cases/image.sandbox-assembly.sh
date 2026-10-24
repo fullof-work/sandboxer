@@ -32,8 +32,7 @@ ROOT_IMAGE="$WORK/root.img"
 docker save "$E2E_IMAGE" | "$BIN/flatten-ctl" export --output "$ROOT_IMAGE" --no-progress
 ROOT_REF=$(plaintext_tarstream_ref "$ROOT_IMAGE")
 TEMPLATE="$WORK/upper-template.ext4"
-truncate -s 512M "$TEMPLATE"
-mkfs.ext4 -q -F -O ^has_journal "$TEMPLATE"
+"$BIN/sandbox-ctl" diff create --output "$TEMPLATE" --size 512M >/dev/null
 
 cat >"$WORK/assembly.yaml" <<EOF
 resources: { capacity: { cpu: 1, memory: 512MiB }, allocatable: { cpu: 1, memory: 512MiB } }

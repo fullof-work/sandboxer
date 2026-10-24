@@ -72,12 +72,10 @@ def runtime_init_digest(standalone):
 
 
 def ext4(path, root=None):
-    with path.open("wb") as f:
-        f.truncate(256 * 1024 * 1024)
-    args = ["mkfs.ext4", "-q", "-F", "-O", "^has_journal"]
+    args = [BIN / "sandbox-ctl", "diff", "create", "--output", path, "--size", "256MiB"]
     if root is not None:
-        args += ["-d", str(root)]
-    run(*args, path)
+        args += ["--directory", str(root)]
+    run(*args)
 
 
 def startup_failure_summary(path, returncode, elapsed):

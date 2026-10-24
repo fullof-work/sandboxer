@@ -667,8 +667,9 @@ sandbox-ctl snapshot --path-id worker --checkpoint cp-001 --json
 `--restore`) derive `CheckpointDir = BaseRoot/PathID/checkpoint`; writable root
 and data disks live in `CheckpointDir/diffs/<DiffID>.diff`. These files survive
 normal exit. There is no second launch directory setting. A fresh run assigns
-new disk identities. An existing raw/v1 writable DIFF is never implicitly adopted;
-import its contents as a template. An explicit writable path outside this derived
+new disk identities. Existing raw/v1/v2 working files and templates are rejected;
+export with the old executable and restore the portable artifact into new files.
+An explicit writable path outside this derived
 directory, or a filesystem without the required locking, fails before launch.
 
 Enabling the backend does not change the default capture: without `--checkpoint`,
@@ -771,10 +772,10 @@ At the block layer, `Disk.Checkpoint(ctx, id)`, `ListCheckpoints(ctx)`,
 `DeleteCheckpoint(ctx, id)` and `Export(ctx, id)` use `vhost.CheckpointID`.
 A named `Export` returns a sparse source and closer that owns its reader pin;
 close it when finished. `Export(ctx, vhost.ActiveDiff)` instead requires the
-caller to keep the active disk quiescent. Raw/v1 backends report
+caller to keep the active disk quiescent. Single-layer v3 backends report
 `vhost.ErrCheckpointUnsupported` for named checkpoint operations.
 
-Checkpoint DIFF v2 stores sparse 4 KiB mappings and retained roots in one local
+Checkpoint DIFF v4 stores sparse 4 KiB mappings and retained roots in one local
 file per disk. Its physical length is not disk capacity. Hole falls through to
 the immutable lower graph; an explicitly written zero masks that lower data.
 Encryption uses the process customer key under the existing local-crypto policy;
@@ -787,37 +788,23 @@ Retained versions cost space and post-capture writes may incur index/data COW.
 It does not promise constant total pause time, universal speedups, or guest-data
 durability across host crashes/power loss beyond the existing FLUSH contract.
 
-Reopening an existing v2 DIFF resolves upper presence on demand. Writer ownership,
-identity/key/capacity checks, committed redo replay, root-page validation and
-current-checkpoint metadata health checks finish
-before Open returns; a full index scan is no longer on the same-directory resume
-path. Unknown blocks are distinct from holes. Reads and partial writes query the
-current index in ranges of at most 256 blocks (1 MiB). Complete page overwrites
-also validate unknown metadata before publishing their cached contents, but do
-not read old payload; Discard validates unknown ranges before removing mappings.
-Accepted writes and discards take priority
-over index answers. Queries also validate the relevant predecessor/successor
-subtree boundaries through bounded edge paths, rejecting inconsistent adjacent
-bounds even when their page checksums are valid.
-A discovered index error is fatal, never a fallback to base.
-Child-node corruption may therefore be detected on first access rather than Open.
-This checks visited paths and adjacent boundaries, not the whole tree. Arbitrary
-logical corruption in unvisited subtrees can remain undetected until those paths
-are traversed or a full scan runs; lazy Open is not a full-tree integrity audit.
+Reopening a v4 DIFF loads the complete one-bit-per-4-KiB presence bitmap P
+(at most 1 MiB net for the 32 GiB writable limit). P=0 is Hole and falls through
+to base. P=1 with no payload is Zero and masks base; P=1 with payload is Data.
+Accepted cache writes count as Data. Ordinary zero writes remain Data; they are
+not scanned or compressed. Open still validates ownership, identity/key/capacity,
+committed redo, the root and current Checkpoint before returning. It does not
+scan the complete B+ tree. Visited mappings and adjacent subtree boundaries are
+validated before trusting absence; detected corruption is fatal, never Zero or
+a base fallback. Unvisited subtree corruption can be detected later.
 
-There is no background full-disk prefetch. The first access to an unknown range
-pays its index lookup; locality and storage latency determine that cost. One extra
-bit per logical 4 KiB block records known presence (about 0.94 MiB for a 30 GiB
-disk), in addition to the existing presence bitmap. `diff_dirty_blocks` and
-`diff_dirty_percent` are lower bounds while `diff_presence_complete` is false;
-`diff_presence_known_blocks` reports coverage. Fresh diffs and raw/v1 retain exact
-counts. Ordinary `SnapshotView` and active-diff export complete the remaining
-presence with a full index traversal before exposing holes, which can move scan
-cost to that quiescent operation. Completion uses one temporary bitmap and visits
-mapped keys rather than every logical range of a sparse disk. Named capture/export
-does not require this bitmap. Historical or
-cross-directory restore still materializes its selected version; its cost is not
-removed by lazy presence.
+The former unknown-presence bitmap and recovery scan are removed. Presence
+coverage is complete after Open, and dirty-block statistics count P, including
+Zero pages. Export classifies physical Data in bounded queries. A named export
+owns an immutable root and P copy; an active export includes accepted unflushed
+cache writes. Historical/cross-directory restore still materializes its version,
+preserving full Zero pages without allocating payload. This does not remove
+template, decryption or Data-copy costs.
 
 Restore source readers are temporary. Same-directory hot restore and cold launch
 (CLI, SDK `Start`, and `StartRuntime` + `Launch`) retain the complete source set
@@ -1366,11 +1353,11 @@ capacity. New configuration output does not emit them. Unrelated fields and
 opaque metadata are unaffected.
 
 For new disposable ext4 work disks (overlay uppers, single roots and scratch
-or data-disk fixtures), format the sparse template with `mkfs.ext4 -O ^has_journal`.
+or data-disk fixtures), create a v3 template with `sandbox-ctl diff create`.
 This avoids filesystem journal allocation and metadata journal writes; it does
 not disable journald or application logs. COW is not a replacement for a journal,
 and this default does not promise crash recovery of an interrupted work disk.
-Existing journaled templates, user-supplied images and snapshots remain compatible;
+Journaled new-format templates (`--journal`) and portable snapshots remain supported;
 guest sync/quiesce and snapshot/restore semantics are unchanged. Do not reformat
 an existing data disk to apply this recommendation.
 
@@ -1378,8 +1365,7 @@ For a **new**, empty 512 MiB scratch filesystem, prepare a new template and
 select it without a size override:
 
 ```bash
-truncate -s 512M /tmp/scratch-512m.ext4
-mkfs.ext4 -F -O ^has_journal /tmp/scratch-512m.ext4
+sandbox-ctl diff create --output /tmp/scratch-512m.ext4 --size 512MiB
 ```
 
 ```yaml
@@ -1393,6 +1379,18 @@ mounts:
     type: disk
     source: scratch
 ```
+
+`diff create` accepts a new output path only and creates a plaintext v3 DIFF
+containing ext4 by default. `--directory DIR` seeds that new filesystem;
+`--journal` enables its journal. `--filesystem none` creates an all-Hole DIFF for
+an explicitly selected restore/lower source; it is not a standalone formatted
+filesystem. Size must be positive, 4 KiB aligned and at most 32 GiB. A private raw
+filesystem is generated internally, copied by allocated extents and removed;
+this command does not import old working files. Publication is atomic and refuses
+to replace any existing output, including an empty file. The filename suffix is
+not a format indicator. Direct raw `truncate`/`mkfs` output and legacy raw/v1/v2
+DIFFs/templates are rejected by the new runtime. Export those with the old
+executable before upgrading, then restore the portable artifact into new files.
 
 Use a new active diff: an existing diff takes precedence, so changing a template
 does not resize or replace existing data. Do not truncate an existing filesystem
@@ -2589,7 +2587,9 @@ and Drain interrupt it. An already aggregated backlog proceeds without a new
 A healthy, valid guest **FLUSH is a no-op**. It neither initiates writeback,
 waits for dirty pages nor invokes Drain, fsync or fdatasync. Request ordering and
 fatal-state checks remain. Existing wire features are retained for Cloud
-Hypervisor snapshot compatibility; CONFIG_WCE and wire discard are not added.
+Hypervisor snapshot compatibility. New writable devices advertise DISCARD;
+read-only devices do not. CONFIG_WCE and WRITE_ZEROES are not added. See the
+[Guest discard ABI](sandbox-init.md#guest-block-discard).
 
 Write completion promises only acceptance of complete latest bytes into bounded
 logical COW state. Neither writes nor FLUSH guarantee survival of a
@@ -2612,8 +2612,9 @@ active validation and runtime/snapshot reads use the same path. Runtime code doe
 not inspect filesystem types, names, mount policies or filesystem-specific inode
 flags. Header and format probing are bounded before concurrent body I/O;
 templates and base remain buffered/read-only. Plaintext and encrypted file
-formats, the fixed 4 KiB encrypted header, local encryption off/auto/required
-policy and 512-byte XTS data-unit numbering do not change.
+formats are now single-layer v3 and versioned v4. Both have a fixed 4 KiB
+header plus checksummed P pages. Local encryption off/auto/required policy and
+512-byte logical XTS data-unit numbering remain unchanged.
 
 `STATX_DIOALIGN` on the open fd supplies separate address and offset/length
 constraints. Positive reported constraints must fit the workspace bound and
@@ -2638,7 +2639,7 @@ and subpage reads are copied through these buffers; large operations are chunked
 Full-page cache writeback avoids read/modify/write. Short writes fail rather than
 retrying an unaligned remainder; see [write(2)](https://man7.org/linux/man-pages/man2/write.2.html).
 
-### 11.4.5 Versioned DIFF v2 storage and recovery
+### 11.4.5 Versioned DIFF v4 storage and recovery
 
 The optional backend lives in [`pkg/diffstore/internal/versioned`](../pkg/diffstore/internal/versioned).
 Each logical 4 KiB block maps through a B+ tree to a physical slot. A 4 KiB index
@@ -2674,22 +2675,27 @@ Physical page numbers are distinct from guest logical block numbers:
 
 | Physical pages | Contents |
 | --- | --- |
-| 0 | Immutable header: existing DIFF magic, big-endian version 2 prefix, identity/capacity and wrapped key |
+| 0 | Immutable header: existing DIFF magic, big-endian version 4 prefix, identity/capacity and wrapped key |
 | 1 | Mutable control page |
 | 2 | Redo commit descriptor |
 | 3–5 | Redo home-address index, not B+ index pages |
 | 6–1541 | Up to 1,536 existing metadata page images |
+| 1600 onward, at most 259 pages | Active P bitmap; exact count follows capacity |
 | 2048 onward | Groups of one descriptor page followed by 128 slots |
 
-Creation reserves pages 0–1541 (6,316,032 bytes), so redo and existing control
+Creation reserves pages 0–1541 (6,316,032 bytes) and the active P pages, so redo and existing control
 pages remain writable when new payload allocation runs out of space. The initial
 sparse file length is 8 MiB, not the guest capacity. Metadata pages carry
 checksums. An encrypted header wraps a random 64-byte XTS key with AES-GCM,
-using the immutable header fields as associated data and the v2-specific
+using the immutable header fields as associated data and the v4-specific
 header-key derivation domain.
 
-Snapshot creation records the active root and advances the epoch without scanning
-or copying its payload. A slot born after the latest retained epoch is private;
+Snapshot creation records the active root and an independent full P copy, and
+advances the epoch without scanning or copying Data. The P copy uses at most 259
+ordinary allocator records and the unchanged redo budget, even with fragmented
+free slots. Pins protect both root and P. Delete does not collect P records;
+bounded GC persists its partial P-copy cursor and sends these exclusive records
+directly to global garbage before finishing the deleted version. A slot born after the latest retained epoch is private;
 repeated overwrites can update that slot in place without rewriting the index or
 emitting metadata redo. Shared data slots and their shared index path use COW.
 Before a guest write can dirty the plaintext COW cache, `MarkModified` clears the
@@ -2770,11 +2776,13 @@ capture may leave visible versions; list and delete their exact identities, and
 use a new capture ID when retrying. A client transport error alone does not prove
 that no artifact or version was committed.
 
-Low-level Discard serializes with writes and in-flight writeback before punching
-complete blocks and clearing upper presence. Partial edges retain contents.
-Discard exposes base bytes again; it is not an explicit zero masking the base.
-The wire profile still rejects DISCARD and WRITE_ZEROES. Writing zeros still
-materializes upper data and cannot be treated as a hole.
+`Disk.Discard(offset, length, hole)` serializes with writes and in-flight
+writeback, in batches of at most 64 complete pages. Partial edges retain contents.
+Internal `hole=true` clears P and reveals base. Guest `hole=false` removes payload
+and sets P, masking base with Zero. Each completed batch also marks template
+backfill resolved, including pages that previously had no content. Separate
+batches are not one atomic range transaction; cancellation before freezing and
+sticky failures after freezing retain the existing cache coordination rules.
 
 Internal `Drain` waits for accepted writes to finish without fsync. Normal Close
 stops new frontend work, cancels quota waits, drains accepted healthy writes,
@@ -3191,7 +3199,15 @@ OFD version-pin range after handoff, then exercises hot/cold restore, explicit
 Delete, continued writes, re-capture, publication and portable restore in plaintext
 and XTS modes. This distinguishes an empty List from an actually released reader.
 
-Lazy-presence regressions cover allocated zeros, unknown upper/base partial
+The checkpoint case also writes a nonzero file into an immutable lower, unlinks
+it and executes Guest `fstrim`. Direct block-device reads verify zero after trim,
+local/historical/cross-directory restore, and portable publication/restore. Carrier
+inspection follows the exported layer chain: its first present layer must be Zero
+with no payload extent. An empty new active layer above that immutable Zero is
+valid; requiring the active layer itself to contain the mask would reject normal
+layer reuse. Both single-layer and checkpoint restore paths are exercised.
+
+Presence regressions cover allocated Data zeros, payload-free Zero, upper/base partial
 writes, accepted but unflushed overwrites, concurrent discard, cancellation,
 sticky index failures and ordinary-export completeness. The presence harness
 separately records Open/index bytes, first read, 1,024 startup reads with latency
@@ -3216,21 +3232,41 @@ The benchmark driver records host/filesystem/build identity, raw logs, frontend
 and checkpoint p50/p95/p99, throughput including final Drain, physical data/index/
 redo/GC byte counters, cache hits and process CPU/RSS. Its 64 MiB working set
 exceeds the 32 MiB COW cache, except the intentional 4 MiB hot case. At least three
-runs and two working-set traversals are required. Compare raw versus plaintext
-v2 and v1 versus encrypted v2 separately, including no-version, protected first
+runs are required. Overwrite cases use two working-set traversals; `first-sequential`
+and `first-random` write each page exactly once on a fresh disk. Historical mode
+labels `raw`, `v1`, `v2-*` remain stable for baseline harness comparison; in the
+candidate they select v3 plaintext, v3 XTS and v4 respectively. Compare single-layer
+versus checkpoint plaintext and XTS separately, including no-version, protected first
 write and already-private overwrite. These commands describe reproducible checks;
 they do not claim that performance targets or every privileged test passed.
 
-The template driver separately measures three rounds of fresh 64 MiB raw, v1
-XTS, v2 plaintext and v2 XTS initialization. It records Open, Ready,
+The following companion probes separate internal Hole discard from Guest Zero
+discard and report actual allocation before trim, while a deleted checkpoint is
+reader-pinned, after reader release/GC, and after reuse:
+
+```bash
+go test ./pkg/diffstore -run '^$' -bench '^BenchmarkCheckpoint(Guest)?Discard$' -benchtime=3x
+go test ./pkg/diffstore/internal/versioned -run '^$' -bench '^BenchmarkCheckpointZeroRetention$' -benchtime=3x
+```
+
+Discard reports process CPU, backend calls, bitmap/index/redo bytes and structure
+commits. Background GC may contribute to versioned counters. Hole changes P;
+Zero over existing Data leaves P set and needs no bitmap rewrite. The old backend
+has no Guest Zero discard, so its Hole results are not a semantic replacement for
+that operation. Reader-retained space and unchanged file length are reported
+separately from reclaimable payload. Run these probes without concurrent product
+E2E or full race suites, and retain raw results with the PR/Issue.
+
+The template driver separately measures three rounds of fresh 64 MiB single-layer
+plaintext/XTS and checkpoint plaintext/XTS initialization. It records Open, Ready,
 Materialized and total time, including initial synchronization and publication,
 then verifies the entire payload SHA256 outside the timing window. Source
 preparation is excluded; process peak RSS still includes that setup.
 
 The scaling driver removes each history before the next size. It reports
 checkpoint registration, control reopen and presence reconstruction separately;
-its explicit full-scan measurement scales with mapped pages. V2 Disk reopen
-now defers that work to accessed ranges or a later ordinary active export.
+its explicit full-scan measurement scales with mapped pages. V4 Disk reopen loads
+P without reconstructing presence from the tree; payload queries remain bounded.
 The vhost helper freezes exactly 32 dirty pages (128 KiB) before writeback and
 reports template readiness, Drain, final materialization, metadata registration,
 capture total and reopen separately. Without the helper, registration samples

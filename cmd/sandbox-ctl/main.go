@@ -51,6 +51,8 @@ func main() {
 		os.Exit(runCmd(os.Args[2:]))
 	case "checkpoint":
 		os.Exit(checkpointCmd(os.Args[2:]))
+	case "diff":
+		os.Exit(diffCmd(os.Args[2:]))
 	case "snapshot":
 		os.Exit(snapshotCmd(os.Args[2:]))
 	case "export":
@@ -100,6 +102,8 @@ func printUsage(w *os.File) {
 	fmt.Fprintf(w, `sandbox-ctl — sandbox runtime control
 
 Usage:
+  sandbox-ctl diff create --output <new.diff> --size <size>
+                        [--filesystem ext4|none] [--directory <seed-dir>] [--journal]
   sandbox-ctl run       [--config host.yaml[:instance.yaml]] [--manifest-config <path>]
                         [--sandbox-id <sid>] [--path-id <leaf>] [--ch-binary <path>]
                         [--run-root <dir>] [--base-root <dir>] [--enable-checkpoint]

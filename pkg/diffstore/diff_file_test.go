@@ -59,8 +59,8 @@ func TestEncryptedBlockCOWPolicyAndReopen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Size() != diffHeaderRegionSize+size {
-		t.Fatalf("physical size=%d want=%d", info.Size(), diffHeaderRegionSize+size)
+	if info.Size() != singleBodyOffset(size)+size {
+		t.Fatalf("physical size=%d want=%d", info.Size(), singleBodyOffset(size)+size)
 	}
 
 	payload := bytes.Repeat([]byte{0xa5}, 512)
@@ -91,7 +91,7 @@ func TestEncryptedBlockCOWPolicyAndReopen(t *testing.T) {
 	if !bytes.Equal(physical[:len(diffMagic)], diffMagic[:]) {
 		t.Fatalf("encrypted magic=%x", physical[:len(diffMagic)])
 	}
-	bodyBlock := physical[diffHeaderRegionSize+cowBlockSize : diffHeaderRegionSize+2*cowBlockSize]
+	bodyBlock := physical[singleBodyOffset(size)+cowBlockSize : singleBodyOffset(size)+2*cowBlockSize]
 	if bytes.Equal(bodyBlock, want[cowBlockSize:2*cowBlockSize]) {
 		t.Fatal("encrypted body stored plaintext")
 	}
@@ -182,7 +182,7 @@ func TestEncryptedDiffHeaderValidation(t *testing.T) {
 		{name: "prefix-size", mutate: func(t *testing.T, path string) {
 			mutateDiffBytes(t, path, func(body []byte) { binaryPutUint16(body[10:12], 15) })
 		}},
-		{name: "flags", mutate: func(t *testing.T, path string) { mutateDiffBytes(t, path, func(body []byte) { body[15] = 1 }) }},
+		{name: "flags", mutate: func(t *testing.T, path string) { mutateDiffBytes(t, path, func(body []byte) { body[15] = 2 }) }},
 		{name: "authentication", mutate: func(t *testing.T, path string) {
 			mutateDiffBytes(t, path, func(body []byte) { body[diffPrefixSize+7] ^= 0x80 })
 		}},
@@ -227,8 +227,8 @@ func TestEncryptedDiffHeaderValidation(t *testing.T) {
 		{name: "block-size", mutate: func(header []byte) { header[11] ^= 1 }},
 		{name: "data-unit-size", mutate: func(header []byte) { header[15] ^= 1 }},
 		{name: "body-offset", mutate: func(header []byte) { header[19] ^= 1 }},
-		{name: "key-size", mutate: func(header []byte) { header[23] ^= 1 }},
-		{name: "reserved", mutate: func(header []byte) { header[88] = 1 }},
+		{name: "key-size", mutate: func(header []byte) { header[47] ^= 1 }},
+		{name: "reserved", mutate: func(header []byte) { header[112] = 1 }},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			path := create(t)
@@ -242,7 +242,7 @@ func TestEncryptedDiffHeaderValidation(t *testing.T) {
 	t.Run("magic-required", func(t *testing.T) {
 		path := create(t)
 		mutateDiffBytes(t, path, func(body []byte) { body[0] ^= 1 })
-		if err := open(path, true); !errors.Is(err, ErrDiffPlaintextForbidden) {
+		if err := open(path, true); !errors.Is(err, ErrFormat) {
 			t.Fatalf("required damaged magic error=%v", err)
 		}
 	})
@@ -255,14 +255,12 @@ func TestEncryptedDiffHeaderValidation(t *testing.T) {
 		if err := os.WriteFile(path, body, 0o600); err != nil {
 			t.Fatal(err)
 		}
-		cow, err := OpenDisk(path, nil, DiffInit{Existing: true}, WithDiffEncryption(key, false))
-		if err != nil {
-			t.Fatalf("auto rejected non-magic legacy plaintext: %v", err)
+		if cow, err := OpenDisk(path, nil, DiffInit{Existing: true}, WithDiffEncryption(key, false)); !errors.Is(err, ErrFormat) {
+			if cow != nil {
+				_ = cow.Close()
+			}
+			t.Fatalf("legacy plaintext accepted: %v", err)
 		}
-		if cow.diff.(*diffFile).encrypted {
-			t.Fatal("near-magic plaintext was classified as encrypted")
-		}
-		_ = cow.Close()
 	})
 
 	t.Run("old-aes-siv-v1", func(t *testing.T) {
@@ -274,7 +272,7 @@ func TestEncryptedDiffHeaderValidation(t *testing.T) {
 		if err := os.WriteFile(path, body, 0o600); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := OpenDisk(path, nil, DiffInit{Existing: true}, WithDiffEncryption(testDiffKey(0x41), false)); !errors.Is(err, ErrDiffAuthentication) {
+		if _, err := OpenDisk(path, nil, DiffInit{Existing: true}, WithDiffEncryption(testDiffKey(0x41), false)); !errors.Is(err, ErrFormat) {
 			t.Fatalf("old AES-SIV diff error=%v", err)
 		}
 	})
@@ -292,9 +290,12 @@ func TestEncryptedDiffGoldenAndRandomKeys(t *testing.T) {
 	}
 	const vectorSector = int64(0xff)
 	const goldenSize = (vectorSector + 1) * diffDataUnitSize
-	diff, err := createEncryptedDiffFile(f, goldenSize, mustDiffEncryption(t, key), bytes.NewReader(randomMaterial))
+	diff, err := createDiffFile(f, goldenSize, mustDiffEncryption(t, key), bytes.NewReader(randomMaterial))
 	if err != nil {
 		_ = f.Close()
+		t.Fatal(err)
+	}
+	if err := diff.enableDirect(); err != nil {
 		t.Fatal(err)
 	}
 	plaintext := make([]byte, diffDataUnitSize)
@@ -313,7 +314,7 @@ func TestEncryptedDiffGoldenAndRandomKeys(t *testing.T) {
 		t.Fatal(err)
 	}
 	const wantXTSFirst32 = "1c3b3a102f770386e4836c99e370cf9bea00803f5e482357a4ae12d414a3e63b"
-	if got := hex.EncodeToString(physical[diffHeaderRegionSize+vectorOffset : diffHeaderRegionSize+vectorOffset+32]); got != wantXTSFirst32 {
+	if got := hex.EncodeToString(physical[diff.bodyOffset+vectorOffset : diff.bodyOffset+vectorOffset+32]); got != wantXTSFirst32 {
 		t.Fatalf("AES-256-XTS vector prefix=%s want=%s", got, wantXTSFirst32)
 	}
 	gotPlaintext := make([]byte, len(plaintext))
@@ -323,7 +324,7 @@ func TestEncryptedDiffGoldenAndRandomKeys(t *testing.T) {
 	if !bytes.Equal(gotPlaintext, plaintext) {
 		t.Fatal("AES-256-XTS round trip failed")
 	}
-	const wantHeader = "894b44585453310a0001001000000000000102030405060708090a0bb2ce352abb439fafdbbf9e7c711227cc2036bd773685b370447336476c95bb845f52cee4acacc2d1646d48dfd014d36e7dc33a90e76d34e75d0184af8385189bf92ece9956134546003eb26ed378aaa619a77ea3a2d77937494a2a7676f8b809edac3e7a68311a760dd05f4907647a2490ee18f0b4e69dde13e4121c1f0f80d6d5c82996b62be812fb2960d05b3cffc6"
+	const wantHeader = "894b44585453310a0003001000000001000102030405060708090a0b99c93441ce4f17808b7c19cbea6ce2d46dbfb6ee9774d5eeffd85d629605b1ca9f972794d0eb970ee2e820b238361e04757343701d412a11ad16c3c8897b9d8dfb5c2be7321fe65ce23b84aa23d95d6fb670790cb957fb7888d0aa21446da3acb05f196f414565ae25ae09fa87a516184c60bac9886d32bf7592feb3e02e350eb0f4c37d97fe7984fd52532f3d7e6447"
 	gotHeader := hex.EncodeToString(physical[:diffPrefixSize+diffHeaderSealedSize])
 	if gotHeader != wantHeader {
 		t.Fatalf("encrypted diff header=%s want=%s", gotHeader, wantHeader)
@@ -547,16 +548,16 @@ func TestFreshEncryptedDiffRejectsPreallocatedBody(t *testing.T) {
 		t.Fatal(err)
 	}
 	key := testDiffKey(0x55)
-	diff, err := createEncryptedDiffFile(f, 2*cowBlockSize, mustDiffEncryption(t, key), strings.NewReader(strings.Repeat("k", diffXTSKeySize+diffHeaderNonceSize)))
+	diff, err := createDiffFile(f, 2*cowBlockSize, mustDiffEncryption(t, key), strings.NewReader(strings.Repeat("k", diffXTSKeySize+diffHeaderNonceSize)))
 	if err != nil {
 		_ = f.Close()
 		t.Fatal(err)
 	}
 	defer diff.Close()
-	if _, err := f.WriteAt([]byte{1}, diffHeaderRegionSize); err != nil {
+	if _, err := f.WriteAt([]byte{1}, diff.bodyOffset); err != nil {
 		t.Fatal(err)
 	}
-	if err := diff.validateFreshEncryptedBodySparse(); err == nil {
+	if err := diff.validateFreshBodySparse(); err == nil {
 		t.Fatal("filesystem body allocation before seed was accepted")
 	}
 }
@@ -579,9 +580,13 @@ func testDiffTemplateMatrixAndAtomicCommit(t *testing.T, dir string) {
 		{Offset: cowBlockSize + 123, Size: 257},
 		{Offset: 3 * cowBlockSize, Size: cowBlockSize},
 	})
+	originalTemplate, err := os.ReadFile(templatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
 	t.Cleanup(func() {
 		got, err := os.ReadFile(templatePath)
-		if err != nil || !bytes.Equal(got, want) {
+		if err != nil || !bytes.Equal(got, originalTemplate) {
 			t.Fatalf("immutable template changed: %v", err)
 		}
 	})
@@ -718,7 +723,7 @@ func testDiffTemplateMatrixAndAtomicCommit(t *testing.T, dir string) {
 		t.Fatal(err)
 	}
 	_ = fromEmpty.Close()
-	if info, err := os.Stat(empty); err != nil || info.Size() != diffHeaderRegionSize+size {
+	if info, err := os.Stat(empty); err != nil || info.Size() != singleBodyOffset(size)+size {
 		t.Fatalf("empty placeholder final size=%v err=%v", info, err)
 	}
 
@@ -783,9 +788,7 @@ func testValidateDiffExt4UsesLogicalPlaintextAndBaseFallback(t *testing.T, dir s
 	}
 
 	invalidPath := filepath.Join(dir, "invalid")
-	if err := os.WriteFile(invalidPath, make([]byte, size), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	writeSparseTemplate(t, invalidPath, make([]byte, size), nil)
 	if err := ValidateExistingDiffExt4(ctx, invalidPath, nil); err == nil ||
 		!strings.Contains(err.Error(), "formatted ext4") {
 		t.Fatalf("invalid filesystem error = %v", err)
@@ -1016,6 +1019,7 @@ func rewrapDiffHeader(t *testing.T, path string, key [32]byte, mutate func([]byt
 		header,
 		diffHeaderAAD(prefix),
 	)
+	sealSinglePresence(region)
 	if err := writeFullAt(f, region, 0); err != nil {
 		t.Fatal(err)
 	}
@@ -1027,14 +1031,19 @@ func writeSparseTemplate(t *testing.T, path string, logical []byte, data []spars
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer f.Close()
-	if err := f.Truncate(int64(len(logical))); err != nil {
+	d, err := createDiffFile(f, int64(len(logical)), nil, nil)
+	if err != nil {
+		f.Close()
+		t.Fatal(err)
+	}
+	defer d.Close()
+	if err := d.enableDirect(); err != nil {
 		t.Fatal(err)
 	}
 	for _, extent := range data {
 		start := int(extent.Offset)
 		end := start + int(extent.Size)
-		if _, err := f.WriteAt(logical[start:end], int64(start)); err != nil {
+		if _, err := d.WriteAt(logical[start:end], int64(start)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1307,7 +1316,7 @@ func TestAsyncTemplateDiscardDoesNotReintroduceTemplateBlock(t *testing.T) {
 	}
 	const blk = int64(1)
 	const discarded = 128 * cowBlockSize
-	if err := cow.Discard(blk*cowBlockSize, discarded); err != nil {
+	if err := cow.Discard(blk*cowBlockSize, discarded, true); err != nil {
 		t.Fatal(err)
 	}
 	got := make([]byte, discarded)
@@ -1337,11 +1346,8 @@ func TestAsyncTemplateEphemeralCloseCancelsWithoutFatal(t *testing.T) {
 	dir := t.TempDir()
 	templatePath := filepath.Join(dir, "template.ext4")
 	finalPath := filepath.Join(dir, "active.diff")
-	f, err := os.OpenFile(templatePath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o600)
+	f, err := initializeFreshDiffFile(templatePath, size, nil, nil)
 	if err != nil {
-		t.Fatal(err)
-	}
-	if err := f.Truncate(size); err != nil {
 		t.Fatal(err)
 	}
 	block := bytes.Repeat([]byte{0x33}, cowBlockSize)

@@ -53,8 +53,7 @@ docker save "$E2E_IMAGE" | "$BIN/flatten-ctl" export --output "$ROOT_IMAGE" --no
 [ -s "$ROOT_IMAGE" ] || e2e_fail "flatten produced an empty root artifact"
 ROOT_REF="$(plaintext_tarstream_ref "$ROOT_IMAGE")"
 DIFF="$WORK/cold.diff"
-truncate -s 1G "$DIFF"
-mkfs.ext4 -q -F -O ^has_journal "$DIFF"
+"$BIN/sandbox-ctl" diff create --output "$DIFF" --size 1G >/dev/null
 
 PYCODE='import time
 print("PYBOOT-OK", flush=True)
@@ -105,8 +104,7 @@ SNAPSHOT="$WORK/snapshot/$SID1.snapshot"
 [ -f "$SNAPSHOT" ] || e2e_fail "snapshot is missing"
 
 RESTORE_DIFF="$WORK/restore.diff"
-truncate -s 1G "$RESTORE_DIFF"
-mkfs.ext4 -q -F -O ^has_journal "$RESTORE_DIFF"
+"$BIN/sandbox-ctl" diff create --output "$RESTORE_DIFF" --size 1G >/dev/null
 cat >"$WORK/bad.yaml" <<EOF
 resources:
   capacity: { cpu: 1, memory: 512MiB }

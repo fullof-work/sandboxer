@@ -9,6 +9,7 @@ import (
 	"os"
 	"sort"
 
+	"github.com/kuasar-sandbox/sandboxer/pkg/diffstore/internal/presence"
 	"github.com/kuasar-sandbox/sandboxer/pkg/diffstore/internal/sectorcrypt"
 	"golang.org/x/sys/unix"
 )
@@ -165,7 +166,7 @@ func (t *transaction) allocate(kind uint64) (uint64, error) {
 		t.ctrl.Next++
 		if (slot-1)%slotsPerGroup == 0 {
 			b := make([]byte, PageSize)
-			copy(b, "KDDESC2")
+			copy(b, "KDDESC4")
 			sealPage(b)
 			t.pages[descriptorPage(slot)] = b
 			t.fresh[descriptorPage(slot)] = true
@@ -181,7 +182,7 @@ func (t *transaction) allocate(kind uint64) (uint64, error) {
 	return slot, nil
 }
 func (t *transaction) putCheckpoint(slot uint64, cp checkpoint) error {
-	b, err := encodeJSON("KDCP2", cp)
+	b, err := encodeJSON("KDCP4", cp)
 	if err == nil {
 		t.pages[slotPage(slot)] = b
 	}
@@ -256,7 +257,7 @@ func (t *transaction) commit(ctx context.Context) error {
 		return t.writeData()
 	}
 	t.ctrl.Tx++
-	ctrl, err := encodeJSON("KDCONT2", t.ctrl)
+	ctrl, err := encodeJSON("KDCONT4", t.ctrl)
 	if err != nil {
 		return err
 	}
@@ -329,7 +330,7 @@ func (t *transaction) commit(ctx context.Context) error {
 	}
 	s.stats.RedoWritten += uint64(len(payload))
 	commit := make([]byte, PageSize)
-	copy(commit, "KDREDO2")
+	copy(commit, "KDREDO4")
 	le.PutUint64(commit[8:], t.ctrl.Tx)
 	le.PutUint64(commit[16:], uint64(len(existing)))
 	copy(commit[24:], hash.Sum(nil))
@@ -362,6 +363,11 @@ func (t *transaction) commit(ctx context.Context) error {
 	s.currentFlag.Store(t.ctrl.Current)
 	s.retiredFlag.Store(t.ctrl.Retired)
 	for p, b := range t.pages {
+		if presencePage(p, s.Size()) {
+			i := int(p - presenceAreaPage)
+			n := min(presence.PayloadSize, len(s.presence)-i*presence.PayloadSize)
+			copy(s.presence[i*presence.PayloadSize:], b[presence.HeaderSize:presence.HeaderSize+n])
+		}
 		s.cache.put(p, b)
 	}
 	s.stats.Commits++
@@ -429,7 +435,7 @@ func (s *Store) crypt(b []byte, block uint64, encrypt bool) {
 	sectorcrypt.Transform(s.cipher, b[:PageSize], block*(PageSize/sectorcrypt.UnitSize), encrypt)
 }
 
-func readRedo(f *os.File, stats *Stats) ([]record, error) {
+func readRedo(f *os.File, stats *Stats, size int64) ([]record, error) {
 	read := func(page uint64, n int) ([]byte, error) {
 		b, err := directRead(f, n, int64(page)*PageSize)
 		if err != nil {
@@ -449,7 +455,7 @@ func readRedo(f *os.File, stats *Stats) ([]record, error) {
 	}
 	// A torn commit descriptor is an unpublished transaction. Its home pages
 	// were not touched until the whole descriptor write completed.
-	if checkPage(commit) != nil || !bytes.Equal(commit[:7], []byte("KDREDO2")) {
+	if checkPage(commit) != nil || !bytes.Equal(commit[:7], []byte("KDREDO4")) {
 		return nil, nil
 	}
 	count := le.Uint64(commit[16:])
@@ -474,7 +480,7 @@ func readRedo(f *os.File, stats *Stats) ([]record, error) {
 	seen := make(map[uint64]bool, len(out))
 	for i := range out {
 		p := le.Uint64(index[i*8:])
-		if p == 0 || p >= logCommitPage && p < slotAreaPage || seen[p] {
+		if p == 0 || (p >= logCommitPage && p < slotAreaPage && !presencePage(p, size)) || seen[p] {
 			return nil, fmt.Errorf("diffstore: invalid redo destination")
 		}
 		seen[p] = true

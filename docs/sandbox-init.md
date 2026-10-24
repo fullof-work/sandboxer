@@ -255,6 +255,31 @@ merged root. Bind/empty volumes do not add sources. Handles survive memory
 restore, never enter app exec, and close with init; an in-flight uncancelable
 read retains its original handle/slot until it finishes (§4.11).
 
+<a id="guest-block-discard"></a>
+
+#### Guest block DISCARD
+
+New writable virtio-blk devices expose `VIRTIO_BLK_F_DISCARD`; read-only devices
+do not. The fixed configuration is `MaxDiscSeg=1`, `DiscSecAln=8` (4096 bytes),
+and `MaxDiscSec=8192` (4 MiB). Capabilities are fixed when the server is created;
+binding a pooled backend must match them. Restored devices retain their captured
+feature negotiation: an old snapshot does not acquire the new feature on resume.
+
+The request contains exactly one 16-byte range, possibly split across readable
+descriptors. The host validates flags, original sector bounds and overflow before
+rounding inward to complete 4 KiB pages. Unsupported flags and WRITE_ZEROES return
+UNSUPP; malformed/beyond-capacity requests return IOERR. A successful DISCARD
+removes upper payload but retains logical presence: subsequent reads return zero,
+including over nonzero lower data. Uncovered edge pages retain their original
+contents. The host uses batches of at most 64 pages; completion is not a guarantee
+of atomicity across batches or stable-storage durability. Ordinary writes of zero
+bytes still allocate Data. Guest FLUSH keeps the existing non-durable contract.
+
+Use `fstrim` on a mounted writable ext4 filesystem to exercise the real Guest
+path. Validation must retain nonzero lower bytes, check zero reads after discard,
+Checkpoint/export and restore, and verify that the corresponding upper ranges
+have no payload. A successful trim byte count alone does not prove these properties.
+
 ### 3.2 Phase 2: apply the spec, wire stdio and start the app
 
 Phase 1's JOIN supplies LaunchSpec and the vsock connection that exchanged

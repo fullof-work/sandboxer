@@ -239,8 +239,8 @@ func runtimeDeviceSpecs(disks []RuntimeDiskSpec) ([]vhost.BlockDeviceSpec, error
 		if d.BaseCapacity%vhost.SectorSize != 0 || d.WritableCapacity%vhost.SectorSize != 0 {
 			return nil, fmt.Errorf("runtime disk %d capacity is not sector-aligned", i)
 		}
-		if d.WritableCapacity <= 0 {
-			return nil, fmt.Errorf("runtime disk %d: writable capacity required", i)
+		if err := diffstore.ValidateWritableSize(d.WritableCapacity); err != nil {
+			return nil, fmt.Errorf("runtime disk %d: %w", i, err)
 		}
 		if d.Overlay {
 			if d.BaseCapacity <= 0 {

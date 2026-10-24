@@ -50,7 +50,11 @@ func (s *Store) Checkpoint(ctx context.Context, id string) error {
 		if err != nil {
 			return err
 		}
-		cp := checkpoint{ID: id, Epoch: t.ctrl.Epoch, Root: t.ctrl.Root, Previous: t.ctrl.Tail, Visible: true, Retained: true}
+		bitmap, err := t.snapshotPresence()
+		if err != nil {
+			return err
+		}
+		cp := checkpoint{Bitmap: bitmap, ID: id, Epoch: t.ctrl.Epoch, Root: t.ctrl.Root, Previous: t.ctrl.Tail, Visible: true, Retained: true}
 		if t.ctrl.Tail != 0 {
 			last, err := s.readCheckpoint(t.ctrl.Tail, t)
 			if err != nil {

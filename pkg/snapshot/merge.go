@@ -43,31 +43,36 @@ func openMergeBase(raw string, size int64, codec tarstream.Codec, required bool)
 }
 
 func openMergeBaseWithOpener(ctx context.Context, raw string, size int64, codec tarstream.Codec, required bool, opener MergeBaseOpener) (*tarLayer, []sparse.Extent, error) {
+	stream, err := openMergeBaseStream(ctx, raw, codec, required, opener)
+	if err != nil {
+		return nil, nil, err
+	}
+	return prepareMergeBase(ctx, stream, size)
+}
+
+func openMergeBaseStream(ctx context.Context, raw string, codec tarstream.Codec, required bool, opener MergeBaseOpener) (fetch.Stream, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if err := ctx.Err(); err != nil {
-		return nil, nil, err
-	}
-	if size < 0 {
-		return nil, nil, fmt.Errorf("merge base: negative logical size")
+		return nil, err
 	}
 	if required && codec == nil {
-		return nil, nil, fmt.Errorf("merge base: required policy has no codec")
+		return nil, fmt.Errorf("merge base: required policy has no codec")
 	}
 	if opener != nil {
 		stream, err := opener(ctx, raw)
 		if err != nil {
-			return nil, nil, &mergeArtifactError{err: err}
+			return nil, &mergeArtifactError{err: err}
 		}
 		if stream == nil {
-			return nil, nil, &mergeArtifactError{err: errors.New("opener returned nil stream")}
+			return nil, &mergeArtifactError{err: errors.New("opener returned nil stream")}
 		}
-		return prepareMergeBase(ctx, stream, size)
+		return stream, nil
 	}
 	ref, err := manifest.ParseRef(raw)
 	if err != nil || ref.Scheme != manifest.RefSchemeFile || ref.Location != "" || ref.Digest == "" || ref.DigestScheme == "manifest" {
-		return nil, nil, fmt.Errorf("merge base: resolved tarstream file identity required")
+		return nil, fmt.Errorf("merge base: resolved tarstream file identity required")
 	}
 	var options []tarstream.ReadOption
 	if codec != nil {
@@ -76,9 +81,9 @@ func openMergeBaseWithOpener(ctx context.Context, raw string, size int64, codec 
 	options = append(options, tarstream.WithExpectedDigest(ref.DigestScheme, ref.Digest))
 	stream, err := readretry.Open(ctx, func() (fetch.Stream, error) { return fetch.OpenTarStream(ref.Path, options...) })
 	if err != nil {
-		return nil, nil, &mergeArtifactError{err: err}
+		return nil, &mergeArtifactError{err: err}
 	}
-	return prepareMergeBase(ctx, stream, size)
+	return stream, nil
 }
 
 func prepareMergeBase(ctx context.Context, stream fetch.Stream, size int64) (*tarLayer, []sparse.Extent, error) {
@@ -86,7 +91,7 @@ func prepareMergeBase(ctx context.Context, stream fetch.Stream, size int64) (*ta
 		_ = stream.Close()
 		return nil, nil, err
 	}
-	if stream.Size() < uint64(size) {
+	if size < 0 || stream.Size() < uint64(size) {
 		return fail(fmt.Errorf("merge base: entry size %d < expected layer size %d", stream.Size(), size))
 	}
 	holes, err := mergeStreamHoles(ctx, stream, uint64(size))

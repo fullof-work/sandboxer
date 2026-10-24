@@ -44,10 +44,8 @@ docker save "$E2E_IMAGE" | "$BIN/flatten-ctl" export --output "$ROOT_IMAGE" --no
 [ -s "$ROOT_IMAGE" ] || e2e_fail "flatten produced an empty root artifact"
 ROOT_REF="$(plaintext_tarstream_ref "$ROOT_IMAGE")"
 
-truncate -s 512M "$WORK/root-template.ext4"
-mkfs.ext4 -q -F -O ^has_journal "$WORK/root-template.ext4"
-truncate -s 256M "$WORK/data-template.ext4"
-mkfs.ext4 -q -F -O ^has_journal "$WORK/data-template.ext4"
+"$BIN/sandbox-ctl" diff create --output "$WORK/root-template.ext4" --size 512M >/dev/null
+"$BIN/sandbox-ctl" diff create --output "$WORK/data-template.ext4" --size 256M >/dev/null
 
 RUN_ROOT="$WORK/run/build-01"
 BASE_ROOT="$WORK/base/build-01"

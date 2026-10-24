@@ -82,10 +82,8 @@ EOF
 ROOT_IMAGE="$WORK/root.img"
 docker save "$E2E_IMAGE" | "$BIN/flatten-ctl" export --output "$ROOT_IMAGE" --no-progress
 BLK0_REF="$(plaintext_tarstream_ref "$ROOT_IMAGE")"
-truncate -s 512M "$WORK/root-upper.ext4"
-mkfs.ext4 -q -F -O ^has_journal "$WORK/root-upper.ext4"
-truncate -s 256M "$WORK/scratch-template.ext4"
-mkfs.ext4 -q -F -O ^has_journal "$WORK/scratch-template.ext4"
+"$BIN/sandbox-ctl" diff create --output "$WORK/root-upper.ext4" --size 512M >/dev/null
+"$BIN/sandbox-ctl" diff create --output "$WORK/scratch-template.ext4" --size 256M >/dev/null
 
 cat >"$WORK/cold.yaml" <<EOF
 resources: { capacity: { cpu: 1, memory: 512MiB }, allocatable: { cpu: 1, memory: 512MiB } }
@@ -244,8 +242,7 @@ PY
 write_restore_yaml() {
     local output=$1 hostname=$2 root_diff=$3
     rm -f "$root_diff"
-    truncate -s 512M "$root_diff"
-    mkfs.ext4 -q -F -O ^has_journal "$root_diff"
+    "$BIN/sandbox-ctl" diff create --output "$root_diff" --size 512M >/dev/null
     cat >"$output" <<EOF
 resources: { capacity: { cpu: 1, memory: 512MiB }, allocatable: { cpu: 1, memory: 512MiB } }
 network: { tap: $TAP_NAME, interface: eth0, ip: 169.254.1.1/31, hostname: $hostname }

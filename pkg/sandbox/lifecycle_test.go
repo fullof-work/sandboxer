@@ -405,9 +405,7 @@ func TestPrepareSnapshotDependencyPlanKeepsLocatedRootCarrier(t *testing.T) {
 func TestPreflightWritableExt4RejectsUnformattedExplicitDiff(t *testing.T) {
 	dir := t.TempDir()
 	diffPath := filepath.Join(dir, "upper.diff")
-	if err := os.WriteFile(diffPath, make([]byte, 4096), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	writeTestDiff(t, diffPath, make([]byte, 4096))
 	root := &config.RootConfig{
 		Base: "file:///unused.erofs",
 		Overlay: &config.OverlayConfig{

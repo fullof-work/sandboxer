@@ -28,7 +28,7 @@ func TestPresenceSparseZeroAndCurrentRoot(t *testing.T) {
 			if err := s.Checkpoint(ctx, "before"); err != nil {
 				t.Fatal(err)
 			}
-			if err := s.Discard(ctx, 64*PageSize, PageSize); err != nil {
+			if err := s.Discard(ctx, 64*PageSize, PageSize, true); err != nil {
 				t.Fatal(err)
 			}
 			putPages(t, s, []uint64{65}, 2)
@@ -49,7 +49,7 @@ func TestPresenceSparseZeroAndCurrentRoot(t *testing.T) {
 				for i := range present {
 					present[i] = true
 				}
-				if err := s.Presence(ctx, start, present); err != nil {
+				if err := s.PayloadPresence(ctx, start, present); err != nil {
 					t.Fatal(err)
 				}
 				for i, got := range present {
@@ -73,33 +73,33 @@ func TestPresenceBoundsCancellationAndClose(t *testing.T) {
 		start uint64
 		count int
 	}{{0, MaxPresencePages + 1}, {1024, 1}, {1025, 0}, {1023, 2}, {math.MaxUint64, 1}} {
-		if err := s.Presence(ctx, tc.start, make([]bool, tc.count)); err == nil {
+		if err := s.PayloadPresence(ctx, tc.start, make([]bool, tc.count)); err == nil {
 			t.Fatalf("accepted presence range %d+%d", tc.start, tc.count)
 		}
 		if err := s.Err(); err != nil {
 			t.Fatal("invalid range poisoned owner", err)
 		}
 	}
-	if err := s.Presence(ctx, 1024, nil); err != nil {
+	if err := s.PayloadPresence(ctx, 1024, nil); err != nil {
 		t.Fatal("empty end range", err)
 	}
 	cancelled, cancel := context.WithCancel(ctx)
 	cancel()
 	before := s.Stats()
-	if err := s.Presence(cancelled, 0, make([]bool, 1)); !errors.Is(err, context.Canceled) {
+	if err := s.PayloadPresence(cancelled, 0, make([]bool, 1)); !errors.Is(err, context.Canceled) {
 		t.Fatal(err)
 	}
 	if s.Stats() != before || s.Err() != nil {
 		t.Fatal("cancelled query performed I/O or poisoned owner")
 	}
 	present := []bool{true}
-	if err := s.Presence(ctx, 0, present); err != nil || present[0] {
+	if err := s.PayloadPresence(ctx, 0, present); err != nil || present[0] {
 		t.Fatal("empty store", present, err)
 	}
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Presence(ctx, 0, present); !errors.Is(err, os.ErrClosed) {
+	if err := s.PayloadPresence(ctx, 0, present); !errors.Is(err, os.ErrClosed) {
 		t.Fatal("closed owner", err)
 	}
 }
@@ -128,12 +128,12 @@ func TestPresenceReadsOnlyRequestedIndexRange(t *testing.T) {
 	}
 	defer s.Close()
 	stopTestGC(s)
-	if got := s.Stats().IndexRead; got != PageSize {
-		t.Fatalf("open read %d index bytes, want one root page", got)
+	if got := s.Stats().IndexRead; got != 2*PageSize {
+		t.Fatalf("open read %d metadata bytes, want the root and one presence page", got)
 	}
 	before := s.Stats()
 	present := make([]bool, MaxPresencePages)
-	if err := s.Presence(ctx, 117, present); err != nil {
+	if err := s.PayloadPresence(ctx, 117, present); err != nil {
 		t.Fatal(err)
 	}
 	for i, exists := range present {
@@ -177,14 +177,14 @@ func TestPresenceDefersUnrelatedCorruptionAndFailsSticky(t *testing.T) {
 		t.Fatal("open scanned an unrelated child", err)
 	}
 	defer s.Close()
-	if err := s.Presence(ctx, 0, make([]bool, 8)); err != nil {
+	if err := s.PayloadPresence(ctx, 0, make([]bool, 8)); err != nil {
 		t.Fatal("query scanned an unrelated child", err)
 	}
-	err = s.Presence(ctx, 1023, make([]bool, 1))
+	err = s.PayloadPresence(ctx, 1023, make([]bool, 1))
 	if err == nil || !errors.Is(s.Err(), err) {
 		t.Fatal("corrupt requested child must fail sticky", err, s.Err())
 	}
-	if got := s.Presence(ctx, 0, make([]bool, 1)); got != err {
+	if got := s.PayloadPresence(ctx, 0, make([]bool, 1)); got != err {
 		t.Fatal("fatal owner continued serving", got)
 	}
 }
@@ -251,7 +251,7 @@ func TestOpenValidatesRootBeforeLazyPresence(t *testing.T) {
 			}
 			defer repaired.Close()
 			present := make([]bool, 2)
-			if err := repaired.Presence(ctx, 0, present); err != nil || !reflect.DeepEqual(present, []bool{false, true}) {
+			if err := repaired.PayloadPresence(ctx, 0, present); err != nil || !reflect.DeepEqual(present, []bool{false, true}) {
 				t.Fatal(present, err)
 			}
 		})
@@ -282,7 +282,7 @@ func TestPresenceCancellationDuringRangeWalk(t *testing.T) {
 	defer cancel()
 	partial := make([]bool, MaxPresencePages)
 	query := &cancelPresenceContext{Context: cancelled, cancel: cancel, checks: 4}
-	if err := s.Presence(query, 117, partial); !errors.Is(err, context.Canceled) {
+	if err := s.PayloadPresence(query, 117, partial); !errors.Is(err, context.Canceled) {
 		t.Fatal(err)
 	}
 	if s.Err() != nil {
@@ -291,7 +291,7 @@ func TestPresenceCancellationDuringRangeWalk(t *testing.T) {
 	if !partial[0] || partial[len(partial)-1] {
 		t.Fatal("fixture did not cancel between child-node visits")
 	}
-	if err := s.Presence(ctx, 117, partial); err != nil {
+	if err := s.PayloadPresence(ctx, 117, partial); err != nil {
 		t.Fatal("query did not recover from cancellation", err)
 	}
 	for i, exists := range partial {
@@ -330,7 +330,7 @@ func TestPresenceRejectsMismatchedChildRange(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.Close()
-	if err := s.Presence(ctx, 1023, make([]bool, 1)); err == nil || s.Err() == nil {
+	if err := s.PayloadPresence(ctx, 1023, make([]bool, 1)); err == nil || s.Err() == nil {
 		t.Fatal("accepted an absence answer from mismatched child metadata", err)
 	}
 }
@@ -432,7 +432,7 @@ func TestScanValidatesChildrenAndFailsSticky(t *testing.T) {
 			if err == nil || !errors.Is(s.Err(), err) {
 				t.Fatal("scan accepted corruption or did not fail sticky", err, s.Err())
 			}
-			if got := s.Presence(ctx, 0, make([]bool, 1)); got != err {
+			if got := s.PayloadPresence(ctx, 0, make([]bool, 1)); got != err {
 				t.Fatal("fatal owner continued serving", got)
 			}
 		})

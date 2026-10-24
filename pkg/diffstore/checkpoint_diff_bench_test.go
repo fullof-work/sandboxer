@@ -27,7 +27,10 @@ import (
 // 128 with -benchtime=32768x touches every page once). Seed/setup is untimed.
 func BenchmarkCheckpointCOWWriteback(b *testing.B) {
 	for _, mode := range []string{"raw", "v1", "v2-no-version", "v2-shared", "v2-private", "v2-xts-no-version", "v2-xts-shared", "v2-xts-private"} {
-		for _, workload := range []string{"sequential", "random", "partial", "hot", "mixed", "cold-read", "frequent-checkpoint", "gc-write"} {
+		for _, workload := range []string{"first-sequential", "first-random", "sequential", "random", "partial", "hot", "mixed", "cold-read", "frequent-checkpoint", "gc-write"} {
+			if strings.HasPrefix(workload, "first-") && strings.HasSuffix(mode, "-private") {
+				continue
+			}
 			if (workload == "frequent-checkpoint" || workload == "gc-write") && (mode == "raw" || mode == "v1") {
 				continue
 			}
@@ -39,7 +42,13 @@ func BenchmarkCheckpointCOWWriteback(b *testing.B) {
 // Discard is measured with a dense upper and a cache smaller than the range.
 // Refill/Drain is excluded. The normal backend GC remains enabled, so total
 // commits include concurrent reclamation and are not Discard-only commits.
-func BenchmarkCheckpointDiscard(b *testing.B) {
+func BenchmarkCheckpointDiscard(b *testing.B) { benchmarkCheckpointDiscard(b, true) }
+
+// Guest Zero discard preserves P=1 after releasing dense payload; the older
+// baseline has no Guest DISCARD and is compared only through the Hole case.
+func BenchmarkCheckpointGuestDiscard(b *testing.B) { benchmarkCheckpointDiscard(b, false) }
+
+func benchmarkCheckpointDiscard(b *testing.B, hole bool) {
 	for _, mode := range []string{"raw", "v1", "v2-no-version", "v2-xts-no-version"} {
 		b.Run(mode, func(b *testing.B) {
 			const size = int64(4 << 20)
@@ -65,7 +74,12 @@ func BenchmarkCheckpointDiscard(b *testing.B) {
 			observer := &discardObserver{diffBackend: cow.diff}
 			cow.diff = observer
 			chunk := bytes.Repeat([]byte{0x45}, 1<<20)
-			var commits uint64
+			var commits, indexBytes, redoBytes, bitmapWrites uint64
+			var userNS, systemNS int64
+			if single, ok := observer.diffBackend.(*diffFile); ok {
+				single.beforePresenceWrite = func(int) error { bitmapWrites++; return nil }
+			}
+			var discardBitmapWrites uint64
 			b.SetBytes(size)
 			b.ResetTimer()
 			b.StopTimer()
@@ -82,17 +96,36 @@ func BenchmarkCheckpointDiscard(b *testing.B) {
 				if backend != nil {
 					before = backend.store.Stats()
 				}
+				var cpuBefore, cpuAfter unix.Rusage
+				if err := unix.Getrusage(unix.RUSAGE_SELF, &cpuBefore); err != nil {
+					b.Fatal(err)
+				}
+				bitmapBefore := bitmapWrites
 				b.StartTimer()
-				if err := cow.Discard(0, size); err != nil {
+				if err := cow.Discard(0, size, hole); err != nil {
 					b.Fatal(err)
 				}
 				b.StopTimer()
+				if err := unix.Getrusage(unix.RUSAGE_SELF, &cpuAfter); err != nil {
+					b.Fatal(err)
+				}
+				userNS += cpuAfter.Utime.Nano() - cpuBefore.Utime.Nano()
+				systemNS += cpuAfter.Stime.Nano() - cpuBefore.Stime.Nano()
+				discardBitmapWrites += bitmapWrites - bitmapBefore
 				if backend != nil {
-					commits += backend.store.Stats().Commits - before.Commits
+					after := backend.store.Stats()
+					commits += after.Commits - before.Commits
+					indexBytes += after.IndexWritten - before.IndexWritten
+					redoBytes += after.RedoWritten - before.RedoWritten
 				}
 			}
 			b.ReportMetric(float64(len(observer.calls))/float64(b.N), "backend-calls/range")
 			b.ReportMetric(float64(commits)/float64(b.N), "total-commits/range")
+			b.ReportMetric(float64(indexBytes)/float64(b.N), "index-B/range")
+			b.ReportMetric(float64(redoBytes)/float64(b.N), "redo-B/range")
+			b.ReportMetric(float64(discardBitmapWrites*cowBlockSize)/float64(b.N), "presence-B/range")
+			b.ReportMetric(float64(userNS)/float64(b.N), "cpu-user-ns/range")
+			b.ReportMetric(float64(systemNS)/float64(b.N), "cpu-system-ns/range")
 			b.ReportMetric(float64(size), "range-B")
 			b.ReportMetric(float64(cacheSize), "cache-B")
 		})
@@ -126,7 +159,11 @@ func benchmarkCheckpointWriteback(b *testing.B, mode, workload string) {
 	}
 	defer func() { _ = cow.Close() }()
 	chunk := bytes.Repeat([]byte{0x35}, 1<<20)
-	for off := int64(0); off < size; off += int64(len(chunk)) {
+	firstWrite := strings.HasPrefix(workload, "first-")
+	if firstWrite && b.N > blocks {
+		b.Fatal("first-write benchmark must not revisit a page")
+	}
+	for off := int64(0); !firstWrite && off < size; off += int64(len(chunk)) {
 		if _, err := cow.WriteAt(chunk, off); err != nil {
 			b.Fatal(err)
 		}
@@ -183,7 +220,7 @@ func benchmarkCheckpointWriteback(b *testing.B, mode, workload string) {
 	}
 	for i := 0; i < b.N; i++ {
 		block := i % blocks
-		if workload == "random" || workload == "partial" || workload == "mixed" || workload == "cold-read" {
+		if workload == "random" || workload == "first-random" || workload == "partial" || workload == "mixed" || workload == "cold-read" {
 			block = permutation[block]
 		}
 		if workload == "hot" {
@@ -273,6 +310,7 @@ func benchmarkCheckpointWriteback(b *testing.B, mode, workload string) {
 	}
 	if backend != nil {
 		after := backend.store.Stats()
+		b.ReportMetric(float64(after.Commits-before.Commits)/float64(b.N), "commits/op")
 		for name, value := range map[string]uint64{"data-read-B/op": after.DataRead - before.DataRead, "data-write-B/op": after.DataWritten - before.DataWritten, "index-read-B/op": after.IndexRead - before.IndexRead, "index-write-B/op": after.IndexWritten - before.IndexWritten, "redo-B/op": after.RedoWritten - before.RedoWritten, "gc-B/op": after.GCWritten - before.GCWritten, "gc-read-B/op": after.GCRead - before.GCRead, "gc-punch-B/op": after.GCPunched - before.GCPunched, "redo-read-B/op": after.RedoRead - before.RedoRead, "allocated-slots/op": after.Allocated - before.Allocated, "reused-slots/op": after.Reused - before.Reused} {
 			b.ReportMetric(float64(value)/float64(b.N), name)
 		}

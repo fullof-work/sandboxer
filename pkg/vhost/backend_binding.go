@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/kuasar-sandbox/sandboxer/pkg/diffstore"
 	"reflect"
 	"sync/atomic"
 	"syscall"
@@ -46,6 +47,11 @@ func NewBackendSet(specs []BlockDeviceSpec) (*BackendSet, error) {
 		if spec.Capacity <= 0 || spec.Capacity%SectorSize != 0 {
 			return nil, fmt.Errorf("vhost: device %d capacity %d must be positive and sector-aligned", i, spec.Capacity)
 		}
+		if !spec.ReadOnly {
+			if err := diffstore.ValidateWritableSize(spec.Capacity); err != nil {
+				return nil, fmt.Errorf("vhost: device %d: %w", i, err)
+			}
+		}
 		s.devices[i] = &backendSlot{set: s, index: i, unbound: unboundBackend{spec: spec}}
 	}
 	return s, nil
@@ -85,6 +91,9 @@ func (s *BackendSet) Bind(backends []Backend) error {
 		if b.ReadOnly() != spec.ReadOnly {
 			return fmt.Errorf("vhost: device %d backend read-only capability does not match device", i)
 		}
+		if b.SupportsDiscard() != !spec.ReadOnly {
+			return fmt.Errorf("vhost: device %d backend DISCARD capability does not match device", i)
+		}
 	}
 	if !s.binding.CompareAndSwap(nil, next) {
 		return ErrBackendSetBound
@@ -111,6 +120,7 @@ type unboundBackend struct{ spec BlockDeviceSpec }
 func (*unboundBackend) suppressRequestStats() bool         { return true }
 func (b *unboundBackend) Size() int64                      { return b.spec.Capacity }
 func (b *unboundBackend) ReadOnly() bool                   { return b.spec.ReadOnly }
+func (b *unboundBackend) SupportsDiscard() bool            { return !b.spec.ReadOnly }
 func (*unboundBackend) ReadAt([]byte, int64) (int, error)  { return 0, ErrBackendUnbound }
 func (*unboundBackend) WriteAt([]byte, int64) (int, error) { return 0, ErrBackendUnbound }
 func (*unboundBackend) Flush() error                       { return ErrBackendUnbound }
@@ -122,8 +132,9 @@ type backendSlot struct {
 	unbound unboundBackend
 }
 
-func (b *backendSlot) Size() int64    { return b.unbound.Size() }
-func (b *backendSlot) ReadOnly() bool { return b.unbound.ReadOnly() }
+func (b *backendSlot) Size() int64           { return b.unbound.Size() }
+func (b *backendSlot) ReadOnly() bool        { return b.unbound.ReadOnly() }
+func (b *backendSlot) SupportsDiscard() bool { return b.unbound.SupportsDiscard() }
 
 // requestBackend pins one immutable binding view for an entire virtio request,
 // not one view per data segment. A request selected before commit may finish

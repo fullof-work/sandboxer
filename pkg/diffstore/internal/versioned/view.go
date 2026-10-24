@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
+	"github.com/kuasar-sandbox/sandboxer/pkg/diffstore/internal/presence"
 	"github.com/kuasar-sandbox/sandboxer/pkg/diffstore/internal/sectorcrypt"
 	"golang.org/x/crypto/xts"
 	"golang.org/x/sys/unix"
@@ -22,7 +23,9 @@ type View struct {
 	file, lock *os.File
 	info       Info
 	cipher     *xts.Cipher
+	presence   []byte
 	root       uint64
+	next       uint64
 	cache      *pageCache
 	overlay    map[uint64][]byte
 	closed     bool
@@ -54,6 +57,7 @@ func (v *View) Close() error {
 	err := errors.Join(v.file.Close(), v.lock.Close())
 	v.cache = nil
 	v.overlay = nil
+	v.presence = nil
 	v.cipher = nil
 	return err
 }
@@ -107,7 +111,7 @@ func openView(ctx context.Context, f *os.File, lockPath, id string, info Info, x
 		return fail(err)
 	}
 	v := &View{file: f, lock: lock, info: info, cipher: xc, cache: newCache(cachePages), overlay: make(map[uint64][]byte)}
-	records, err := readRedo(f, nil)
+	records, err := readRedo(f, nil, info.LogicalSize)
 	if err != nil {
 		return fail(err)
 	}
@@ -119,13 +123,13 @@ func openView(ctx context.Context, f *os.File, lockPath, id string, info Info, x
 		return fail(err)
 	}
 	var ctrl control
-	if err = decodeJSON(b, "KDCONT2", &ctrl); err != nil {
+	if err = decodeJSON(b, "KDCONT4", &ctrl); err != nil {
 		return fail(err)
 	}
 	if ctrl.Retired {
 		return fail(ErrRetired)
 	}
-	v.root = ctrl.Root
+	v.root, v.next = ctrl.Root, ctrl.Next
 	if id != "" {
 		if err = ValidID(id); err != nil {
 			return fail(err)
@@ -140,7 +144,7 @@ func openView(ctx context.Context, f *os.File, lockPath, id string, info Info, x
 				return fail(err)
 			}
 			var cp checkpoint
-			if err = decodeJSON(b, "KDCP2", &cp); err != nil {
+			if err = decodeJSON(b, "KDCP4", &cp); err != nil {
 				return fail(err)
 			}
 			if cp.ID == id {
@@ -151,6 +155,10 @@ func openView(ctx context.Context, f *os.File, lockPath, id string, info Info, x
 					return fail(err)
 				}
 				v.root = cp.Root
+				v.presence, err = readSnapshotPresence(v.read, cp, info.LogicalSize, ctrl.Next)
+				if err != nil {
+					return fail(err)
+				}
 				found = true
 				break
 			}
@@ -158,6 +166,12 @@ func openView(ctx context.Context, f *os.File, lockPath, id string, info Info, x
 		}
 		if !found {
 			return fail(ErrNotExist)
+		}
+	}
+	if id == "" {
+		v.presence, err = loadPresence(v.read, info.LogicalSize)
+		if err != nil {
+			return fail(err)
 		}
 	}
 	if err = ofd(lock, unix.F_RDLCK, readerByte, false); err != nil {
@@ -178,7 +192,7 @@ func probeCurrent(path string, f *os.File, info Info) (Info, error) {
 	if err = ofd(lock, unix.F_RDLCK, metadataByte, true); err != nil {
 		return Info{}, err
 	}
-	records, err := readRedo(f, nil)
+	records, err := readRedo(f, nil, info.LogicalSize)
 	if err != nil {
 		return Info{}, err
 	}
@@ -197,7 +211,7 @@ func probeCurrent(path string, f *os.File, info Info) (Info, error) {
 		return Info{}, err
 	}
 	var ctrl control
-	if err = decodeJSON(b, "KDCONT2", &ctrl); err != nil {
+	if err = decodeJSON(b, "KDCONT4", &ctrl); err != nil {
 		return Info{}, err
 	}
 	if ctrl.Retired {
@@ -209,7 +223,7 @@ func probeCurrent(path string, f *os.File, info Info) (Info, error) {
 			return Info{}, err
 		}
 		var cp checkpoint
-		if err = decodeJSON(b, "KDCP2", &cp); err != nil {
+		if err = decodeJSON(b, "KDCP4", &cp); err != nil {
 			return Info{}, err
 		}
 		if cp.Visible {
@@ -235,7 +249,7 @@ func (r viewRun) ReadAt(ctx context.Context, b []byte, off uint64) (int, error) 
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
-	if r.kind == sparse.Hole {
+	if r.kind != sparse.Data {
 		clear(b)
 		return len(b), nil
 	}
@@ -258,33 +272,33 @@ func (v *View) RunAt(off, limit uint64) (sparse.Run, error) {
 		end = off + limit
 	}
 	block := off / PageSize
-	e, ok, err := successor(v, v.root, block, 0)
-	if err != nil {
-		return nil, err
+	if presence.Has(v.presence, block) {
+		end = min(end, (block+MaxPresencePages)*PageSize)
 	}
-	if !ok {
+	end = min(end, presence.End(v.presence, block, (end+PageSize-1)/PageSize)*PageSize)
+	if !presence.Has(v.presence, block) {
 		return viewRun{v, off, end, sparse.Hole}, nil
 	}
-	if e.key > block {
-		return viewRun{v, off, min(end, e.key*PageSize), sparse.Hole}, nil
-	}
-	// Coalesce a bounded run of mapped logical pages without touching payload.
-	// Export can then issue full physical extents, while sparse metadata stays
-	// independent from any particular consumer's read order.
-	end = min(end, off+1<<20)
-	cursor := (block + 1) * PageSize
-	for cursor < end {
-		slot, err := lookup(v, v.root, cursor/PageSize)
-		if err != nil {
+	// Use the same bounded traversal and adjacent-subtree validation as the
+	// active owner: a corrupt separator must not turn retained Data into Zero.
+	var mapped [MaxPresencePages]bool
+	pages := (end+PageSize-1)/PageSize - block
+	if v.root != 0 {
+		if err := payloadRange(context.Background(), v, v.root, block, block+pages, mapped[:pages], 0, v.Size()/PageSize-1, 0); err != nil {
 			return nil, err
 		}
-		if slot == 0 {
-			end = cursor
+	}
+	kind := sparse.Zero
+	if mapped[0] {
+		kind = sparse.Data
+	}
+	for i := uint64(1); i < pages; i++ {
+		if mapped[i] != mapped[0] {
+			end = min(end, (block+i)*PageSize)
 			break
 		}
-		cursor += PageSize
 	}
-	return viewRun{v, off, end, sparse.Data}, nil
+	return viewRun{v, off, end, kind}, nil
 }
 func (v *View) ReadAt(ctx context.Context, p []byte, off uint64) (int, error) {
 	v.mu.Lock()
@@ -316,11 +330,23 @@ func (v *View) ReadAt(ctx context.Context, p []byte, off uint64) (int, error) {
 		pos := off + uint64(done)
 		block := pos / PageSize
 		inner := int(pos % PageSize)
+		if !presence.Has(v.presence, block) {
+			n := min(count-done, PageSize-inner)
+			clear(p[done : done+n])
+			done += n
+			continue
+		}
 		slot, err := lookup(v, v.root, block)
 		if err != nil {
 			return done, err
 		}
 		if slot == 0 {
+			if v.root != 0 {
+				var mapped [1]bool
+				if err := payloadRange(ctx, v, v.root, block, block+1, mapped[:], 0, v.Size()/PageSize-1, 0); err != nil {
+					return done, err
+				}
+			}
 			n := min(count-done, PageSize-inner)
 			clear(p[done : done+n])
 			done += n
@@ -328,6 +354,9 @@ func (v *View) ReadAt(ctx context.Context, p []byte, off uint64) (int, error) {
 		}
 		blocks := 1
 		for blocks < 256 && blocks*PageSize-inner < count-done {
+			if !presence.Has(v.presence, block+uint64(blocks)) {
+				break
+			}
 			next, err := lookup(v, v.root, block+uint64(blocks))
 			if err != nil {
 				return done, err
