@@ -61,9 +61,9 @@ printf 'DATASET-OK\n' >"$WORK/dataset-source/DATASET-OK"
     --tmpdir "$WORK/tmp" --output "$WORK/dataset.img" "$WORK/dataset-source"
 ROOT_REF="$(plaintext_tarstream_ref "$ROOT_IMAGE")"
 DATASET_REF="$(plaintext_tarstream_ref "$WORK/dataset.img")"
-"$BIN/sandbox-ctl" diff create --output "$WORK/root.ext4" --size 512M >/dev/null
-"$BIN/sandbox-ctl" diff create --output "$WORK/scratch.ext4" --size 256M >/dev/null
-"$BIN/sandbox-ctl" diff create --output "$WORK/dataset.ext4" --size 256M >/dev/null
+truncate -s 512M "$WORK/root.ext4"; mkfs.ext4 -q -F -O ^has_journal "$WORK/root.ext4"
+truncate -s 256M "$WORK/scratch.ext4"; mkfs.ext4 -q -F -O ^has_journal "$WORK/scratch.ext4"
+truncate -s 256M "$WORK/dataset.ext4"; mkfs.ext4 -q -F -O ^has_journal "$WORK/dataset.ext4"
 
 cat >"$WORK/cold.yaml" <<EOF
 resources: { capacity: { cpu: 1, memory: 512MiB }, allocatable: { cpu: 1, memory: 512MiB } }
@@ -153,8 +153,8 @@ PARENT_MEMORY_BASENAME="$(basename "$PARENT_MEMORY_ARTIFACT")"
 S1_E_REF="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["SandboxRef"])' "$WORK/s1-s.json")"
 S1_E_BASENAME="$(python3 -c 'import json,os,sys; print(os.path.basename(json.load(open(sys.argv[1]))["SandboxRef"].split("@",1)[0]))' "$WORK/s1-s.json")"
 
-"$BIN/sandbox-ctl" diff create --output "$WORK/r1-root.ext4" --size 512M --filesystem none >/dev/null
-"$BIN/sandbox-ctl" diff create --output "$WORK/r1-data.ext4" --size 256M --filesystem none >/dev/null
+truncate -s 512M "$WORK/r1-root.ext4"
+truncate -s 256M "$WORK/r1-data.ext4"
 cat >"$WORK/restore1.yaml" <<EOF
 resources: { capacity: { cpu: 1, memory: 512MiB }, allocatable: { cpu: 1, memory: 512MiB } }
 network: { tap: $TAP_NAME, interface: eth0, ip: 169.254.1.1/31, hostname: memory-residency-r1 }
@@ -224,8 +224,8 @@ cat >"$CH_WRAPPER" <<EOF
 exec "$BIN/cloud-hypervisor" "\$@"
 EOF
 chmod +x "$CH_WRAPPER"
-"$BIN/sandbox-ctl" diff create --output "$WORK/r2-root.ext4" --size 512M --filesystem none >/dev/null
-"$BIN/sandbox-ctl" diff create --output "$WORK/r2-data.ext4" --size 256M --filesystem none >/dev/null
+truncate -s 512M "$WORK/r2-root.ext4"
+truncate -s 256M "$WORK/r2-data.ext4"
 cat >"$WORK/restore2.yaml" <<EOF
 resources: { capacity: { cpu: 1, memory: 512MiB }, allocatable: { cpu: 1, memory: 512MiB } }
 network: { tap: $TAP_NAME, interface: eth0, ip: 169.254.1.1/31, hostname: memory-residency-r2 }

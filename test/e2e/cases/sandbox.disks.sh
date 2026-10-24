@@ -48,14 +48,17 @@ ip link set "$TAP_NAME" up
 ROOT_IMAGE="$WORK/root.img"
 docker save "$E2E_IMAGE" | "$BIN/flatten-ctl" export --output "$ROOT_IMAGE" --no-progress
 [ -s "$ROOT_IMAGE" ] || e2e_fail "flatten produced an empty root artifact"
-"$BIN/sandbox-ctl" diff create --output "$WORK/root-up.ext4" --size 512M >/dev/null
-"$BIN/sandbox-ctl" diff create --output "$WORK/scratch.ext4" --size 256M >/dev/null
+truncate -s 512M "$WORK/root-up.ext4"
+mkfs.ext4 -q -F -O ^has_journal "$WORK/root-up.ext4"
+truncate -s 256M "$WORK/scratch.ext4"
+mkfs.ext4 -q -F -O ^has_journal "$WORK/scratch.ext4"
 mkdir -p "$WORK/dataset-source"
 printf 'DATASET-OK\n' >"$WORK/dataset-source/DATASET-OK"
 "$BIN/flatten-ctl" export --no-progress \
     --tmpdir "$WORK/tmp" --output "$WORK/dataset.img" "$WORK/dataset-source"
 [ -s "$WORK/dataset.img" ] || e2e_fail "dataset flatten produced an empty artifact"
-"$BIN/sandbox-ctl" diff create --output "$WORK/dataset-up.ext4" --size 256M >/dev/null
+truncate -s 256M "$WORK/dataset-up.ext4"
+mkfs.ext4 -q -F -O ^has_journal "$WORK/dataset-up.ext4"
 ROOT_REF="$(plaintext_tarstream_ref "$ROOT_IMAGE")"
 DATASET_REF="$(plaintext_tarstream_ref "$WORK/dataset.img")"
 

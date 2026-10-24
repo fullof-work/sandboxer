@@ -107,7 +107,7 @@ func TestBlockCOW_BitmapRebuildFromExistingDiff(t *testing.T) {
 	payload := bytes.Repeat([]byte{'A'}, 4096)
 	logical := make([]byte, size)
 	copy(logical[2*4096:], payload)
-	writeSparseTemplate(t, diff, logical, []sparse.Extent{{Offset: 2 * 4096, Size: 4096}})
+	writeSparseWorkFile(t, diff, logical, []sparse.Extent{{Offset: 2 * 4096, Size: 4096}})
 
 	cow, err := OpenDisk(diff, nil, DiffInit{Existing: true})
 	if err != nil {

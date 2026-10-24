@@ -79,7 +79,8 @@ ROOT_IMAGE="$WORK/root.img"
 docker save "$E2E_IMAGE" | "$BIN/flatten-ctl" export --output "$ROOT_IMAGE" --no-progress
 ROOT_REF=$(plaintext_tarstream_ref "$ROOT_IMAGE")
 ROOT_DIFF="$WORK/root.diff"
-"$BIN/sandbox-ctl" diff create --output "$ROOT_DIFF" --size 1G >/dev/null
+truncate -s 1G "$ROOT_DIFF"
+mkfs.ext4 -q -F -O ^has_journal "$ROOT_DIFF"
 
 cat >"$WORK/cold.yaml" <<EOF
 resources: { capacity: { cpu: 1, memory: 512MiB }, allocatable: { cpu: 1, memory: 512MiB } }
@@ -124,7 +125,7 @@ last_tick() {
 }
 write_host_config() {
     local path=$1 diff=$2 hostname=$3
-    "$BIN/sandbox-ctl" diff create --output "$diff" --size 1G --filesystem none >/dev/null
+    truncate -s 1G "$diff"
     cat >"$path" <<EOF
 resources: { capacity: { cpu: 1, memory: 512MiB }, allocatable: { cpu: 1, memory: 512MiB } }
 network: { tap: $TAP_NAME, interface: eth0, ip: 169.254.1.1/31, hostname: $hostname }

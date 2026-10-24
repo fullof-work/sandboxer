@@ -3,7 +3,7 @@
 `pkg/diffstore` owns writable block storage independently of vhost transport. Both
 single-layer v3 files and checkpoint-capable v4 files use the same `Disk`
 frontend. Both store logical presence separately from physical payload. Legacy
-raw/v1/v2 working files and templates are rejected without modification. Export
+raw/v1/v2 working files are rejected without modification. Export
 them with the old executable before upgrading; existing portable tarstreams remain
 readable and can seed a new-format DIFF. There is no in-place migration.
 
@@ -225,9 +225,9 @@ adjacent ranges. Descriptor pages between each 128 record positions and all live
 pages split ranges. Punching finishes before one existing metadata/redo transaction
 removes the old chain entries and publishes free descriptors. The batch links in
 ascending address order, then joins the former free head. Failure before commit
-publishes no free slots; reopening may safely repeat a punch. No new format version,
-larger redo area, payload relocation, file truncation or global free-range index
-is introduced. Encryption and direct-I/O alignment retain their existing rules.
+publishes no free slots; reopening may safely repeat a punch. GC itself adds no
+format version, larger redo area, payload relocation, file truncation or global
+free-range index. Encryption and direct-I/O alignment retain their existing rules.
 
 `DirectoryMaintenance` borrows an acquired `DirectoryOwner`, validates its stable
 lock identity, and registers all active DiffIDs before enumeration. It never
@@ -261,8 +261,15 @@ whole-file withdrawal/deletion. Runtime and offline usage belongs to
 | Storage tests formerly in `pkg/vhost` | `pkg/diffstore` |
 | B+ engine tests formerly in `internal/diffstore` | `pkg/diffstore/internal/versioned` |
 
-This changes Go source imports; it does not change CLI/configuration or disk bytes.
-All repository callers migrate together. `vhost.BlockReader` remains a type alias
+The earlier package relocation in this table changed Go source imports without
+changing CLI/configuration or disk bytes. The presence-enabled v3/v4 formats are a
+separate, incompatible working-file change: export retained raw/v1/v2 work-file
+content with the old version before upgrading. Provisioning templates remain
+immutable inputs with their existing raw/encrypted input contract; their readers
+do not reopen or upgrade the source as an active working file. Existing raw ext4
+preparation and old portable tarstream import remain supported.
+
+All repository callers use the relocated API. `vhost.BlockReader` remains a type alias
 for the source accepted by read-only transport devices. Storage benchmark flags
 and `VHOST_*` environment names remain compatible; their compiled test package is
 now `./pkg/diffstore`. The existing ENOSPC script name remains a CI entry point.

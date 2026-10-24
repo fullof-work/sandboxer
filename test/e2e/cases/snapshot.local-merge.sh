@@ -107,7 +107,8 @@ docker save "$E2E_IMAGE" | "$BIN/flatten-ctl" export --output "$ROOT_IMAGE" --no
 [ -s "$ROOT_IMAGE" ] || e2e_fail "flatten produced an empty root artifact"
 ROOT_REF="$(plaintext_tarstream_ref "$ROOT_IMAGE")"
 DIFF="$WORK/root.diff"
-"$BIN/sandbox-ctl" diff create --output "$DIFF" --size 1G >/dev/null
+truncate -s 1G "$DIFF"
+mkfs.ext4 -q -F -O ^has_journal "$DIFF"
 
 PYCODE='import os,time
 print("PYBOOT-OK", flush=True)
@@ -140,7 +141,8 @@ EOF
 
 write_restore_config() {
     local path=$1 diff=$2
-    "$BIN/sandbox-ctl" diff create --output "$diff" --size 1G >/dev/null
+    truncate -s 1G "$diff"
+    mkfs.ext4 -q -F -O ^has_journal "$diff"
     cat >"$path" <<EOF
 resources:
   capacity: { cpu: 1, memory: 512MiB }

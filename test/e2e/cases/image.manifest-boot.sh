@@ -131,7 +131,8 @@ MKEY=$("$BIN/manifest-ctl" store --manifest-config "$WORK/manifest.yaml" --no-pr
 [[ "$MKEY" =~ ^[0-9a-f]{64}$ ]] || e2e_fail "manifest store returned a non-canonical key: $MKEY"
 
 DIFF_FILE="$WORK/root.ext4"
-"$BIN/sandbox-ctl" diff create --output "$DIFF_FILE" --size 1G >/dev/null
+truncate -s 1G "$DIFF_FILE"
+mkfs.ext4 -q -F -O ^has_journal "$DIFF_FILE"
 cat >"$WORK/sandbox.yaml" <<EOF
 resources:
   capacity: { cpu: 1, memory: 512MiB }

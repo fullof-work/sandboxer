@@ -667,7 +667,7 @@ sandbox-ctl snapshot --path-id worker --checkpoint cp-001 --json
 `--restore`) derive `CheckpointDir = BaseRoot/PathID/checkpoint`; writable root
 and data disks live in `CheckpointDir/diffs/<DiffID>.diff`. These files survive
 normal exit. There is no second launch directory setting. A fresh run assigns
-new disk identities. Existing raw/v1/v2 working files and templates are rejected;
+new disk identities. Existing raw/v1/v2 working files are rejected;
 export with the old executable and restore the portable artifact into new files.
 An explicit writable path outside this derived
 directory, or a filesystem without the required locking, fails before launch.
@@ -1353,11 +1353,11 @@ capacity. New configuration output does not emit them. Unrelated fields and
 opaque metadata are unaffected.
 
 For new disposable ext4 work disks (overlay uppers, single roots and scratch
-or data-disk fixtures), create a v3 template with `sandbox-ctl diff create`.
+or data-disk fixtures), format the sparse template with `mkfs.ext4 -O ^has_journal`.
 This avoids filesystem journal allocation and metadata journal writes; it does
 not disable journald or application logs. COW is not a replacement for a journal,
 and this default does not promise crash recovery of an interrupted work disk.
-Journaled new-format templates (`--journal`) and portable snapshots remain supported;
+Existing journaled templates, user-supplied images and snapshots remain compatible;
 guest sync/quiesce and snapshot/restore semantics are unchanged. Do not reformat
 an existing data disk to apply this recommendation.
 
@@ -1365,7 +1365,8 @@ For a **new**, empty 512 MiB scratch filesystem, prepare a new template and
 select it without a size override:
 
 ```bash
-sandbox-ctl diff create --output /tmp/scratch-512m.ext4 --size 512MiB
+truncate -s 512M /tmp/scratch-512m.ext4
+mkfs.ext4 -F -O ^has_journal /tmp/scratch-512m.ext4
 ```
 
 ```yaml
@@ -1380,17 +1381,7 @@ mounts:
     source: scratch
 ```
 
-`diff create` accepts a new output path only and creates a plaintext v3 DIFF
-containing ext4 by default. `--directory DIR` seeds that new filesystem;
-`--journal` enables its journal. `--filesystem none` creates an all-Hole DIFF for
-an explicitly selected restore/lower source; it is not a standalone formatted
-filesystem. Size must be positive, 4 KiB aligned and at most 32 GiB. A private raw
-filesystem is generated internally, copied by allocated extents and removed;
-this command does not import old working files. Publication is atomic and refuses
-to replace any existing output, including an empty file. The filename suffix is
-not a format indicator. Direct raw `truncate`/`mkfs` output and legacy raw/v1/v2
-DIFFs/templates are rejected by the new runtime. Export those with the old
-executable before upgrading, then restore the portable artifact into new files.
+Provisioning templates remain immutable inputs, distinct from active DIFF work files. Existing raw ext4 preparation and encrypted-template reading remain supported; no template rebuild or new creation command is required. The runtime reads the template and creates a separate v3/v4 working file. Templates used for writable disks must still satisfy the positive, 4 KiB aligned, at-most-32-GiB logical capacity limit.
 
 Use a new active diff: an existing diff takes precedence, so changing a template
 does not resize or replace existing data. Do not truncate an existing filesystem

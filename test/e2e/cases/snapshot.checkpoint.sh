@@ -48,7 +48,8 @@ trap cleanup EXIT
 docker save "$E2E_IMAGE" | "$BIN/flatten-ctl" export --output "$WORK/root.img" --no-progress
 ROOT_REF="$(plaintext_tarstream_ref "$WORK/root.img")"
 for disk in root scratch dataset; do
-    "$BIN/sandbox-ctl" diff create --output "$WORK/$disk.ext4" --size 256M >/dev/null
+    truncate -s 256M "$WORK/$disk.ext4"
+    mkfs.ext4 -q -F -O ^has_journal "$WORK/$disk.ext4"
 done
 cat >"$WORK/cold.yaml" <<EOF
 resources: { capacity: { cpu: 1, memory: 512MiB }, allocatable: { cpu: 1, memory: 512MiB } }

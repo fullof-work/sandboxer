@@ -253,12 +253,25 @@ func diffHeaderAAD(prefix []byte) []byte {
 }
 
 type diffEncryption struct {
-	header cipher.AEAD
+	header         cipher.AEAD
+	templateHeader cipher.AEAD
 }
 
 func newDiffEncryption(customerKey [32]byte) (*diffEncryption, error) {
+	header, err := newDiffHeaderCipher(customerKey, diffHeaderKeyDomain)
+	if err != nil {
+		return nil, err
+	}
+	templateHeader, err := newDiffHeaderCipher(customerKey, []byte("kuasar/diff/header-key/aes-gcm/v1\x00"))
+	if err != nil {
+		return nil, err
+	}
+	return &diffEncryption{header: header, templateHeader: templateHeader}, nil
+}
+
+func newDiffHeaderCipher(customerKey [32]byte, domain []byte) (cipher.AEAD, error) {
 	mac := hmac.New(sha256.New, customerKey[:])
-	_, _ = mac.Write(diffHeaderKeyDomain)
+	_, _ = mac.Write(domain)
 	var headerKey [sha256.Size]byte
 	mac.Sum(headerKey[:0])
 	defer clear(headerKey[:])
@@ -270,7 +283,7 @@ func newDiffEncryption(customerKey [32]byte) (*diffEncryption, error) {
 	if err != nil {
 		return nil, fmt.Errorf("diffstore: create diff header GCM: %w", err)
 	}
-	return &diffEncryption{header: header}, nil
+	return header, nil
 }
 
 // MaxWritableSize bounds a DIFF's logical address space, not its history, a
@@ -478,62 +491,12 @@ type fileDiffTemplate struct {
 	diff *diffFile
 }
 
-type lazyDiffTemplate struct {
-	diff *diffFile
-}
-
 func openLazyDiffTemplate(path string, encryption *diffEncryption) (diffTemplateSource, error) {
-	diff, err := openExistingDiffFile(path, encryption, false, true)
-	if err != nil {
-		return nil, err
-	}
-	return &lazyDiffTemplate{diff: diff}, nil
+	return openProvisioningTemplate(path, encryption)
 }
-
-func (s *lazyDiffTemplate) Size() uint64 { return uint64(s.diff.logicalSize) }
-
-func (s *lazyDiffTemplate) RunAt(offset, limit uint64) (sparse.Run, error) {
-	if offset >= s.Size() {
-		return nil, io.EOF
-	}
-	if limit == 0 {
-		return nil, fmt.Errorf("diffstore: diff template RunAt limit is zero")
-	}
-	kind, end := s.diff.classify(offset, limit)
-	return lazyDiffTemplateRun{source: s, offset: offset, end: end, kind: kind}, nil
-}
-
-type lazyDiffTemplateRun struct {
-	source *lazyDiffTemplate
-	offset uint64
-	end    uint64
-	kind   sparse.RunKind
-}
-
-func (r lazyDiffTemplateRun) Offset() uint64       { return r.offset }
-func (r lazyDiffTemplateRun) End() uint64          { return r.end }
-func (r lazyDiffTemplateRun) Kind() sparse.RunKind { return r.kind }
-func (r lazyDiffTemplateRun) ReadAt(ctx context.Context, buf []byte, innerOffset uint64) (int, error) {
-	if r.kind == sparse.Hole || r.kind == sparse.Zero {
-		clear(buf)
-		return len(buf), nil
-	}
-	return r.source.ReadAt(ctx, buf, r.offset+innerOffset)
-}
-func (s *lazyDiffTemplate) ReadAt(ctx context.Context, buf []byte, offset uint64) (int, error) {
-	if err := ctx.Err(); err != nil {
-		return 0, err
-	}
-	return s.diff.ReadAt(buf, int64(offset))
-}
-func (s *lazyDiffTemplate) Close() error { return s.diff.Close() }
 
 func openDiffTemplate(path string, encryption *diffEncryption) (diffTemplateSource, error) {
-	diff, err := openExistingDiffFile(path, encryption, false, true)
-	if err != nil {
-		return nil, err
-	}
-	return &fileDiffTemplate{diff: diff}, nil
+	return openProvisioningTemplate(path, encryption)
 }
 
 func (s *fileDiffTemplate) Size() uint64 { return uint64(s.diff.logicalSize) }

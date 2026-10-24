@@ -166,8 +166,8 @@ func testDiffIOBeforeTemplateSeed(t *testing.T, dir string, tmpfs bool) {
 		t.Fatal(err)
 	}
 	defer src.Close()
-	if src.(*fileDiffTemplate).diff.direct == nil {
-		t.Fatal("immutable template lacks zero-aware owned workspace")
+	if _, ok := src.(*templateImage); !ok {
+		t.Fatal("raw provisioning template was opened as an active DIFF")
 	}
 	probeDir, err := filepath.EvalSymlinks(dir)
 	if err != nil {

@@ -57,9 +57,12 @@ printf 'DATASET-OK\n' >"$WORK/dataset-source/DATASET-OK"
 ROOT_REF="$(plaintext_tarstream_ref "$ROOT_IMAGE")"
 DATASET_REF="$(plaintext_tarstream_ref "$WORK/dataset.img")"
 
-"$BIN/sandbox-ctl" diff create --output "$WORK/root.ext4" --size 512M >/dev/null
-"$BIN/sandbox-ctl" diff create --output "$WORK/scratch.ext4" --size 256M >/dev/null
-"$BIN/sandbox-ctl" diff create --output "$WORK/dataset.ext4" --size 256M >/dev/null
+truncate -s 512M "$WORK/root.ext4"
+mkfs.ext4 -q -F -O ^has_journal "$WORK/root.ext4"
+truncate -s 256M "$WORK/scratch.ext4"
+mkfs.ext4 -q -F -O ^has_journal "$WORK/scratch.ext4"
+truncate -s 256M "$WORK/dataset.ext4"
+mkfs.ext4 -q -F -O ^has_journal "$WORK/dataset.ext4"
 
 cat >"$WORK/cold.yaml" <<EOF
 resources: { capacity: { cpu: 1, memory: 512MiB }, allocatable: { cpu: 1, memory: 512MiB } }
@@ -137,8 +140,8 @@ PY
 
 # Empty uppers inherit the captured filesystem metadata and content. Formatting
 # these files here would intentionally destroy the snapshot-backed state.
-"$BIN/sandbox-ctl" diff create --output "$WORK/root-restore.ext4" --size 512M --filesystem none >/dev/null
-"$BIN/sandbox-ctl" diff create --output "$WORK/dataset-restore.ext4" --size 256M --filesystem none >/dev/null
+truncate -s 512M "$WORK/root-restore.ext4"
+truncate -s 256M "$WORK/dataset-restore.ext4"
 cat >"$WORK/restore.yaml" <<EOF
 resources: { capacity: { cpu: 1, memory: 512MiB }, allocatable: { cpu: 1, memory: 512MiB } }
 network: { tap: $TAP_NAME, interface: eth0, ip: 169.254.1.1/31, hostname: snapshot-disks-r }

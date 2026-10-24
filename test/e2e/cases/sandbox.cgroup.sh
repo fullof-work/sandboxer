@@ -87,7 +87,8 @@ run_case() {
     mkdir -p "$case_dir" "$run_root"
 
     local diff="$case_dir/root.diff"
-    "$BIN/sandbox-ctl" diff create --output "$diff" --size 1G >/dev/null
+    truncate -s 1G "$diff"
+    mkfs.ext4 -q -F -O ^has_journal "$diff"
 
     cat >"$case_dir/sandbox.yaml" <<EOF
 resources:

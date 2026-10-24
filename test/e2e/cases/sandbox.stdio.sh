@@ -50,7 +50,8 @@ ROOT_REF="$(plaintext_tarstream_ref "$ROOT_IMAGE")"
 write_config() {
     local output=$1
     local diff=$2
-    "$BIN/sandbox-ctl" diff create --output "$diff" --size 1G >/dev/null
+    truncate -s 1G "$diff"
+    mkfs.ext4 -q -F -O ^has_journal "$diff"
     cat >"$output" <<EOF
 resources:
   capacity: { cpu: 1, memory: 512MiB }

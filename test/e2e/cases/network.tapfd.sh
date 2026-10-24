@@ -92,7 +92,8 @@ ROOT_REF="$(plaintext_tarstream_ref "$ROOT_IMAGE")"
 GUEST_MAC="02:00:00:00:80:01"
 
 mkdiff() {
-    "$BIN/sandbox-ctl" diff create --output "$1" --size 1G >/dev/null
+    truncate -s 1G "$1"
+    mkfs.ext4 -q -F -O ^has_journal "$1"
 }
 
 write_config() {

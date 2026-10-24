@@ -237,7 +237,8 @@ while True:
     i += 1
     time.sleep(.02)
 PY
-"$BIN/sandbox-ctl" diff create --output "$WORK/seed.diff" --size 1G >/dev/null
+truncate -s 1G "$WORK/seed.diff"
+mkfs.ext4 -q -F -O ^has_journal "$WORK/seed.diff"
 python3 - "$WORK" "$ROOT" "$BIN" <<'PY'
 import json, pathlib, sys
 w, root, binpath = sys.argv[1:]

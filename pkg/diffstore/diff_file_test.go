@@ -758,7 +758,9 @@ func testValidateDiffExt4UsesLogicalPlaintextAndBaseFallback(t *testing.T, dir s
 	if err := ValidateDiffTemplateExt4(ctx, plainPath, nil); err != nil {
 		t.Fatalf("validate plaintext template: %v", err)
 	}
-	if err := ValidateExistingDiffExt4(ctx, plainPath, nil,
+	activePlain := filepath.Join(dir, "plain-active.diff")
+	writeSparseWorkFile(t, activePlain, ext4, []sparse.Extent{{Offset: 1024, Size: 1024}})
+	if err := ValidateExistingDiffExt4(ctx, activePlain, nil,
 		WithDiffEncryption(testDiffKey(0x81), true)); !errors.Is(err, ErrDiffPlaintextForbidden) {
 		t.Fatalf("required policy error = %v, want ErrDiffPlaintextForbidden", err)
 	}
@@ -788,7 +790,7 @@ func testValidateDiffExt4UsesLogicalPlaintextAndBaseFallback(t *testing.T, dir s
 	}
 
 	invalidPath := filepath.Join(dir, "invalid")
-	writeSparseTemplate(t, invalidPath, make([]byte, size), nil)
+	writeSparseWorkFile(t, invalidPath, make([]byte, size), nil)
 	if err := ValidateExistingDiffExt4(ctx, invalidPath, nil); err == nil ||
 		!strings.Contains(err.Error(), "formatted ext4") {
 		t.Fatalf("invalid filesystem error = %v", err)
@@ -1026,6 +1028,28 @@ func rewrapDiffHeader(t *testing.T, path string, key [32]byte, mutate func([]byt
 }
 
 func writeSparseTemplate(t *testing.T, path string, logical []byte, data []sparse.Extent) {
+	t.Helper()
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if err := f.Truncate(int64(len(logical))); err != nil {
+		t.Fatal(err)
+	}
+	for _, extent := range data {
+		start := int(extent.Offset)
+		end := start + int(extent.Size)
+		if _, err := f.WriteAt(logical[start:end], int64(start)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := f.Sync(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func writeSparseWorkFile(t *testing.T, path string, logical []byte, data []sparse.Extent) {
 	t.Helper()
 	f, err := os.Create(path)
 	if err != nil {

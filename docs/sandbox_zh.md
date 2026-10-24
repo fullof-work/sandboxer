@@ -603,7 +603,7 @@ sandbox-ctl snapshot --path-id worker --checkpoint cp-001 --json
 `PathID` 默认等于 `SandboxID`。`--config`、`--from` 和 `--restore` 都沿用
 `CheckpointDir = BaseRoot/PathID/checkpoint`；根盘和数据盘的可写文件位于
 `CheckpointDir/diffs/<DiffID>.diff`，正常退出后保留。不增加第二个启动目录配置。
-新启动分配新的磁盘身份。已有 raw/v1/v2 工作文件及模板被拒绝；升级前用旧程序导出，
+新启动分配新的磁盘身份。已有 raw/v1/v2 工作文件被拒绝；升级前用旧程序导出，
 再把便携制品恢复到新文件。显式指定派生目录之外的可写路径，或文件系统不支持所需锁
 操作，会在启动前失败。
 
@@ -1220,17 +1220,18 @@ COW base 属于可写 ext4 upper，不是只读 EROFS 镜像。这些规则同�
 这些键；无关配置字段和不透明的 metadata 不受影响。
 
 对于新建的可丢弃 ext4 工作盘（overlay upper、单盘 root，以及 scratch 或数据盘测试
-文件），使用 `sandbox-ctl diff create` 创建 v3 模板，避免文件系统 journal
+文件），使用 `mkfs.ext4 -O ^has_journal` 格式化稀疏模板，避免文件系统 journal
 占用及元数据日志写入；这不影响 journald 或应用日志。COW 不能替代 journal，
-此默认约定不承诺中断后工作盘的崩溃恢复。带 journal 的新格式模板（`--journal`）及
-便携快照仍受支持；guest sync/quiesce 与快照/恢复语义保持不变。不要为应用此建议而
+此默认约定不承诺中断后工作盘的崩溃恢复。已有带 journal 的模板、用户自带镜像和
+快照继续兼容；guest sync/quiesce 与快照/恢复语义保持不变。不要为应用此建议而
 重新格式化已有数据盘。
 
 对于一个**新建的**、空白的 512 MiB scratch 文件系统，可以准备新模板，使用时不再指定
 大小覆盖项：
 
 ```bash
-sandbox-ctl diff create --output /tmp/scratch-512m.ext4 --size 512MiB
+truncate -s 512M /tmp/scratch-512m.ext4
+mkfs.ext4 -F -O ^has_journal /tmp/scratch-512m.ext4
 ```
 
 ```yaml
@@ -1245,13 +1246,7 @@ mounts:
     source: scratch
 ```
 
-`diff create` 只接受新输出路径，默认创建含 ext4 的明文 v3 DIFF。`--directory DIR`
-为新文件系统填充初始文件，`--journal` 启用 journal。`--filesystem none` 创建全 Hole
-DIFF，供显式选择的恢复/lower 来源使用，本身不是已格式化的独立文件系统。
-容量必须为正数、4 KiB 对齐且不超过 32 GiB。命令内部生成私有 raw 文件系统，按已分配
-区间复制后移除，不导入旧工作文件。输出原子发布，拒绝替换包括空文件在内的任何已有
-路径。文件后缀不代表格式。新版运行时拒绝直接 `truncate`/`mkfs` 生成的 raw 文件及旧
-raw/v1/v2 DIFF/模板；升级前用旧程序导出便携制品，再恢复到新文件。
+模板是只读的初始化输入，与活动 DIFF 工作文件不同。既有 raw ext4 准备方式及加密模板读取继续受支持，无需重建模板或使用新的创建命令。运行时读取模板，另行创建 v3/v4 工作文件。用于可写磁盘的模板仍须满足逻辑容量为正、4 KiB 对齐且不超过 32 GiB 的限制。
 
 必须使用新的活动 diff：已有 diff 优先，因此更换模板不会调整容量或替换已有数据。
 不要通过截断已有文件系统来实施更小的限制。Sandboxer 不会自动调整文件系统大小，

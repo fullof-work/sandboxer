@@ -70,7 +70,8 @@ ROOT_REF="$(plaintext_tarstream_ref "$ROOT_IMAGE")"
 RUN_ROOT="$WORK/run"
 BASE_ROOT="$WORK/base"
 mkdir -p "$RUN_ROOT" "$BASE_ROOT" "$WORK/snapshot"
-"$BIN/sandbox-ctl" diff create --output "$WORK/template.ext4" --size 512M >/dev/null
+truncate -s 512M "$WORK/template.ext4"
+mkfs.ext4 -q -F -O ^has_journal "$WORK/template.ext4"
 cat >"$WORK/cold.yaml" <<EOF
 resources:
   capacity: {cpu: 1, memory: 512MiB}
@@ -157,7 +158,8 @@ wait_run_exit
 SNAPSHOT="$WORK/snapshot/$SID1.snapshot"
 [ -f "$SNAPSHOT" ] || e2e_fail "journal snapshot is missing"
 
-"$BIN/sandbox-ctl" diff create --output "$WORK/restored.ext4" --size 512M >/dev/null
+truncate -s 512M "$WORK/restored.ext4"
+mkfs.ext4 -q -F -O ^has_journal "$WORK/restored.ext4"
 cat >"$WORK/restore.yaml" <<EOF
 resources:
   capacity: {cpu: 1, memory: 512MiB}
