@@ -172,3 +172,64 @@ func TestEncryptedProvisioningTemplateAuthentication(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestSingleTemplatePresencePublicationIsBatched(t *testing.T) {
+	const size = 130 * cowBlockSize
+	for _, encrypted := range []bool{false, true} {
+		t.Run(fmt.Sprintf("encrypted=%v", encrypted), func(t *testing.T) {
+			ctx := context.Background()
+			dir := t.TempDir()
+			input := filepath.Join(dir, "template.ext4")
+			want := bytes.Repeat([]byte{0x53}, size)
+			writeSparseTemplate(t, input, want, []sparse.Extent{{Offset: 0, Size: size}})
+			source, err := openLazyDiffTemplate(input, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer source.Close()
+			var options []DiskOption
+			if encrypted {
+				options = append(options, WithDiffEncryption(testDiffKey(81), true))
+			}
+			path := filepath.Join(dir, "active")
+			disk, err := OpenDisk(path, nil, DiffInit{CreateSize: size}, options...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer disk.Close()
+			// Foreground pages split the first template batch into disjoint runs.
+			foreground := bytes.Repeat([]byte{0xa1}, cowBlockSize)
+			for _, block := range []int{1, 63} {
+				if _, err := disk.WriteAt(foreground, int64(block*cowBlockSize)); err != nil {
+					t.Fatal(err)
+				}
+				copy(want[block*cowBlockSize:], foreground)
+			}
+			if err := disk.Drain(ctx); err != nil {
+				t.Fatal(err)
+			}
+			backend := disk.diff.(*diffFile)
+			writes := 0
+			backend.beforePresenceWrite = func(int) error { writes++; return nil }
+			staging := make([]byte, disk.diff.policy().materialPages*cowBlockSize)
+			if err := disk.materializeRange(ctx, source, 0, size, staging); err != nil {
+				t.Fatal(err)
+			}
+			if writes != 3 {
+				t.Fatalf("130 pages with foreground gaps published presence %d times, want 3 bounded batches", writes)
+			}
+			if err := disk.Close(); err != nil {
+				t.Fatal(err)
+			}
+			reopened, err := OpenDisk(path, nil, DiffInit{Existing: true}, options...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer reopened.Close()
+			got := make([]byte, size)
+			if _, err := reopened.ReadAt(got, 0); err != nil || !bytes.Equal(got, want) {
+				t.Fatalf("reopened template/foreground bytes differ: %v", err)
+			}
+		})
+	}
+}

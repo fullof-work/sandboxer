@@ -41,10 +41,9 @@ type diffBackend interface {
 
 func (d *diffFile) Size() int64 { return d.logicalSize }
 func (d *diffFile) policy() batchPolicy {
-	// Payload runs remain separate physical writes, but one bounded batch can
-	// publish each changed P page once. Otherwise random first writes rewrite
-	// the same bitmap page for every singleton in the dirty queue.
-	return batchPolicy{materialPages: 1}
+	// Reuse writeback batching for template materialization. Cap each staging
+	// and stripe-lock window at 256 KiB instead of publishing P per 4 KiB page.
+	return batchPolicy{materialPages: (256 << 10) / cowBlockSize}
 }
 func (d *diffFile) markModified(ctx context.Context) error { return ctx.Err() }
 func (d *diffFile) err() error                             { return nil }

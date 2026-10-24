@@ -52,7 +52,7 @@ disk, err := diffstore.OpenDisk(path, base, init,
 
 Check `err` before using a disk. `DiffInit{Existing: true}` opens an existing file;
 `CreateSize` or `TemplatePath` provisions a fresh file. v4 opens authenticate and
-check the expected identity/base and never adopt older files. A plaintext v3
+check the expected identity/base and never adopt older files. A plaintext raw
 provisioning template remains allowed when the new active file must be encrypted.
 
 | Property | Single layer (v3) | Versioned (v4) |
@@ -60,7 +60,7 @@ provisioning template remains allowed when the new active file must be encrypted
 | Runtime | Same `Disk` and shared `Cache` | Same `Disk` and shared `Cache` |
 | Existing-file presence | Full logical P load; sparse scan identifies physical payload only | Full logical P load; bounded B+ queries identify payload |
 | Writeback | Bounded batches may contain disjoint pages; each changed P page is published once per batch | Bounded transactions may contain disjoint logical pages |
-| Template staging | One 4 KiB page | Up to `maxWritebackPages` (256) 4 KiB pages |
+| Template staging | Up to 64 pages (256 KiB) | Up to `maxWritebackPages` (256) 4 KiB pages |
 | Checkpoint capability | Unavailable | `CheckpointManager` |
 | Physical failure cleanup | Hole-punch only newly created upper pages | Transaction/allocation engine owns recovery; never punch guest offsets in the mixed physical file |
 
@@ -74,7 +74,9 @@ limits and encryption domains retain their existing policies.
 Fresh creation shares the claim/recheck/template/temp-file flow, and publication
 shares file sync, atomic rename, claim release and directory sync. Materialization
 uses one dispatcher and the same stripe/presence conflict checks. v4 retains
-batched template commits; single-layer retains one-page staging. Template bytes
+batched template commits; single-layer batches at most 64 pages to amortize
+presence publication and contiguous payload writes. Its temporary staging grows
+from 4 KiB to 256 KiB only while materialization runs. Template bytes
 are read before taking write stripes, then presence is rechecked so frontend
 writes/discards win. A fully superseded range may consequently be read and then
 skipped. `WaitMaterialReady` and `WaitMaterialized` retain distinct readiness and
