@@ -55,7 +55,7 @@ type CowBackend struct{ C *diffstore.Disk }
 func (b *CowBackend) ReadAt(buf []byte, offset int64) (int, error)  { return b.C.ReadAt(buf, offset) }
 func (b *CowBackend) WriteAt(buf []byte, offset int64) (int, error) { return b.C.WriteAt(buf, offset) }
 func (b *CowBackend) Flush() error                                  { return b.C.Flush() }
-func (b *CowBackend) Discard(offset, length int64) error            { return b.C.Discard(offset, length, false) }
+func (b *CowBackend) Discard(offset, length int64) error            { return b.C.Discard(offset, length) }
 func (b *CowBackend) Size() int64                                   { return b.C.Size() }
 func (b *CowBackend) ReadOnly() bool                                { return false }
 func (b *CowBackend) SupportsDiscard() bool                         { return true }

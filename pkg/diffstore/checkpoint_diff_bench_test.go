@@ -39,16 +39,10 @@ func BenchmarkCheckpointCOWWriteback(b *testing.B) {
 	}
 }
 
-// Discard is measured with a dense upper and a cache smaller than the range.
+// Complete Zero Discard is measured with a dense upper and a cache smaller than the range.
 // Refill/Drain is excluded. The normal backend GC remains enabled, so total
 // commits include concurrent reclamation and are not Discard-only commits.
-func BenchmarkCheckpointDiscard(b *testing.B) { benchmarkCheckpointDiscard(b, true) }
-
-// Guest Zero discard preserves P=1 after releasing dense payload; the older
-// baseline has no Guest DISCARD and is compared only through the Hole case.
-func BenchmarkCheckpointGuestDiscard(b *testing.B) { benchmarkCheckpointDiscard(b, false) }
-
-func benchmarkCheckpointDiscard(b *testing.B, hole bool) {
+func BenchmarkCheckpointDiscard(b *testing.B) {
 	for _, mode := range []string{"raw", "v1", "v2-no-version", "v2-xts-no-version"} {
 		b.Run(mode, func(b *testing.B) {
 			const size = int64(4 << 20)
@@ -102,7 +96,7 @@ func benchmarkCheckpointDiscard(b *testing.B, hole bool) {
 				}
 				bitmapBefore := bitmapWrites
 				b.StartTimer()
-				if err := cow.Discard(0, size, hole); err != nil {
+				if err := cow.Discard(0, size); err != nil {
 					b.Fatal(err)
 				}
 				b.StopTimer()

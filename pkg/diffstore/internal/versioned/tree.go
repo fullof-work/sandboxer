@@ -443,7 +443,7 @@ func (s *Store) WritePages(ctx context.Context, pages []Page) error {
 			// keeps unrelated logical pages physically adjacent whenever possible.
 			var mappings []entry
 			for _, block := range order {
-				if err := t.setPresence(block, true); err != nil {
+				if err := t.setPresence(block); err != nil {
 					return err
 				}
 				slot, err := lookup(t, t.ctrl.Root, block)
@@ -574,7 +574,11 @@ func (s *Store) Scan(ctx context.Context, visit func(uint64) error) error {
 	}
 	return s.scanActive(ctx, s.ctrl.Root, 0, uint64(s.Size()/PageSize)-1, 0, visit)
 }
-func (s *Store) Discard(ctx context.Context, off, length int64, hole bool) error {
+
+// Discard removes active data mappings and commits logical Zero in bounded
+// batches. The range must contain aligned complete pages. Retained versions
+// keep their protected records until independent deletion and GC can free them.
+func (s *Store) Discard(ctx context.Context, off, length int64) error {
 	if off < 0 || length < 0 || off%PageSize != 0 || length%PageSize != 0 || off > s.Size() || length > s.Size()-off {
 		return fmt.Errorf("diffstore: invalid discard range")
 	}
@@ -606,7 +610,7 @@ func (s *Store) Discard(ctx context.Context, off, length int64, hole bool) error
 			// closure must not advance the caller's range before a commit succeeds.
 			for current := pos; current < end; current += PageSize {
 				block := uint64(current / PageSize)
-				if err := t.setPresence(block, !hole); err != nil {
+				if err := t.setPresence(block); err != nil {
 					return err
 				}
 				slot, err := lookup(t, t.ctrl.Root, block)

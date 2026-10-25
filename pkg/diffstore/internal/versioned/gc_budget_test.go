@@ -297,7 +297,7 @@ func TestGCBudgetOneFairWithContinuouslyAddedGarbage(t *testing.T) {
 		// This new page was born after every retained version. Its withdrawal
 		// continually replenishes the global chain while version work is pending.
 		putPages(t, s, []uint64{8}, byte(step))
-		if err := s.Discard(ctx, 8*PageSize, PageSize, true); err != nil {
+		if err := s.Discard(ctx, 8*PageSize, PageSize); err != nil {
 			t.Fatal(err)
 		}
 		if s.gc != progress {
@@ -324,7 +324,7 @@ func TestGCBudgetOneFairWithContinuouslyAddedGarbage(t *testing.T) {
 	}
 	defer v.Close()
 	checkView(t, v, map[uint64][]byte{1: pageFor(1, 1), 2: pageFor(2, 1), 3: pageFor(3, 1)})
-	checkActive(t, s, map[uint64][]byte{1: pageFor(1, 2), 2: pageFor(2, 2), 3: pageFor(3, 2)})
+	checkActive(t, s, map[uint64][]byte{1: pageFor(1, 2), 2: pageFor(2, 2), 3: pageFor(3, 2), 8: nil})
 }
 
 func TestBackgroundGCDrainsMoreAfterReaderCloses(t *testing.T) {

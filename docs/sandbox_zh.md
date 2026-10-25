@@ -2477,10 +2477,10 @@ materializer 仍可完成工作，避免排空与模板物化互相等待。
 应列举并删除它们的精确身份，重试捕获时使用新 ID。仅客户端传输失败不能证明没有
 产物或版本提交。
 
-`Disk.Discard(offset, length, hole)` 与写入及在途回写同步，每批最多 64 个完整页，
-部分边缘保持原内容。内部 `hole=true` 清除 P 并显露 base；Guest `hole=false`
-移除 payload 并设置 P，以 Zero 遮蔽 base。每个成功批次还将模板回填标为已处理，
-包括原本没有内容的页。多个批次不是一次原子范围事务；冻结前取消及冻结后 sticky
+`Disk.Discard(offset, length)` 与写入及在途回写同步，每批最多 64 个完整页，
+部分边缘保持原内容。它移除活动 payload 并设置 P，以 Zero 遮蔽 base；Guest DISCARD
+使用相同的完整操作。普通存在位同时阻止模板回填恢复旧内容，包括原本没有内容的页。
+多个批次不是一次原子范围事务；冻结前取消及冻结后 sticky
 failure 沿用既有缓存协调规则。
 
 内部 `Drain` 等待已接受写入完成，不 fsync。普通 Close 停止新前台工作、取消额度等待、
@@ -2765,6 +2765,11 @@ CH/KVM 证据. PR 和证据产物保留实际测量的提交、环境和限制,
 
 ### 12.8 Checkpoint 验证与测量
 
+`snapshot.checkpoint.sh` 在 v3/v4、明文/XTS 配置下对非零不可变基底执行 Guest fstrim，
+验证可移植导出及冷恢复后的 Zero，并在 v4 下经过本地内存 Checkpoint 恢复。
+单元测试补充模板 Data/Zero 在导入前、导入中及导入后的可控交错，以及缓存回写、
+取消和首次载荷写入失败后的旧状态恢复。
+
 源码检查与预构建产物 E2E 分开执行。direct I/O 和空间回收检查应使用原生 Linux ext4
 scratch；Windows 挂载目录、仅 tmpfs 测试或跳过特权用例不能证明这些性质。
 
@@ -2867,17 +2872,19 @@ p50/p95/p99、包含最终 Drain 的吞吐、数据/索引/redo/GC 物理字节�
 并区分无版本、共享首写、已私有覆盖。这些命令提供复现方法，不代表
 性能门槛或全部特权测试已经通过。
 
-以下配套探针区分内部 Hole discard 与 Guest Zero discard，并记录 trim 前、已删除
+以下配套探针测量完整 Zero discard，并记录 trim 前、已删除
 Checkpoint 仍被读者固定、读者释放并完成 GC 后，以及复用后的实际分配空间：
 
 ```bash
-go test ./pkg/diffstore -run '^$' -bench '^BenchmarkCheckpoint(Guest)?Discard$' -benchtime=3x
+go test ./pkg/diffstore -run '^$' -bench '^BenchmarkCheckpointDiscard$' -benchtime=3x
 go test ./pkg/diffstore/internal/versioned -run '^$' -bench '^BenchmarkCheckpointZeroRetention$' -benchtime=3x
 ```
 
 Discard 记录进程 CPU、后端调用、位图/索引/redo 字节及结构提交数。版本化计数可能
-包含并发后台 GC。Hole 会改变 P；已有 Data 转为 Zero 时 P 保持为 1，无需重写位图。
-旧后端没有 Guest Zero discard，不能把它的 Hole 结果当作语义相同的操作。报告将
+包含并发后台 GC。已有 Data 转为 Zero 时 P 保持为 1，无需重写位图。对同时提供两种
+模式的旧版本，应使用其 `BenchmarkCheckpointGuestDiscard` 比较相同的 Zero 语义；
+历史 Hole 结果不可直接比较。COW 首写基准在停止计时后关闭并重建同配置 DIFF，
+而不是通过 Discard 重置；Zero 已逻辑存在，会改变被测工作。报告将
 读者保留空间及不变的文件长度与可回收 payload 分开。运行探针时避免并发执行产品
 E2E 或全量 race，并把原始结果保留在 PR/Issue。
 

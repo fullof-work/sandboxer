@@ -278,10 +278,9 @@ func TestCOWCacheReadMixedMissCleanDirtyWritebackAndBase(t *testing.T) {
 	base := bytes.Repeat([]byte{0x88}, 16*cowBlockSize)
 	cow := cachedCOW(t, cache, 16, &fakeReader{data: base})
 	want := bytes.Repeat([]byte{0x31}, 16*cowBlockSize)
-	seedUpper(t, cow, 0, want[:13*cowBlockSize])
-	cow.bitmapMu.Lock()
-	cow.bitmap[0] &^= 1 << 8
-	cow.bitmapMu.Unlock() // unchanged base, no upper read
+	// Leave page 8 genuinely unwritten in both frontend and backend state.
+	seedUpper(t, cow, 0, want[:8*cowBlockSize])
+	seedUpper(t, cow, 9, want[9*cowBlockSize:13*cowBlockSize])
 	copy(want[8*cowBlockSize:9*cowBlockSize], base[:cowBlockSize])
 	copy(want[13*cowBlockSize:], base[13*cowBlockSize:])
 	checkRead(t, cow, 2, want[2*cowBlockSize:3*cowBlockSize])

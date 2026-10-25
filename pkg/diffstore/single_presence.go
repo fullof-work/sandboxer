@@ -33,7 +33,7 @@ func (d *diffFile) finishWrites(pages []pageWrite) error {
 	for i, p := range pages {
 		blocks[i] = p.Block
 	}
-	if err := d.publishPresence(blocks, true, false); err != nil {
+	if err := d.publishPresence(blocks, false); err != nil {
 		return err
 	}
 	d.stateMu.Lock()
@@ -60,7 +60,7 @@ func (d *diffFile) cleanupWritesLocked(pages []pageWrite) error {
 	// A bitmap write may have failed after an earlier page was persisted. Restore
 	// exactly the old committed bits after removing fresh payloads, including
 	// P=1 for Zero. Do not copy any accepted-but-unflushed frontend state.
-	result = errors.Join(result, d.publishPresence(blocks, false, true))
+	result = errors.Join(result, d.publishPresence(blocks, true))
 	return result
 }
 
@@ -76,11 +76,13 @@ func (d *diffFile) scanDirtyBlocks() ([]uint64, error) {
 
 // direct.writeMu serializes payload changes with persisted bitmap updates.
 // stateMu is held only while copying/publishing in-memory state, never for I/O.
-func (d *diffFile) publishPresence(blocks []uint64, present bool, restore bool) error {
+// Normal publication only sets P. restore is exclusively failed-write cleanup:
+// encode the old committed bitmap verbatim without changing in-memory bits.
+func (d *diffFile) publishPresence(blocks []uint64, restore bool) error {
 	pages := make(map[int][]byte)
 	d.stateMu.RLock()
 	for _, block := range blocks {
-		if !restore && presence.Has(d.bitmap, block) == present {
+		if !restore && presence.Has(d.bitmap, block) {
 			continue
 		}
 		i := int(block/8) / presence.PayloadSize
@@ -88,7 +90,7 @@ func (d *diffFile) publishPresence(blocks []uint64, present bool, restore bool) 
 			pages[i] = presence.Encode(d.bitmap, d.logicalSize, i)
 		}
 		if !restore {
-			presence.Set(pages[i][presence.HeaderSize:cowBlockSize-4], block-uint64(i*presence.PayloadSize)*8, present)
+			presence.Set(pages[i][presence.HeaderSize:cowBlockSize-4], block-uint64(i*presence.PayloadSize)*8)
 		}
 	}
 	d.stateMu.RUnlock()
@@ -119,7 +121,7 @@ func (d *diffFile) publishPresence(blocks []uint64, present bool, restore bool) 
 	if !restore {
 		d.stateMu.Lock()
 		for _, block := range blocks {
-			presence.Set(d.bitmap, block, present)
+			presence.Set(d.bitmap, block)
 		}
 		d.stateMu.Unlock()
 	}
@@ -163,7 +165,7 @@ func (d *diffFile) decodePayload(buf []byte, start int64) {
 	}
 }
 
-func (d *diffFile) discard(ctx context.Context, offset, length int64, hole bool) error {
+func (d *diffFile) discard(ctx context.Context, offset, length int64) error {
 	if offset < 0 || length < 0 || offset%cowBlockSize != 0 || length%cowBlockSize != 0 || offset > d.logicalSize || length > d.logicalSize-offset {
 		return fmt.Errorf("diffstore: invalid single-layer discard")
 	}
@@ -185,7 +187,7 @@ func (d *diffFile) discard(ctx context.Context, offset, length int64, hole bool)
 	for i := range blocks {
 		blocks[i] = uint64(offset/cowBlockSize) + uint64(i)
 	}
-	if err := d.publishPresence(blocks, !hole, false); err != nil {
+	if err := d.publishPresence(blocks, false); err != nil {
 		return err
 	}
 	d.stateMu.Lock()

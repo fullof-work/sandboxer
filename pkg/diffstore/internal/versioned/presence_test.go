@@ -28,7 +28,7 @@ func TestPresenceSparseZeroAndCurrentRoot(t *testing.T) {
 			if err := s.Checkpoint(ctx, "before"); err != nil {
 				t.Fatal(err)
 			}
-			if err := s.Discard(ctx, 64*PageSize, PageSize, true); err != nil {
+			if err := s.Discard(ctx, 64*PageSize, PageSize); err != nil {
 				t.Fatal(err)
 			}
 			putPages(t, s, []uint64{65}, 2)

@@ -60,19 +60,19 @@ func (s *Store) Presence(ctx context.Context, start uint64, dst []bool) error {
 
 // setPresence merges only this operation's bit into the transaction page. It
 // never copies an external frontend bitmap containing unflushed writes.
-func (t *transaction) setPresence(block uint64, present bool) error {
+func (t *transaction) setPresence(block uint64) error {
 	index := int(block/8) / presence.PayloadSize
 	page := presenceAreaPage + uint64(index)
 	b, ok := t.pages[page]
 	if !ok {
-		if presence.Has(t.store.presence, block) == present {
+		if presence.Has(t.store.presence, block) {
 			return nil
 		}
 		b = presence.Encode(t.store.presence, t.store.Size(), index)
 		t.pages[page] = b
 	}
 	part := b[presence.HeaderSize : PageSize-4]
-	presence.Set(part, block-uint64(index*presence.PayloadSize)*8, present)
+	presence.Set(part, block-uint64(index*presence.PayloadSize)*8)
 	sealPage(b)
 	return nil
 }

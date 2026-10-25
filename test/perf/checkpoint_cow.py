@@ -79,6 +79,7 @@ def main():
             'background-gc': {'backlog_payload_bytes': 4 << 20, 'cycles_per_round': 1,
                               'time': 'worker startup through Complete, including scheduling gaps'},
             'discard': {'range_bytes': 4 << 20, 'cow_cache_bytes': 1 << 20,
+                        'semantics': 'Zero: retain logical presence and remove active payload',
                         'background_gc': True, 'commits': 'total, including concurrent GC'},
             'reclamation': {'working_set_bytes': args.working_set_mib << 20,
                             'background_gc': False, 'gc_time': 'sum of GC calls, excluding free-list observation',

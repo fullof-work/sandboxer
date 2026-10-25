@@ -22,7 +22,7 @@ func TestZeroPresenceSnapshotsAndReaderRelease(t *testing.T) {
 			s, path := newTestStore(t, 64, key)
 			stopTestGC(s)
 			putPages(t, s, []uint64{1}, 1)
-			if err := s.Discard(ctx, 2*PageSize, PageSize, false); err != nil {
+			if err := s.Discard(ctx, 2*PageSize, PageSize); err != nil {
 				t.Fatal(err)
 			}
 			if err := s.Checkpoint(ctx, "zero"); err != nil {
@@ -39,7 +39,20 @@ func TestZeroPresenceSnapshotsAndReaderRelease(t *testing.T) {
 					t.Fatalf("block %d: %v %v", block, run, err)
 				}
 			}
-			if err := s.Discard(ctx, PageSize, 2*PageSize, true); err != nil {
+			if err := s.Discard(ctx, PageSize, 2*PageSize); err != nil {
+				t.Fatal(err)
+			}
+			checkView(t, v, map[uint64][]byte{1: pageFor(1, 1), 2: nil})
+			checkActive(t, s, map[uint64][]byte{1: nil, 2: nil})
+			if err := s.Checkpoint(ctx, "after-discard"); err != nil {
+				t.Fatal(err)
+			}
+			afterDiscard, err := s.Export(ctx, "after-discard")
+			if err != nil {
+				t.Fatal(err)
+			}
+			checkView(t, afterDiscard, map[uint64][]byte{1: nil, 2: nil})
+			if err := afterDiscard.Close(); err != nil {
 				t.Fatal(err)
 			}
 			putPages(t, s, []uint64{3}, 2)
@@ -78,10 +91,10 @@ func TestZeroPresenceSnapshotsAndReaderRelease(t *testing.T) {
 			}
 			defer s.Close()
 			bitmap, err := s.PresenceBitmap(ctx)
-			if err != nil || presence.Has(bitmap, 1) || presence.Has(bitmap, 2) || !presence.Has(bitmap, 3) {
+			if err != nil || !presence.Has(bitmap, 1) || !presence.Has(bitmap, 2) || !presence.Has(bitmap, 3) {
 				t.Fatalf("reopen presence: %x %v", bitmap, err)
 			}
-			checkActive(t, s, map[uint64][]byte{3: pageFor(3, 2)})
+			checkActive(t, s, map[uint64][]byte{1: nil, 2: nil, 3: pageFor(3, 2)})
 		})
 	}
 }
@@ -207,14 +220,14 @@ func TestBitmapOnlyChangeAndRedoRecovery(t *testing.T) {
 	if err := s.Checkpoint(ctx, "empty"); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Discard(ctx, 0, PageSize, false); err != nil {
+	if err := s.Discard(ctx, 0, PageSize); err != nil {
 		t.Fatal(err)
 	}
 	if s.CanResume("empty") || s.ctrl.Root != 0 {
 		t.Fatal("bitmap-only change did not invalidate continuation")
 	}
 	before := s.Stats()
-	if err := s.Discard(ctx, 0, PageSize, false); err != nil {
+	if err := s.Discard(ctx, 0, PageSize); err != nil {
 		t.Fatal(err)
 	}
 	if s.Stats().Commits != before.Commits {
@@ -227,7 +240,7 @@ func TestBitmapOnlyChangeAndRedoRecovery(t *testing.T) {
 		}
 		return nil
 	}
-	if err := s.Discard(ctx, PageSize, PageSize, false); !errors.Is(err, injected) {
+	if err := s.Discard(ctx, PageSize, PageSize); !errors.Is(err, injected) {
 		t.Fatal(err)
 	}
 	_ = s.Close()
@@ -258,7 +271,7 @@ func TestMaximumPresenceCopyBudgetAndBoundedGC(t *testing.T) {
 	}
 	defer s.Close()
 	stopTestGC(s)
-	if err := s.Discard(ctx, presence.MaxSize-PageSize, PageSize, false); err != nil {
+	if err := s.Discard(ctx, presence.MaxSize-PageSize, PageSize); err != nil {
 		t.Fatal(err)
 	}
 	before := s.Stats()

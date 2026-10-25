@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Exercise the rewritten snapshot sequences, including parent-shell output drain."""
 import os
+import json
 from pathlib import Path
 import re
 import subprocess
@@ -139,6 +140,65 @@ SBPID2=$$
         result = self.exercise('TICK 22\n', 'TICK 23\nTICK 24\n')
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('restored counter did not continue past captured state', result.stderr)
+
+
+class StartupFailureDiagnosticsTests(unittest.TestCase):
+    def invoke(self, path, live=False, broken_diagnostic=False):
+        helper = function((CASES / 'snapshot.restore.sh').read_text(), 'startup_failure')
+        setup = 'e2e_fail() { echo "FAIL: $*" >&2; exit 1; }\n'
+        if broken_diagnostic:
+            setup += 'python3() { return 42; }\n'
+        setup += ('sleep 30 &\n' if live else '(exit 23) &\n')
+        setup += 'pid=$!\ntrap \'kill "$pid" 2>/dev/null || :; wait "$pid" 2>/dev/null || :\' EXIT\n'
+        if not live:
+            setup += 'wait "$pid" || :\n'
+        result = subprocess.run(['bash', '-euo', 'pipefail', '-c',
+                                 helper + '\n' + setup + '\nstartup_failure "$1" "$pid" cold-ready "$SECONDS"',
+                                 'test', str(path)], capture_output=True, text=True, timeout=5,
+                                env={**ENV, 'BIN': str(ROOT / 'bin'),
+                                     'SANDBOXER_LIB': str(ROOT / 'test/e2e/lib')})
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn('FAIL: cold-ready run missed readiness', result.stderr)
+        rows = [line.removeprefix('snapshot startup: ') for line in result.stderr.splitlines()
+                if line.startswith('snapshot startup: ')]
+        return result, json.loads(rows[0]) if rows else None
+
+    def test_exited_child_reports_bounded_redacted_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory, 'cold.log')
+            path.write_text('private-secret\n' * 10000 + 'permission denied token=private-secret\n'
+                            '[sandbox-ctl] CH exited code=7\n')
+            result, summary = self.invoke(path)
+            self.assertEqual(summary['child_returncode'], 23)
+            self.assertEqual(summary['ch_exit_codes'], [7])
+            self.assertEqual(summary['marker_counts']['permission denied'], 1)
+            self.assertEqual(summary['scanned_tail_bytes'], 65536)
+            self.assertTrue(summary['tail_truncated'])
+            self.assertNotIn('deadline_seconds', summary)
+            self.assertNotIn('private-secret', result.stderr)
+
+    def test_live_child_diagnostic_does_not_wait_for_exit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _, summary = self.invoke(Path(directory, 'missing.log'), live=True)
+            self.assertIsNone(summary['child_returncode'])
+            self.assertTrue(summary['log_unavailable'])
+
+    def test_unsafe_logs_and_diagnostic_failure_preserve_original_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            secret = root / 'secret'
+            secret.write_text('private-secret')
+            link = root / 'link'
+            link.symlink_to(secret)
+            fifo = root / 'fifo'
+            os.mkfifo(fifo)
+            for path in (link, fifo, root / 'missing'):
+                with self.subTest(path=path.name):
+                    result, summary = self.invoke(path)
+                    self.assertTrue(summary['log_unavailable'])
+                    self.assertNotIn('private-secret', result.stderr)
+            _, summary = self.invoke(secret, broken_diagnostic=True)
+            self.assertIsNone(summary)
 
 
 if __name__ == "__main__":

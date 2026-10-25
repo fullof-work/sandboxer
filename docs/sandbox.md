@@ -2767,11 +2767,11 @@ capture may leave visible versions; list and delete their exact identities, and
 use a new capture ID when retrying. A client transport error alone does not prove
 that no artifact or version was committed.
 
-`Disk.Discard(offset, length, hole)` serializes with writes and in-flight
+`Disk.Discard(offset, length)` serializes with writes and in-flight
 writeback, in batches of at most 64 complete pages. Partial edges retain contents.
-Internal `hole=true` clears P and reveals base. Guest `hole=false` removes payload
-and sets P, masking base with Zero. Each completed batch also marks template
-backfill resolved, including pages that previously had no content. Separate
+It removes active payload and sets P, masking base with Zero; Guest DISCARD uses
+the same operation. The normal presence bit also prevents template backfill from
+restoring old content, including on pages that previously had no content. Separate
 batches are not one atomic range transaction; cancellation before freezing and
 sticky failures after freezing retain the existing cache coordination rules.
 
@@ -3118,6 +3118,12 @@ Regression coverage includes ring/completion invariants, COW materialization, EO
 
 ### 12.8 Checkpoint validation and measurement
 
+`snapshot.checkpoint.sh` exercises Guest fstrim over a nonzero immutable base in
+v3/v4 and plaintext/XTS configurations, verifies Zero after portable export and
+cold restore, and crosses a local memory Checkpoint restore for v4. Unit tests
+add controlled template Data/Zero interleavings before, during and after import,
+as well as cached writeback, cancellation and failed first-payload restoration.
+
 Run source checks separately from prebuilt-product E2E. Use a native Linux ext4
 scratch directory for direct I/O and space-reclamation checks; a Windows-mounted
 path, tmpfs-only run or skipped privileged test does not establish those results.
@@ -3235,20 +3241,23 @@ versus checkpoint plaintext and XTS separately, including no-version, protected 
 write and already-private overwrite. These commands describe reproducible checks;
 they do not claim that performance targets or every privileged test passed.
 
-The following companion probes separate internal Hole discard from Guest Zero
-discard and report actual allocation before trim, while a deleted checkpoint is
+The following companion probes measure complete Zero discard and report actual
+allocation before trim, while a deleted checkpoint is
 reader-pinned, after reader release/GC, and after reuse:
 
 ```bash
-go test ./pkg/diffstore -run '^$' -bench '^BenchmarkCheckpoint(Guest)?Discard$' -benchtime=3x
+go test ./pkg/diffstore -run '^$' -bench '^BenchmarkCheckpointDiscard$' -benchtime=3x
 go test ./pkg/diffstore/internal/versioned -run '^$' -bench '^BenchmarkCheckpointZeroRetention$' -benchtime=3x
 ```
 
 Discard reports process CPU, backend calls, bitmap/index/redo bytes and structure
-commits. Background GC may contribute to versioned counters. Hole changes P;
-Zero over existing Data leaves P set and needs no bitmap rewrite. The old backend
-has no Guest Zero discard, so its Hole results are not a semantic replacement for
-that operation. Reader-retained space and unchanged file length are reported
+commits. Background GC may contribute to versioned counters. Zero over existing
+Data leaves P set and needs no bitmap rewrite. For an older revision that offers
+both modes, use its `BenchmarkCheckpointGuestDiscard` for the same Zero semantics;
+historical Hole results are not comparable. Fresh-write COW benchmarks close and
+recreate the same-config DIFF outside the timer instead of resetting it with
+Discard; Zero is already logically present and would change the measured work.
+Reader-retained space and unchanged file length are reported
 separately from reclaimable payload. Run these probes without concurrent product
 E2E or full race suites, and retain raw results with the PR/Issue.
 

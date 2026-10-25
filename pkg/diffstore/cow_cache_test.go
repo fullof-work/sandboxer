@@ -579,7 +579,7 @@ func TestCOWCacheDiscardCannotResurrectWriteback(t *testing.T) {
 			writePage(t, cow, 0, 0x62)
 			awaitSignal(t, gate.entered)
 			done := make(chan error, 1)
-			go func() { done <- cow.Discard(0, cowBlockSize, true) }()
+			go func() { done <- cow.Discard(0, cowBlockSize) }()
 			if inflight {
 				awaitSignal(t, waiting)
 				gate.open()
@@ -591,15 +591,20 @@ func TestCOWCacheDiscardCannotResurrectWriteback(t *testing.T) {
 			if err := cow.Drain(context.Background()); err != nil {
 				t.Fatal(err)
 			}
-			checkRead(t, cow, 0, base[:cowBlockSize])
+			checkBudget(t, cache, 0, 0, 0)
+			checkRead(t, cow, 0, make([]byte, cowBlockSize))
 			bitmap, err := cow.diff.scanDirtyBlocks()
 			if err != nil {
 				t.Fatal(err)
 			}
-			if bitmapBlockDirty(bitmap, 0) || cow.blockDirty(0) {
-				t.Fatal("discarded page resurrected")
+			if !bitmapBlockDirty(bitmap, 0) || !cow.blockDirty(0) {
+				t.Fatal("discard lost its logical Zero")
 			}
-			checkBudget(t, cache, 0, 0, 0)
+			payload := []bool{true}
+			if err := cow.diff.payloadPresence(context.Background(), 0, payload); err != nil || payload[0] {
+				t.Fatal("discard retained payload", payload, err)
+			}
+			checkBudget(t, cache, 1, 0, 0) // the subsequent Zero read is a clean cache page
 		})
 	}
 }
@@ -610,14 +615,14 @@ type discardObserver struct {
 	before func(context.Context) error
 }
 
-func (d *discardObserver) discard(ctx context.Context, off, length int64, hole bool) error {
+func (d *discardObserver) discard(ctx context.Context, off, length int64) error {
 	d.calls = append(d.calls, [2]int64{off, length})
 	if d.before != nil {
 		if err := d.before(ctx); err != nil {
 			return err
 		}
 	}
-	return d.diffBackend.discard(ctx, off, length, hole)
+	return d.diffBackend.discard(ctx, off, length)
 }
 
 func TestCOWDiscardBoundedBatchesAcrossFormatsAndEdges(t *testing.T) {
@@ -655,7 +660,7 @@ func TestCOWDiscardBoundedBatchesAcrossFormatsAndEdges(t *testing.T) {
 			observer := &discardObserver{diffBackend: cow.diff}
 			cow.diff = observer
 			// Preserve edge pages 0 and 131; discard 130 complete pages in 3 calls.
-			if err := cow.Discard(17, blocks*cowBlockSize-34, true); err != nil {
+			if err := cow.Discard(17, blocks*cowBlockSize-34); err != nil {
 				t.Fatal(err)
 			}
 			if len(observer.calls) != 3 {
@@ -667,7 +672,7 @@ func TestCOWDiscardBoundedBatchesAcrossFormatsAndEdges(t *testing.T) {
 				}
 			}
 			for i := range blocks {
-				value := byte(0x21)
+				value := byte(0)
 				if i == 0 || i == blocks-1 {
 					value = 0x56
 				}
@@ -705,7 +710,7 @@ func TestCOWDiscardWaitsWholeBatchBeforeFreezingAndCancels(t *testing.T) {
 			cache.mu.Unlock()
 			ctx, cancel := context.WithCancel(context.Background())
 			done := make(chan error, 1)
-			go func() { done <- cache.discard(ctx, cow, 0, 63, true) }()
+			go func() { done <- cache.discard(ctx, cow, 0, 63) }()
 			awaitSignal(t, waiting)
 			cache.mu.Lock()
 			first := cache.pages[cacheKey{cow, 0}].state
@@ -762,7 +767,7 @@ func TestCOWDiscardFrozenBatchPublishesDespiteCancelOrFailsAndWakes(t *testing.T
 				return nil
 			}}
 			cow.diff = observer
-			err := cache.discard(ctx, cow, 0, 63, true)
+			err := cache.discard(ctx, cow, 0, 63)
 			if fail {
 				if !errors.Is(err, io.ErrUnexpectedEOF) || cache.Err() == nil {
 					t.Fatal(err)
@@ -772,8 +777,8 @@ func TestCOWDiscardFrozenBatchPublishesDespiteCancelOrFailsAndWakes(t *testing.T
 					t.Fatal(err)
 				}
 				for i := int64(0); i < 64; i++ {
-					if cow.blockDirty(i) {
-						t.Fatal("batch not published absent", i)
+					if !cow.blockDirty(i) {
+						t.Fatal("batch not published Zero", i)
 					}
 				}
 			}

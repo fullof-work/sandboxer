@@ -74,7 +74,7 @@ func BenchmarkCheckpointZeroRetention(b *testing.B) {
 				space("before-trim")
 				before := s.Stats()
 				start := time.Now()
-				if err := s.Discard(ctx, 0, size, false); err != nil {
+				if err := s.Discard(ctx, 0, size); err != nil {
 					b.Fatal(err)
 				}
 				totals["discard-ns"] += uint64(time.Since(start))

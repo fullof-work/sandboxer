@@ -30,7 +30,7 @@ func TestDiskMergePreservesZeroAndBoundsParent(t *testing.T) {
 					t.Fatal(err)
 				}
 				defer top.Close()
-				if err := top.Discard(0, 4096, false); err != nil {
+				if err := top.Discard(0, 4096); err != nil {
 					t.Fatal(err)
 				}
 				if _, err := top.WriteAt(bytes.Repeat([]byte{0x91}, 4096), 8192); err != nil {
@@ -44,7 +44,7 @@ func TestDiskMergePreservesZeroAndBoundsParent(t *testing.T) {
 				if _, err := parent.WriteAt(bytes.Repeat([]byte{0x67}, 5*4096), 0); err != nil {
 					t.Fatal(err)
 				}
-				if err := parent.Discard(4096, 4096, false); err != nil {
+				if err := parent.Discard(4096, 4096); err != nil {
 					t.Fatal(err)
 				}
 				view, close, err := prepareDiskSource(ctx, DiskDiff{MergeBase: "parent", Export: func(ctx context.Context) (ExportView, error) {
