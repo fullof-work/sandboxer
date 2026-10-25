@@ -51,6 +51,25 @@ cleanup() {
 }
 trap cleanup EXIT
 
+startup_failure() {
+    local log=$1 pid=$2 phase=$3 started=$4 returncode=running
+    # A live process may still be draining; never block or change the watchdog.
+    if ! kill -0 "$pid" 2>/dev/null; then
+        if wait "$pid"; then returncode=0; else returncode=$?; fi
+    fi
+    python3 -B - "$SANDBOXER_LIB" "$log" "$returncode" "$phase" "$((SECONDS - started))" <<'PY_STARTUP' || true
+import json, sys
+sys.path.insert(0, sys.argv[1])
+from usage import startup_failure_summary
+code = None if sys.argv[3] == 'running' else int(sys.argv[3])
+summary = startup_failure_summary(sys.argv[2], code, float(sys.argv[5]))
+summary.pop('deadline_seconds', None)  # The usage harness's 45s deadline is unrelated.
+summary['phase'] = sys.argv[4]
+print('snapshot startup: ' + json.dumps(summary, sort_keys=True), file=sys.stderr)
+PY_STARTUP
+    e2e_fail "$phase run missed readiness"
+}
+
 ip tuntap add dev "$TAP_NAME" mode tap
 TAP_CREATED=1
 ip addr add 169.254.1.0/31 dev "$TAP_NAME"
@@ -101,6 +120,7 @@ SID1="restore-cold-$BASHPID"
 LOG1="$OUT/cold.log"
 readiness_begin_capture "$WORK/cold.ready"
 COLD_READER_PID=$READY_READER_PID
+STARTUP_STARTED=$SECONDS
 readiness_exec_in_new_session "$BIN/sandbox-ctl" run \
     --ready-fd="$READY_WRITE_FD" --config "$WORK/cold.yaml" \
     --ch-binary "$BIN/cloud-hypervisor" --run-root "$WORK/runtime" --sandbox-id "$SID1" \
@@ -108,9 +128,9 @@ readiness_exec_in_new_session "$BIN/sandbox-ctl" run \
 SBPID1=$!
 readiness_close_parent_writer
 readiness_start_watchdog "$SBPID1" 120 10
-readiness_wait_event "$WORK/cold.ready" 1 control_ready "$SBPID1" || e2e_fail "cold run missed control_ready"
+readiness_wait_event "$WORK/cold.ready" 1 control_ready "$SBPID1" || startup_failure "$LOG1" "$SBPID1" cold-control "$STARTUP_STARTED"
 readiness_connect_ctl "$WORK/runtime/$SID1/ctl.sock" || e2e_fail "cold ctl.sock unavailable at control_ready"
-readiness_wait_event "$WORK/cold.ready" 2 ready "$SBPID1" || e2e_fail "cold run missed ready"
+readiness_wait_event "$WORK/cold.ready" 2 ready "$SBPID1" || startup_failure "$LOG1" "$SBPID1" cold-ready "$STARTUP_STARTED"
 CG_COLD="$("$BIN/sandbox-ctl" exec --sandbox-id "$SID1" --run-root "$WORK/runtime" -- cat /proc/self/cgroup)"
 grep -qE '^0::/init[[:space:]]*$' <<<"$CG_COLD" || e2e_fail "cold exec is not pinned to /init"
 readiness_assert_wire "$WORK/cold.ready" "$COLD_READER_PID" $'control_ready\nready\n' || e2e_fail "cold readiness wire is not exact"
@@ -166,6 +186,7 @@ SID2="restore-live-$BASHPID"
 LOG2="$OUT/restore.log"
 readiness_begin_capture "$WORK/restore.ready"
 RESTORE_READER_PID=$READY_READER_PID
+STARTUP_STARTED=$SECONDS
 readiness_exec_in_new_session "$BIN/sandbox-ctl" run \
     --ready-fd="$READY_WRITE_FD" --restore "$SNAPSHOT" --config "$WORK/restore.yaml" \
     --ch-binary "$BIN/cloud-hypervisor" --run-root "$WORK/runtime" --sandbox-id "$SID2" \
@@ -173,9 +194,9 @@ readiness_exec_in_new_session "$BIN/sandbox-ctl" run \
 SBPID2=$!
 readiness_close_parent_writer
 readiness_start_watchdog "$SBPID2" 120 10
-readiness_wait_event "$WORK/restore.ready" 1 control_ready "$SBPID2" || e2e_fail "restore missed control_ready"
+readiness_wait_event "$WORK/restore.ready" 1 control_ready "$SBPID2" || startup_failure "$LOG2" "$SBPID2" restore-control "$STARTUP_STARTED"
 readiness_connect_ctl "$WORK/runtime/$SID2/ctl.sock" || e2e_fail "restore ctl.sock unavailable at control_ready"
-readiness_wait_event "$WORK/restore.ready" 2 ready "$SBPID2" || e2e_fail "restore missed ready"
+readiness_wait_event "$WORK/restore.ready" 2 ready "$SBPID2" || startup_failure "$LOG2" "$SBPID2" restore-ready "$STARTUP_STARTED"
 CG_RESTORE="$("$BIN/sandbox-ctl" exec --sandbox-id "$SID2" --run-root "$WORK/runtime" -- cat /proc/self/cgroup)"
 grep -qE '^0::/init[[:space:]]*$' <<<"$CG_RESTORE" || e2e_fail "restored exec is not pinned to /init"
 readiness_assert_wire "$WORK/restore.ready" "$RESTORE_READER_PID" $'control_ready\nready\n' || e2e_fail "restore readiness wire is not exact"

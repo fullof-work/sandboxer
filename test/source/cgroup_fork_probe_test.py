@@ -12,6 +12,32 @@ import uuid
 ROOT = Path(__file__).resolve().parents[2]
 
 
+class InitCgroupAssertionTests(unittest.TestCase):
+    def test_exact_root_and_read_failure_are_independent_of_console_output(self):
+        source = (ROOT / 'test/e2e/cases/sandbox.cgroup.sh').read_text()
+        # The unquoted YAML heredoc removes these dollar escapes before the
+        # guest shell sees the command. Execute the shipped command itself.
+        command = next(line.strip() for line in source.splitlines()
+                       if line.strip().startswith('top_cgroup=')).replace('\\$', '$')
+        with tempfile.TemporaryDirectory() as directory:
+            cat = Path(directory, 'cat')
+            cat.write_text('#!/bin/sh\n'
+                           '[ "$1" = /proc/self/cgroup ] || exit 99\n'
+                           'printf "CG-TOP-INIT 0::/ console-noise\\n" >&2\n'
+                           'printf "%s" "$TEST_CGROUP"\n'
+                           'exit "$TEST_READ_STATUS"\n')
+            cat.chmod(0o755)
+            for value, status, valid in [('0::/\n', 0, True), ('0::/init\n', 0, False),
+                                         ('0::/app\n', 0, False), ('', 0, False),
+                                         ('0::/\n1::/other\n', 0, False),
+                                         ('0::/\n', 7, False)]:
+                with self.subTest(value=value, read_status=status):
+                    result = subprocess.run(['sh', '-c', command], capture_output=True,
+                        env={**os.environ, 'PATH': directory + ':' + os.environ['PATH'],
+                             'TEST_CGROUP': value, 'TEST_READ_STATUS': str(status)}, timeout=5)
+                    self.assertEqual(result.returncode == 0, valid)
+
+
 class NativeForkProbeTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

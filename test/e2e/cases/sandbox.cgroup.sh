@@ -186,7 +186,10 @@ init:
   - exec: /bin/sh
     args: ["-c", "base64 -d /cgroup-fork-probe.b64 > /cgroup-fork-probe && chmod 0755 /cgroup-fork-probe"]
   - exec: /bin/sh
-    args: ["-c", "printf 'CG-TOP-INIT '; cat /proc/self/cgroup"]
+    args:
+      - -c
+      - |
+        top_cgroup=\$(cat /proc/self/cgroup) && [ "\$top_cgroup" = "0::/" ]
 launch:
   exec: /cgroup-fork-probe
   args: [/probe.sh, primary, "$expected", "$pid_mode", "$control", "$real_check"]
@@ -209,7 +212,8 @@ EOF
     wait_marker "CG-plugin-GEN-2-SELF $expected" "$log" "$run_pid" || e2e_fail "$name plugin did not restart in expected cgroup"
     wait_marker "CG-plugin-GEN-2-FORK-OK 128" "$log" "$run_pid" || e2e_fail "$name plugin immediate-fork placement failed"
     wait_marker "CG-primary-GEN-2-PID-$pid_mode-OK" "$log" "$run_pid" || e2e_fail "$name PID namespace contract failed"
-    grep -qF 'CG-TOP-INIT 0::/' "$log" || e2e_fail "$name sandbox-init cgroup baseline missing"
+    # runInit aborts launch if its exact root-cgroup assertion fails. Do not
+    # reconstruct this value from two writes to the interleaved guest console.
 
     local exec_log="$OUT/$name-exec.log"
     "$BIN/sandbox-ctl" exec --sandbox-id "$sid" --run-root "$run_root" -- \
