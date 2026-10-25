@@ -158,7 +158,7 @@ func TestBlockCOW_IOBoundsDoNotOverflow(t *testing.T) {
 	if _, err := cow.WriteAt(make([]byte, 1), maxOffset); err == nil {
 		t.Fatal("overflowing WriteAt was accepted")
 	}
-	if err := cow.Discard(maxOffset, 1, true); err == nil {
+	if err := cow.Discard(maxOffset, 1); err == nil {
 		t.Fatal("overflowing Discard was accepted")
 	}
 	reader := &cowSnapshotReaderAt{cow: cow, bitmap: append([]uint64(nil), cow.bitmap...)}

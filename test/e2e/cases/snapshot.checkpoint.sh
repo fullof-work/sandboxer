@@ -265,6 +265,43 @@ guest python3 -c "$(cat "$E2E_LIB/sandboxer/trim_probe.py")" seed >"$OUT/trim-se
 "$BIN/sandbox-ctl" export --path-id "$CURRENT_PATH" --run-root "$RUN_ROOT" --resume \
     --output "$WORK/trim-lower" >"$OUT/trim-lower.log" 2>&1
 stop_run
+# Exercise real Guest fstrim over the same nonzero lower in all writable
+# policies. V4 also crosses a local memory Checkpoint; every policy crosses a
+# portable export and cold restore. Preparation remains outside this case.
+python3 - "$WORK/trim-crypto.yaml" <<'PY'
+import secrets, sys
+with open(sys.argv[1], 'w') as out:
+    out.write('manifest: { key: "' + secrets.token_hex(32) + '" }\n')
+    out.write('crypto: { chunk: aes, manifest: aes, local: auto }\n')
+PY
+for mode in v3 v4; do
+    for policy in plain xts; do
+        TRIM_LABEL="trim-$mode-$policy"
+        TRIM_PATH="$TRIM_LABEL-$BASHPID"
+        TRIM_ARGS=()
+        [ "$mode" != v4 ] || TRIM_ARGS+=(--enable-checkpoint)
+        CRYPTO_ARGS=()
+        [ "$policy" != xts ] || CRYPTO_ARGS=(--manifest-config "$WORK/trim-crypto.yaml")
+        start "$TRIM_LABEL" "$TRIM_PATH" --config "$WORK/restore.yaml" \
+            --from "$WORK/trim-lower/$SID.sandbox" "${TRIM_ARGS[@]}" "${CRYPTO_ARGS[@]}"
+        guest python3 -c "$(cat "$E2E_LIB/sandboxer/trim_probe.py")" trim >"$OUT/$TRIM_LABEL.json"
+        if [ "$mode" = v4 ]; then
+            capture snapshot "$TRIM_LABEL"
+            finish_capture
+            TRIM_S="$(capture_path "$TRIM_LABEL" snapshot "$BASE_ROOT/$TRIM_PATH/checkpoint")"
+            start "$TRIM_LABEL-hot" "$TRIM_PATH" --config "$WORK/restore.yaml" \
+                --restore "$TRIM_S" "${TRIM_ARGS[@]}" "${CRYPTO_ARGS[@]}"
+            guest python3 -c "$(cat "$E2E_LIB/sandboxer/trim_probe.py")" check >"$OUT/$TRIM_LABEL-hot.json"
+        fi
+        "$BIN/sandbox-ctl" export --path-id "$TRIM_PATH" --run-root "$RUN_ROOT" --resume \
+            --output "$WORK/$TRIM_LABEL-portable" >"$OUT/$TRIM_LABEL-export.log" 2>&1
+        stop_run
+        start "$TRIM_LABEL-portable" "$TRIM_PATH-portable" --config "$WORK/restore.yaml" \
+            --from "$WORK/$TRIM_LABEL-portable/$SID.sandbox" "${TRIM_ARGS[@]}" "${CRYPTO_ARGS[@]}"
+        guest python3 -c "$(cat "$E2E_LIB/sandboxer/trim_probe.py")" check >"$OUT/$TRIM_LABEL-portable.json"
+        stop_run
+    done
+done
 start cold "$PATH_ID" --config "$WORK/restore.yaml" --from "$WORK/trim-lower/$SID.sandbox" --enable-checkpoint
 guest python3 -c "$(cat "$E2E_LIB/sandboxer/trim_probe.py")" trim >"$OUT/trim-completed.json"
 # Keep the historical-GC fixture in the active DIFF as well as in its lower.

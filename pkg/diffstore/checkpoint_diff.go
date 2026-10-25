@@ -413,7 +413,7 @@ func (c *Disk) materializeRange(ctx context.Context, template diffTemplateSource
 		pages := records[:0]
 		for pos := offset; pos < next; pos += cowBlockSize {
 			block := int64(pos) / cowBlockSize
-			if !c.blockDirty(block) && !c.materialBlockResolved(block) {
+			if !c.blockDirty(block) {
 				pages = append(pages, pageWrite{Block: uint64(block), Data: staging[pos-offset : pos-offset+cowBlockSize]})
 			}
 		}
@@ -446,20 +446,17 @@ func (c *Disk) materializeZero(ctx context.Context, start, end uint64) error {
 		c.lockBlockRange(first, last)
 		var err error
 		for block := first; block <= last; {
-			if c.blockDirty(block) || c.materialBlockResolved(block) {
+			if c.blockDirty(block) {
 				block++
 				continue
 			}
 			next := block + 1
-			for next <= last && !c.blockDirty(next) && !c.materialBlockResolved(next) {
+			for next <= last && !c.blockDirty(next) {
 				next++
 			}
-			err = c.cache.discard(ctx, c, block, next-1, false)
+			err = c.cache.discard(ctx, c, block, next-1)
 			if err != nil {
 				break
-			}
-			for b := block; b < next; b++ {
-				c.markMaterialResolved(b)
 			}
 			block = next
 		}

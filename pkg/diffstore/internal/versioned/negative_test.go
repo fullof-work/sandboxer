@@ -72,7 +72,7 @@ func TestMetadataIOFailureIsStickyButMissingIDIsNot(t *testing.T) {
 		t.Fatal("missing ID poisoned owner", err)
 	}
 	putPages(t, s, []uint64{1}, 1)
-	if err := s.Discard(ctx, PageSize, PageSize, true); err != nil {
+	if err := s.Discard(ctx, PageSize, PageSize); err != nil {
 		t.Fatal(err)
 	}
 	s.mu.Lock()
@@ -88,6 +88,44 @@ func TestMetadataIOFailureIsStickyButMissingIDIsNot(t *testing.T) {
 	}
 	if !errors.Is(s.Err(), unix.EIO) {
 		t.Fatal("background metadata failure not exposed", s.Err())
+	}
+}
+
+// All three pages read as zeros. The oracle must nevertheless reject every
+// substitution of Hole, Zero or allocated all-zero Data for another state.
+func TestViewOracleDistinguishesThreeZeroReadingStates(t *testing.T) {
+	s, _ := newTestStore(t, 3, nil)
+	if err := s.Discard(ctx, PageSize, PageSize); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.WritePages(ctx, []Page{{Block: 2, Data: make([]byte, PageSize)}}); err != nil {
+		t.Fatal(err)
+	}
+	v, err := s.Export(ctx, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer v.Close()
+	want := map[uint64][]byte{1: nil, 2: make([]byte, PageSize)}
+	checkView(t, v, want)
+	for block := uint64(0); block < 3; block++ {
+		for kind := 0; kind < 3; kind++ {
+			if int(block) == kind {
+				continue
+			}
+			wrong := snapshotModel(want)
+			switch kind {
+			case 0:
+				delete(wrong, block)
+			case 1:
+				wrong[block] = nil
+			case 2:
+				wrong[block] = make([]byte, PageSize)
+			}
+			if err := compareView(v, wrong); err == nil || !strings.Contains(err.Error(), "kind:") {
+				t.Fatalf("oracle accepted block %d as state %d: %v", block, kind, err)
+			}
+		}
 	}
 }
 

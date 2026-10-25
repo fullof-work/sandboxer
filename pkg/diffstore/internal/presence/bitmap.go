@@ -30,13 +30,8 @@ func ValidateSize(size int64) error {
 func Bytes(size int64) int                 { return int((size/PageSize + 7) / 8) }
 func Pages(size int64) int                 { return (Bytes(size) + PayloadSize - 1) / PayloadSize }
 func Has(bitmap []byte, block uint64) bool { return bitmap[block/8]&(1<<(block%8)) != 0 }
-func Set(bitmap []byte, block uint64, present bool) {
-	mask := byte(1 << (block % 8))
-	if present {
-		bitmap[block/8] |= mask
-	} else {
-		bitmap[block/8] &^= mask
-	}
+func Set(bitmap []byte, block uint64) {
+	bitmap[block/8] |= byte(1 << (block % 8))
 }
 
 // End returns the exclusive end of the logical-presence run starting at block.

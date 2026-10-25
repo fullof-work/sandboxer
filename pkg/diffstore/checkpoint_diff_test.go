@@ -94,7 +94,7 @@ func TestCheckpointCOWProtectsDirtyVersionAndPinnedDelete(t *testing.T) {
 			if _, err := cow.WriteAt(bytes.Repeat([]byte{0xb4}, cowBlockSize), 0); err != nil {
 				t.Fatal(err)
 			}
-			if err := cow.Discard(2*cowBlockSize, cowBlockSize, true); err != nil {
+			if err := cow.Discard(2*cowBlockSize, cowBlockSize); err != nil {
 				t.Fatal(err)
 			}
 			if err := cow.Drain(context.Background()); err != nil {
@@ -393,9 +393,9 @@ func (b *failAfterCheckpointWrite) writePages(ctx context.Context, pages []pageW
 	}
 	return io.ErrShortWrite
 }
-func (b *failAfterCheckpointWrite) discard(ctx context.Context, off, length int64, hole bool) error {
+func (b *failAfterCheckpointWrite) discard(ctx context.Context, off, length int64) error {
 	b.discards++
-	return b.diffBackend.discard(ctx, off, length, hole)
+	return b.diffBackend.discard(ctx, off, length)
 }
 
 func TestCheckpointCOWWriteFailureCannotPunchCommittedOrPinnedSlots(t *testing.T) {

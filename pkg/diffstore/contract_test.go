@@ -14,6 +14,12 @@ import (
 	"github.com/kuasar-sandbox/sandboxer/pkg/diffstore"
 )
 
+// The Store alias must expose the same complete operation as its implementation.
+var _ interface {
+	Discard(context.Context, int64, int64) error
+} = (*diffstore.Store)(nil)
+var _ interface{ Discard(int64, int64) error } = (*diffstore.Disk)(nil)
+
 type contractBase struct {
 	data    []byte
 	closed  atomic.Int32
@@ -110,14 +116,14 @@ func TestDiskBackendPublicContract(t *testing.T) {
 						t.Fatal("empty named ID accepted")
 					}
 				}
-				if err := disk.Discard(4096, 4096, true); err != nil {
+				if err := disk.Discard(4096, 4096); err != nil {
 					t.Fatal(err)
 				}
 				if _, err := disk.ReadAt(got, 0); err != nil {
 					t.Fatal(err)
 				}
-				if !bytes.Equal(got[4096:8192], base.data[4096:8192]) {
-					t.Fatal("discard did not reveal base")
+				if !bytes.Equal(got[4096:8192], make([]byte, 4096)) {
+					t.Fatal("discard did not mask base with Zero")
 				}
 				// Closing one owner cannot close another owner's shared cache.
 				other, err := diffstore.OpenDisk(filepath.Join(t.TempDir(), "other.diff"), nil, diffstore.DiffInit{CreateSize: 4096}, diffstore.WithCache(cache))

@@ -32,7 +32,7 @@ type diffBackend interface {
 	cleanupWriteFailure([]pageWrite) error
 	scanDirtyBlocks() ([]uint64, error)
 	payloadPresence(context.Context, uint64, []bool) error
-	discard(context.Context, int64, int64, bool) error
+	discard(context.Context, int64, int64) error
 	markModified(context.Context) error
 	err() error
 	Sync() error
@@ -70,8 +70,8 @@ func (d *checkpointDiff) policy() batchPolicy {
 	return batchPolicy{materialPages: maxWritebackPages}
 }
 func (d *checkpointDiff) cleanupWriteFailure([]pageWrite) error { return nil }
-func (d *checkpointDiff) discard(ctx context.Context, off, n int64, hole bool) error {
-	return d.store.Discard(ctx, off, n, hole)
+func (d *checkpointDiff) discard(ctx context.Context, off, n int64) error {
+	return d.store.Discard(ctx, off, n)
 }
 func (d *checkpointDiff) scanDirtyBlocks() ([]uint64, error) {
 	bitmap := make([]uint64, (d.logicalSize/cowBlockSize+63)/64)

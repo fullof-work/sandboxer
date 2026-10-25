@@ -177,11 +177,13 @@ pending until that copy is exhausted. It needs no payload decryption key.
 
 ## Discard and reclamation
 
-`Disk.Discard(offset, length, hole)` changes only fully covered 4 KiB pages;
-partial edge pages retain their contents. `hole=true` withdraws upper content and
-sets P=0 so reads fall through to the immutable lower layer. Guest DISCARD uses
-`hole=false`: remove payload and set P=1, returning Zero without revealing base
-bytes. This does not add WRITE_ZEROES or zero compression.
+`Disk.Discard(offset, length)` changes only fully covered 4 KiB pages;
+partial edge pages retain their contents. It removes active payload and sets P=1,
+returning Zero without revealing base bytes. The public
+`Store.Discard(ctx, offset, length)` has the same complete operation, requiring
+page-aligned ranges. PayloadPresence is false and no active Data mapping remains;
+retained Checkpoints may still protect old records. Guest DISCARD uses this same
+operation. This does not add WRITE_ZEROES or zero compression.
 Each batch covers at most 64 full pages. It takes distinct stripe locks in numeric
 order, checks all existing cache pages under one cache lock, and only then freezes
 them together. Loading or writeback makes the whole batch wait without freezing
@@ -189,8 +191,13 @@ any part. Uncached pages require no placeholder and unrelated dirty pages need n
 drain. Backend I/O runs without the cache lock and receives a context. Cancellation
 can stop a batch before freezing; afterward it must publish the whole batch or
 enter the existing sticky failure path and wake waiters. Success publishes the
-selected logical state and resolves template backfill for every page, including absent
-pages. Separate batches do not provide an all-or-nothing range transaction.
+Zero for every page, including previously absent pages. The normal presence bit
+alone prevents template Data or Zero backfill from overwriting foreground content;
+there is no separate template-resolution bitmap. Unmodified template Holes still
+fall through to the base. Separate batches do not provide an all-or-nothing range
+transaction. Normal presence publication only sets bits. Failed first-payload
+writes instead restore the old committed bitmap: Hole retains P=0 and Zero
+retains P=1, after cleanup of newly allocated payload.
 
 `DeleteCheckpoints` only withdraws visibility and immediately releases protection
 when no reader pins the version. It never runs or waits for GC. `OpenMetadata`

@@ -189,7 +189,7 @@ func TestCheckpointPayloadCorruptionNeverMasqueradesAsZero(t *testing.T) {
 					case "full-write":
 						n, err = cow.WriteAt(bytes.Repeat([]byte{0x99}, cowBlockSize), int64(target)*cowBlockSize)
 					case "discard":
-						err = cow.Discard(int64(target)*cowBlockSize, cowBlockSize, true)
+						err = cow.Discard(int64(target)*cowBlockSize, cowBlockSize)
 					}
 					// P=0 is authoritative even if unrelated payload metadata is
 					// corrupt. It need not inspect the index to fall through.

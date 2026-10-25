@@ -51,6 +51,8 @@ func checkView(t *testing.T, v *View, want map[uint64][]byte) {
 	}
 }
 
+// The model records all three states: an absent key is Hole, an explicit nil
+// value is Zero, and a non-nil page is Data (including all-zero bytes).
 // The same full-content oracle is used by ordinary correctness tests and the
 // deliberately broken retained-root fixture below. This guards against a test
 // suite that checks only metadata/counts and misses historical payload damage.
@@ -68,17 +70,26 @@ func compareView(v *View, want map[uint64][]byte) error {
 		for pos := off; pos < r.End(); pos += PageSize {
 			block := pos / PageSize
 			expected, ok := want[block]
-			if ok != (r.Kind() == sparse.Data) {
-				return fmt.Errorf("block %d presence: %v != %v", block, r.Kind(), ok)
+			kind := sparse.Hole
+			if ok {
+				kind = sparse.Zero
+				seen[block] = true
+				if expected != nil {
+					kind = sparse.Data
+					if len(expected) != PageSize {
+						return fmt.Errorf("block %d invalid model Data length: %d", block, len(expected))
+					}
+				}
+			}
+			if r.Kind() != kind {
+				return fmt.Errorf("block %d kind: got %v want %v", block, r.Kind(), kind)
 			}
 			n, err := r.ReadAt(ctx, b, pos-off)
 			if err != nil || n != PageSize {
 				return fmt.Errorf("block %d read: %d %v", block, n, err)
 			}
-			if !ok {
+			if expected == nil {
 				expected = make([]byte, PageSize)
-			} else {
-				seen[block] = true
 			}
 			if !bytes.Equal(b, expected) {
 				return fmt.Errorf("block %d content mismatch: got %x want %x", block, b[:16], expected[:16])
@@ -152,11 +163,11 @@ func TestVersionsAndRandomOperations(t *testing.T) {
 				case round%5 == 0:
 					block := uint64(r.Intn(2048))
 					count := min(24, 2048-int(block))
-					if err := s.Discard(ctx, int64(block)*PageSize, int64(count)*PageSize, true); err != nil {
+					if err := s.Discard(ctx, int64(block)*PageSize, int64(count)*PageSize); err != nil {
 						t.Fatal(err)
 					}
 					for i := 0; i < count; i++ {
-						delete(active, block+uint64(i))
+						active[block+uint64(i)] = nil // explicit Zero, not an absent Hole
 					}
 				default:
 					pages := make([]Page, 64)
@@ -372,7 +383,7 @@ func TestBatchWithdrawalSkipsDeletedPredecessors(t *testing.T) {
 	}
 }
 
-func TestBPlusSplitMergeAndHoles(t *testing.T) {
+func TestBPlusSplitMergeAndDiscard(t *testing.T) {
 	s, _ := newTestStore(t, 4096, nil)
 	blocks := make([]uint64, 1600)
 	for i := range blocks {
@@ -382,13 +393,15 @@ func TestBPlusSplitMergeAndHoles(t *testing.T) {
 	if err := s.Checkpoint(ctx, "split"); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Discard(ctx, 100*PageSize, 1300*PageSize, true); err != nil {
+	if err := s.Discard(ctx, 100*PageSize, 1300*PageSize); err != nil {
 		t.Fatal(err)
 	}
 	want := map[uint64][]byte{}
 	for _, b := range blocks {
 		if b < 100 || b >= 1400 {
 			want[b] = pageFor(b, 8)
+		} else {
+			want[b] = nil // Zero retains presence after removing its Data mapping.
 		}
 	}
 	checkActive(t, s, want)

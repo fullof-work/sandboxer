@@ -9,8 +9,8 @@ import (
 func TestBitmapBoundariesAndCorruption(t *testing.T) {
 	for _, size := range []int64{PageSize, 7 * PageSize, 8 * PageSize, 9 * PageSize, int64(PayloadSize) * 8 * PageSize, MaxSize} {
 		bitmap := make([]byte, Bytes(size))
-		Set(bitmap, 0, true)
-		Set(bitmap, uint64(size/PageSize-1), true)
+		Set(bitmap, 0)
+		Set(bitmap, uint64(size/PageSize-1))
 		reopened := make([]byte, len(bitmap))
 		for i := 0; i < Pages(size); i++ {
 			b := Encode(bitmap, size, i)

@@ -20,19 +20,8 @@ func (r zeroBlockReader) ReadAt(buf []byte, offset int64) (int, error) {
 func BenchmarkEncryptedBlockCOW(b *testing.B) {
 	const size = benchmarkCOWBlocks * cowBlockSize
 	key := [32]byte{0x92}
-	open := func(b *testing.B) *Disk {
-		b.Helper()
-		cow, err := OpenDisk(
-			filepath.Join(b.TempDir(), "diff.ext4"),
-			zeroBlockReader{size: size},
-			DiffInit{CreateSize: size},
-			WithDiffEncryption(key, false),
-		)
-		if err != nil {
-			b.Fatal(err)
-		}
-		b.Cleanup(func() { _ = cow.Close() })
-		return cow
+	open := func(b *testing.B) *benchmarkCOW {
+		return newBenchmarkCOW(b, size, WithDiffEncryption(key, false))
 	}
 
 	b.Run("clean-partial-512", func(b *testing.B) {
@@ -44,7 +33,7 @@ func BenchmarkEncryptedBlockCOW(b *testing.B) {
 		for i := 0; i < b.N; i++ {
 			if i > 0 && i%benchmarkCOWBlocks == 0 {
 				b.StopTimer()
-				resetBenchmarkCOW(b, cow)
+				cow.recreate()
 				b.StartTimer()
 			}
 			offset := int64(i%benchmarkCOWBlocks)*cowBlockSize + 123
@@ -110,18 +99,8 @@ func (zeroBlockReader) Close() error  { return nil }
 
 func BenchmarkBlockCOWWriteAt(b *testing.B) {
 	const size = benchmarkCOWBlocks * cowBlockSize
-	open := func(b *testing.B) *Disk {
-		b.Helper()
-		cow, err := OpenDisk(
-			filepath.Join(b.TempDir(), "diff.ext4"),
-			zeroBlockReader{size: size},
-			DiffInit{CreateSize: size},
-		)
-		if err != nil {
-			b.Fatal(err)
-		}
-		b.Cleanup(func() { _ = cow.Close() })
-		return cow
+	open := func(b *testing.B) *benchmarkCOW {
+		return newBenchmarkCOW(b, size)
 	}
 
 	b.Run("clean-partial-512", func(b *testing.B) {
@@ -132,7 +111,7 @@ func BenchmarkBlockCOWWriteAt(b *testing.B) {
 		for i := 0; i < b.N; i++ {
 			if i > 0 && i%benchmarkCOWBlocks == 0 {
 				b.StopTimer()
-				resetBenchmarkCOW(b, cow)
+				cow.recreate()
 				b.StartTimer()
 			}
 			offset := int64(i%benchmarkCOWBlocks)*cowBlockSize + 123
@@ -150,7 +129,7 @@ func BenchmarkBlockCOWWriteAt(b *testing.B) {
 		for i := 0; i < b.N; i++ {
 			if i > 0 && i%benchmarkCOWBlocks == 0 {
 				b.StopTimer()
-				resetBenchmarkCOW(b, cow)
+				cow.recreate()
 				b.StartTimer()
 			}
 			offset := int64(i%benchmarkCOWBlocks) * cowBlockSize
@@ -257,11 +236,45 @@ func BenchmarkBlockCOWSnapshotView(b *testing.B) {
 	})
 }
 
-func resetBenchmarkCOW(b *testing.B, cow *Disk) {
+// A clean-write benchmark must start from a new Hole-backed DIFF. Recreating
+// the same path outside the timer retains one fixture directory and cleanup,
+// rather than turning the next iteration into a write over discarded Zero.
+type benchmarkCOW struct {
+	*Disk
+	recreate func()
+}
+
+func newBenchmarkCOW(b *testing.B, size int64, options ...DiskOption) *benchmarkCOW {
 	b.Helper()
-	if err := cow.Discard(0, cow.size, true); err != nil {
-		b.Fatal(err)
+	path := filepath.Join(b.TempDir(), "diff.ext4")
+	base := zeroBlockReader{size: size}
+	fixture := &benchmarkCOW{}
+	fixture.recreate = func() {
+		b.Helper()
+		if fixture.Disk != nil {
+			if err := fixture.Close(); err != nil {
+				b.Fatal(err)
+			}
+			fixture.Disk = nil
+			if err := os.Remove(path); err != nil {
+				b.Fatal(err)
+			}
+		}
+		var err error
+		fixture.Disk, err = OpenDisk(path, base, DiffInit{CreateSize: size}, options...)
+		if err != nil {
+			b.Fatal(err)
+		}
 	}
+	b.Cleanup(func() {
+		if fixture.Disk != nil {
+			if err := fixture.Close(); err != nil {
+				b.Error(err)
+			}
+		}
+	})
+	fixture.recreate()
+	return fixture
 }
 
 func BenchmarkFreshTemplateMaterialization(b *testing.B) {

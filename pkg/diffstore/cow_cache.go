@@ -697,7 +697,7 @@ func (c *Cache) Close() error {
 	return c.err
 }
 
-func (c *Cache) discard(ctx context.Context, cow *Disk, first, last int64, hole bool) error {
+func (c *Cache) discard(ctx context.Context, cow *Disk, first, last int64) error {
 	for {
 		c.mu.Lock()
 		if err := c.checkLocked(ctx); err != nil {
@@ -737,7 +737,7 @@ func (c *Cache) discard(ctx context.Context, cow *Disk, first, last int64, hole 
 		c.mu.Unlock()
 		// Once frozen, completion cannot be abandoned on cancellation: publish
 		// the complete batch, or the existing sticky failure, and wake waiters.
-		err := cow.diff.discard(context.WithoutCancel(ctx), first*cowBlockSize, (last-first+1)*cowBlockSize, hole)
+		err := cow.diff.discard(context.WithoutCancel(ctx), first*cowBlockSize, (last-first+1)*cowBlockSize)
 		c.mu.Lock()
 		var report func(error)
 		if err == nil {
@@ -745,11 +745,7 @@ func (c *Cache) discard(ctx context.Context, cow *Disk, first, last int64, hole 
 				c.releaseLocked(p)
 			}
 			for block := first; block <= last; block++ {
-				if hole {
-					cow.markAbsent(block)
-				} else {
-					cow.markDirty(block)
-				}
+				cow.markDirty(block)
 			}
 		} else {
 			report = c.failLocked(fmt.Errorf("diffstore: discard blocks %d..%d: %w", first, last, err))

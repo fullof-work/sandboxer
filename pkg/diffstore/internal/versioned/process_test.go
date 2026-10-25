@@ -447,7 +447,7 @@ func TestKilledWriterRedoReopen(t *testing.T) {
 func TestSpaceReservationRunsGCBeforeRetry(t *testing.T) {
 	s, _ := newTestStore(t, 256, nil)
 	putPages(t, s, []uint64{0, 1, 2, 3}, 1)
-	if err := s.Discard(ctx, 0, 4*PageSize, true); err != nil {
+	if err := s.Discard(ctx, 0, 4*PageSize); err != nil {
 		t.Fatal(err)
 	}
 	fired := false

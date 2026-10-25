@@ -66,11 +66,11 @@ func TestCheckpointBitmapPresenceReadModifyExport(t *testing.T) {
 				}
 				copy(want[off:], []byte{9, 8, 7})
 			}
-			// Revert an upper block; export must preserve its absence.
-			if err := cow.Discard(255*cowBlockSize, cowBlockSize, true); err != nil {
+			// Discard an upper block; export must preserve its explicit Zero.
+			if err := cow.Discard(255*cowBlockSize, cowBlockSize); err != nil {
 				t.Fatal(err)
 			}
-			copy(want[255*cowBlockSize:256*cowBlockSize], bytes.Repeat([]byte{0x61}, cowBlockSize))
+			clear(want[255*cowBlockSize : 256*cowBlockSize])
 			// Snapshot must preserve the untouched tail and exact holes.
 			view, err := cow.Export(context.Background(), ActiveDiff)
 			if err != nil {
@@ -79,7 +79,7 @@ func TestCheckpointBitmapPresenceReadModifyExport(t *testing.T) {
 			defer view.Close()
 			upper := readExport(t, view)
 			for block := 0; block < 520; block++ {
-				present := block == 0 || block == 1 || block == 2 || block == 256 || block == 519
+				present := block == 0 || block == 1 || block == 2 || block == 255 || block == 256 || block == 519
 				page := upper[block*cowBlockSize : (block+1)*cowBlockSize]
 				if present {
 					if !bytes.Equal(page, want[block*cowBlockSize:(block+1)*cowBlockSize]) {
@@ -89,7 +89,7 @@ func TestCheckpointBitmapPresenceReadModifyExport(t *testing.T) {
 					t.Fatalf("export hole %d contains base", block)
 				}
 			}
-			if stats := cow.BackendStats(); stats["diff_presence_complete"] != true || stats["diff_dirty_blocks"] != 5 {
+			if stats := cow.BackendStats(); stats["diff_presence_complete"] != true || stats["diff_dirty_blocks"] != 6 {
 				t.Fatal(stats)
 			}
 			got := make([]byte, len(want))
@@ -155,7 +155,7 @@ func TestCheckpointBitmapPresenceMutationMetadataOnly(t *testing.T) {
 						if operation == "full-write" {
 							_, err = cow.WriteAt(page, block*cowBlockSize)
 						} else {
-							err = cow.Discard(block*cowBlockSize, cowBlockSize, true)
+							err = cow.Discard(block*cowBlockSize, cowBlockSize)
 						}
 						if err != nil {
 							t.Fatal(err)
@@ -169,7 +169,7 @@ func TestCheckpointBitmapPresenceMutationMetadataOnly(t *testing.T) {
 				if got := backend.store.Stats().DataRead; got != before || base.reads.Load() != 0 {
 					t.Fatalf("%s read old payload: upper bytes=%d base reads=%d", operation, got-before, base.reads.Load())
 				}
-				want := bytes.Repeat([]byte{0x61}, 2*cowBlockSize)
+				want := make([]byte, 2*cowBlockSize)
 				if operation == "full-write" {
 					want = bytes.Repeat([]byte{0xc7}, 2*cowBlockSize)
 				}

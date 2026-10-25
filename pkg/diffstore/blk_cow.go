@@ -46,7 +46,6 @@ type Disk struct {
 	materialTemplate  diffTemplateSource
 	materialFresh     *freshDiffInit
 	materialCancel    context.CancelFunc
-	materialResolved  []uint64
 	materialDiscard   bool
 	discardOnClose    bool
 }
@@ -148,7 +147,6 @@ func OpenDisk(diffPath string, base BlockReader, init DiffInit, rawOptions ...Di
 		cow.materialDone = make(chan struct{})
 		cow.materialTemplate = fresh.template
 		cow.materialFresh = fresh
-		cow.materialResolved = make([]uint64, len(bitmap))
 		// Materialization has its own lifetime. Closing frontend admission must
 		// not cancel retained-diff publication; ephemeral teardown explicitly
 		// cancels this context through materialCancel.
@@ -218,26 +216,6 @@ func (c *Disk) markDirty(blk int64) {
 	c.bitmapMu.Lock()
 	defer c.bitmapMu.Unlock()
 	c.bitmap[blk/64] |= 1 << (uint64(blk) % 64)
-}
-
-func (c *Disk) markAbsent(blk int64) {
-	c.bitmapMu.Lock()
-	defer c.bitmapMu.Unlock()
-	c.bitmap[blk/64] &^= 1 << (uint64(blk) % 64)
-}
-
-func (c *Disk) materialBlockResolved(blk int64) bool {
-	c.bitmapMu.RLock()
-	defer c.bitmapMu.RUnlock()
-	return len(c.materialResolved) != 0 && bitmapBlockDirty(c.materialResolved, blk)
-}
-
-func (c *Disk) markMaterialResolved(blk int64) {
-	c.bitmapMu.Lock()
-	defer c.bitmapMu.Unlock()
-	if len(c.materialResolved) != 0 {
-		c.materialResolved[blk/64] |= 1 << (uint64(blk) % 64)
-	}
 }
 
 func (c *Disk) blockLock(blk int64) *sync.RWMutex {
@@ -444,8 +422,7 @@ func (c *Disk) readLower(ctx context.Context, buf []byte, offset int64) (int, er
 		length := min(len(buf)-done, int(c.blockSize-pos%c.blockSize))
 		chunk := buf[done : done+length]
 		usedTemplate := false
-		resolved := c.materialBlockResolved(pos / c.blockSize)
-		if template != nil && !resolved && pos < int64(template.Size()) {
+		if template != nil && pos < int64(template.Size()) {
 			run, err := template.RunAt(uint64(pos), uint64(length))
 			if err != nil && !errors.Is(err, io.EOF) {
 				return done, err
@@ -546,9 +523,6 @@ func (c *Disk) runMaterializer(ctx context.Context) {
 		c.materialReaders.Wait()
 		_ = fresh.failMaterialization()
 	}
-	c.bitmapMu.Lock()
-	c.materialResolved = nil
-	c.bitmapMu.Unlock()
 	// Publish failed health before waking waiters; report only after completion.
 	var report func(error)
 	if err != nil {
@@ -661,10 +635,10 @@ func (c *Disk) SetFatalHandler(report func(error)) { c.cache.SetFatalHandler(rep
 // Drain is an internal completion boundary, not a guest durability operation.
 func (c *Disk) Drain(ctx context.Context) error { return c.cache.drain(ctx, c) }
 
-// Discard removes payload for fully covered pages. hole=true reverts to the
-// lower layer; hole=false publishes an explicit Zero that masks the lower layer.
+// Discard releases active payload for fully covered pages and publishes Zero,
+// masking the lower layer. Retained versions keep their protected payload.
 // Partial edge pages retain their original contents.
-func (c *Disk) Discard(offset, length int64, hole bool) error {
+func (c *Disk) Discard(offset, length int64) error {
 	ctx, endOp, err := c.begin(nil)
 	if err != nil {
 		return err
@@ -694,12 +668,7 @@ func (c *Disk) Discard(offset, length int64, hole bool) error {
 	for first := startBlk; first < endBlk; first += maxDiscardPages {
 		last := min(first+maxDiscardPages, endBlk) - 1
 		c.lockBlockRange(first, last)
-		err := c.cache.discard(ctx, c, first, last, hole)
-		if err == nil {
-			for blk := first; blk <= last; blk++ {
-				c.markMaterialResolved(blk)
-			}
-		}
+		err := c.cache.discard(ctx, c, first, last)
 		c.unlockBlockRange(first, last)
 		if err != nil {
 			return err

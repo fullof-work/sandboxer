@@ -582,7 +582,7 @@ func seedDiffTemplate(ctx context.Context, target diffBackend, source diffTempla
 				}
 				if kind == sparse.Zero && position >= offset && position+cowBlockSize <= end {
 					zeroEnd := min(end/cowBlockSize*cowBlockSize, position+64*cowBlockSize)
-					if err := target.discard(ctx, int64(position), int64(zeroEnd-position), false); err != nil {
+					if err := target.discard(ctx, int64(position), int64(zeroEnd-position)); err != nil {
 						return err
 					}
 					position = zeroEnd
