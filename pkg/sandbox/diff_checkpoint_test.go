@@ -13,6 +13,44 @@ import (
 	"github.com/kuasar-sandbox/sandboxer/pkg/diffstore"
 )
 
+func TestFreshCheckpointDeviceBindingAndImmediateCapture(t *testing.T) {
+	for _, encrypted := range []bool{false, true} {
+		t.Run(map[bool]string{false: "plain", true: "encrypted"}[encrypted], func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "disk.diff")
+			options := []diffstore.DiskOption{diffstore.WithCheckpoint("bound-disk", "base")}
+			if encrypted {
+				options = append(options, diffstore.WithDiffEncryption([32]byte{7}, true))
+			}
+			cow, err := diffstore.OpenDisk(path, nil, diffstore.DiffInit{CreateSize: 32 << 30}, options...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer cow.Close()
+			// Use the actual cold/restore binding path immediately after logical
+			// open. It must use validated immutable identity, while the exported
+			// callbacks keep readiness/publication ownership with this Disk.
+			refs := bindCheckpointDisks([]SnapDiskRef{{}}, []DiskBackend{{Cow: cow}})
+			if refs[0].DiffID != "bound-disk" || refs[0].Checkpoint == nil || refs[0].WaitMaterialized == nil || refs[0].Export == nil {
+				t.Fatal("incomplete live device binding", refs[0])
+			}
+			if _, err := cow.WriteAt([]byte{0x51}, 0); err != nil {
+				t.Fatal(err)
+			}
+			if err := refs[0].Checkpoint(context.Background(), "immediate"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := os.Stat(path); err != nil {
+				t.Fatal("capture bound an unpublished file", err)
+			}
+			view, err := refs[0].Export(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer view.Close()
+		})
+	}
+}
+
 func TestCheckpointMaintenanceCanonicalOwner(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "checkpoint")
 	owner, err := diffstore.LockDirectory(dir)

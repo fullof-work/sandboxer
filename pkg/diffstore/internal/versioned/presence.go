@@ -40,6 +40,9 @@ func (s *Store) validatePayloadRange(ctx context.Context, start, end uint64) err
 // The result is usable only on success. An index or I/O failure is sticky, while
 // invalid ranges and context cancellation do not poison the store.
 func (s *Store) PayloadPresence(ctx context.Context, start uint64, present []bool) error {
+	if err := WaitInitialized(s, ctx); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.healthy(ctx); err != nil {

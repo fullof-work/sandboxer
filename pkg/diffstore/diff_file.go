@@ -412,13 +412,21 @@ type diffTemplateSource interface {
 }
 
 type freshDiffInit struct {
-	diff      diffBackend
-	template  diffTemplateSource
-	tmpPath   string
-	finalPath string
-	claim     *os.File
-	claimPath string
-	committed bool
+	diff          diffBackend
+	template      diffTemplateSource
+	tmpPath       string
+	finalPath     string
+	claim         *os.File
+	claimPath     string
+	committed     bool
+	beforePublish func(string) error // deterministic I/O/crash boundaries; installed before attachment
+}
+
+func (f *freshDiffInit) publishHook(stage string) error {
+	if f.beforePublish != nil {
+		return f.beforePublish(stage)
+	}
+	return nil
 }
 
 func acquireFreshDiffClaim(path string) (*os.File, string, error) {

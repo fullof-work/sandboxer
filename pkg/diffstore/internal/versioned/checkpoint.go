@@ -32,6 +32,9 @@ func (s *Store) findCheckpoint(id string, t *transaction) (uint64, checkpoint, e
 	return 0, checkpoint{}, ErrNotExist
 }
 func (s *Store) Checkpoint(ctx context.Context, id string) error {
+	if err := WaitInitialized(s, ctx); err != nil {
+		return err
+	}
 	if err := ValidID(id); err != nil {
 		return err
 	}
@@ -81,6 +84,9 @@ func (s *Store) Checkpoint(ctx context.Context, id string) error {
 	})
 }
 func (s *Store) ListCheckpoints(ctx context.Context) ([]string, error) {
+	if err := WaitInitialized(s, ctx); err != nil {
+		return nil, err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.healthy(ctx); err != nil {
@@ -109,6 +115,9 @@ func (s *Store) DeleteCheckpoint(ctx context.Context, id string) error {
 	return s.DeleteCheckpoints(ctx, []string{id})
 }
 func (s *Store) DeleteCheckpoints(ctx context.Context, ids []string) error {
+	if err := WaitInitialized(s, ctx); err != nil {
+		return err
+	}
 	for _, id := range ids {
 		if err := ValidID(id); err != nil {
 			return err
@@ -189,6 +198,9 @@ func (t *transaction) predecessor(slot uint64) (uint64, checkpoint, error) {
 // Existing fixed views retain their inode and return ErrBusy here until closed.
 // OpenMetadata can reopen a retired DIFF to retry this exact operation.
 func (s *Store) Retire(ctx context.Context) error {
+	if err := WaitInitialized(s, ctx); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {

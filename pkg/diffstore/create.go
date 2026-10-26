@@ -71,7 +71,7 @@ func createFreshDiff(path string, init DiffInit, options diskOptions) (*freshDif
 		if err := os.Remove(fresh.tmpPath); err != nil {
 			return fail(err)
 		}
-		store, err := versioned.Create(fresh.tmpPath, checkpointStoreOptions(options, size, path))
+		store, err := versioned.CreatePending(fresh.tmpPath, checkpointStoreOptions(options, size, path))
 		if err != nil {
 			return fail(err)
 		}
@@ -96,6 +96,9 @@ func createFreshDiff(path string, init DiffInit, options diskOptions) (*freshDif
 // publish completes materialization durably before releasing the creation claim.
 // A failure after rename leaves the committed data in place for inspection.
 func (f *freshDiffInit) publish() error {
+	if err := f.publishHook("before-sync"); err != nil {
+		return err
+	}
 	if err := f.diff.Sync(); err != nil {
 		return err
 	}
@@ -107,7 +110,13 @@ func (f *freshDiffInit) commit() error {
 		return err
 	}
 	f.committed = true
+	if err := f.publishHook("renamed"); err != nil {
+		return err
+	}
 	if err := f.releaseClaim(); err != nil {
+		return err
+	}
+	if err := f.publishHook("directory-sync"); err != nil {
 		return err
 	}
 	return syncDirectory(filepath.Dir(f.finalPath))

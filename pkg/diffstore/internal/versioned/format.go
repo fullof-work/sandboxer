@@ -9,6 +9,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"io"
@@ -291,6 +292,18 @@ func Probe(path string) (Info, error) {
 }
 
 func Create(path string, o Options) (*Store, error) {
+	return create(path, o, false, nil)
+}
+
+// CreatePending is used only by live Disks. Preparation acquires exclusive
+// ownership and validates immutable state; the one bounded initializer is
+// scheduled before the owner can escape to any fallible frontend setup.
+// Offline Create runs exactly the same initializer inline.
+func CreatePending(path string, o Options) (*Store, error) {
+	return create(path, o, true, nil)
+}
+
+func create(path string, o Options, asynchronous bool, beforeIO func(string) error) (*Store, error) {
 	if o.RequireEncryption && o.Key == nil {
 		return nil, ErrEncryptionRequired
 	}
@@ -315,37 +328,67 @@ func Create(path string, o Options) (*Store, error) {
 		lock.Close()
 		return nil, err
 	}
-	fail := func(err error) (*Store, error) { f.Close(); lock.Close(); os.Remove(path); return nil, err }
-	if err = f.Truncate(slotAreaPage * PageSize); err != nil {
-		return fail(err)
+	info, _, _ := parseHeader(h, nil, true)
+	s := &Store{presence: make([]byte, presence.Bytes(info.LogicalSize)), file: f, lock: lock,
+		lockPath: lockPath, info: info, cipher: xc, ctrl: control{Next: 1, Epoch: 1},
+		cache: newCache(cachePages), initDone: make(chan struct{}), beforeIO: beforeIO}
+	initialize := func() {
+		err := s.initialize(h)
+		clear(h)
+		s.mu.Lock()
+		s.initErr = err
+		if err != nil {
+			s.fail(err)
+		} else {
+			s.startGC()
+		}
+		close(s.initDone)
+		s.mu.Unlock()
+	}
+	if asynchronous {
+		go initialize()
+		return s, nil
+	}
+	initialize()
+	if err := s.Err(); err != nil {
+		return nil, errors.Join(err, s.Close(), os.Remove(path))
+	}
+	return s, nil
+}
+
+func (s *Store) initialize(h []byte) error {
+	if err := s.hook("initialize"); err != nil {
+		return err
+	}
+	f := s.file
+	if err := f.Truncate(slotAreaPage * PageSize); err != nil {
+		return err
 	}
 	// Redo and existing control home pages must remain writable even when guest
 	// data fills the filesystem. This fixed, bounded reservation is not payload.
-	if err = unix.Fallocate(int(f.Fd()), unix.FALLOC_FL_KEEP_SIZE, 0, (logImagesPage+maxLogPages)*PageSize); err != nil {
-		return fail(err)
+	if err := s.hook("initialize-reserve"); err != nil {
+		return err
 	}
-	if err = writeFull(f, h, 0); err != nil {
-		return fail(err)
+	if err := unix.Fallocate(int(f.Fd()), unix.FALLOC_FL_KEEP_SIZE, 0, (logImagesPage+maxLogPages)*PageSize); err != nil {
+		return err
 	}
-	ctrl := control{Next: 1, Epoch: 1}
-	b, _ := encodeJSON("KDCONT4", ctrl)
-	if err = writeFull(f, b, 1); err != nil {
-		return fail(err)
+	if err := writeFull(f, h, 0); err != nil {
+		return err
 	}
-	if err = writeFull(f, make([]byte, PageSize), logCommitPage); err != nil {
-		return fail(err)
+	b, _ := encodeJSON("KDCONT4", s.ctrl)
+	if err := writeFull(f, b, 1); err != nil {
+		return err
 	}
-	bitmap := make([]byte, presence.Bytes(o.LogicalSize))
-	if err = unix.Fallocate(int(f.Fd()), unix.FALLOC_FL_KEEP_SIZE, int64(presenceAreaPage)*PageSize, int64(presence.Pages(o.LogicalSize))*PageSize); err != nil {
-		return fail(err)
+	if err := writeFull(f, make([]byte, PageSize), logCommitPage); err != nil {
+		return err
 	}
-	if err = writeInitialPresence(f, bitmap, o.LogicalSize); err != nil {
-		return fail(err)
+	if err := unix.Fallocate(int(f.Fd()), unix.FALLOC_FL_KEEP_SIZE, int64(presenceAreaPage)*PageSize, int64(presence.Pages(s.Size()))*PageSize); err != nil {
+		return err
 	}
-	info, _, _ := parseHeader(h, nil, true)
-	s := &Store{presence: bitmap, file: f, lock: lock, lockPath: lockPath, info: info, cipher: xc, ctrl: ctrl, cache: newCache(cachePages)}
-	s.startGC()
-	return s, nil
+	if err := s.hook("initialize-presence"); err != nil {
+		return err
+	}
+	return writeInitialPresence(f, s.presence, s.Size())
 }
 func Open(path string, o Options) (*Store, error) { return openStore(path, o, false) }
 func OpenMetadata(path string) (*Store, error)    { return openStore(path, Options{}, true) }

@@ -91,6 +91,7 @@ type Cache struct {
 
 // Hooks are installed before starting the worker, only by deterministic tests.
 type cacheHooks struct {
+	idle          func() // observes the worker entering its event wait, under mu
 	afterReadCopy func()
 	waiting       func()
 	beforeSelect  func()
@@ -450,8 +451,11 @@ func (c *Cache) run() {
 			c.mu.Unlock()
 			return
 		}
-		if c.dirty.first == nil {
+		if c.oldestEligibleLocked() == nil {
 			aggregated = false
+			if c.hooks.idle != nil {
+				c.hooks.idle()
+			}
 			c.mu.Unlock()
 			<-c.kick
 			continue
@@ -474,7 +478,7 @@ func (c *Cache) run() {
 		}
 		c.urgent = false
 		batch = batch[:0]
-		if anchor := c.dirty.first; anchor != nil {
+		if anchor := c.oldestEligibleLocked(); anchor != nil {
 			// Keep the oldest anchor, then fill its same-DIFF transaction
 			// with neighboring runs before unrelated logical pages. The
 			// bounded candidate list preserves batching for dispersed
@@ -578,6 +582,18 @@ func (c *Cache) run() {
 		clear(pages)
 		clear(batch)
 	}
+}
+
+// Pending owners remain dirty (and rewritable). Search the existing bounded
+// queue without a batch-size search limit: a long pending prefix must not
+// conceal another disk's runnable pages. Completion kicks this same worker.
+func (c *Cache) oldestEligibleLocked() *cachePage {
+	for p := c.dirty.first; p != nil; p = p.next {
+		if backendWritable(p.key.cow.diff) {
+			return p
+		}
+	}
+	return nil
 }
 
 // Ordinary kicks do not shorten or restart the aggregation deadline. Pressure,
