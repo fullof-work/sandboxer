@@ -14,8 +14,8 @@ import (
 
 type checkpointDiskOption struct{ diffID, baseID string }
 
-// WithCheckpoint selects the persistent v2 DIFF format and binds it to its
-// stable disk identity and immutable base. Reopening never adopts a raw/v1 DIFF.
+// WithCheckpoint selects the persistent v4 DIFF format and binds it to its
+// stable disk identity and immutable base. Reopening never adopts older formats.
 func WithCheckpoint(diffID, baseID string) DiskOption {
 	return checkpointDiskOption{diffID, baseID}
 }

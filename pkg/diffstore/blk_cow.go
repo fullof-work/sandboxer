@@ -909,8 +909,9 @@ func (c *Disk) end(cancel func()) {
 	c.opMu.RUnlock()
 }
 
-// Close stops admission, drains accepted writes without fsync, and waits for
-// real I/O before releasing plaintext and the FD. Base is closed by its owner.
+// Close stops admission, joins initialization and required fresh publication,
+// and drains accepted writes before releasing plaintext and the FD. Already
+// published disks get no additional fsync. Base is closed by its owner.
 func (c *Disk) Close() error {
 	c.closeOnce.Do(func() {
 		// Stop frontend admission first. The materializer does not enter through
