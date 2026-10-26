@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
@@ -620,5 +621,60 @@ func TestPendingInitializationKeepsCachePressureCancellable(t *testing.T) {
 	backend.finish()
 	if err := cow.WaitMaterialized(context.Background()); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestCheckpointOversizedCapacityCleansFreshResources(t *testing.T) {
+	const size = int64(32<<30) + cowBlockSize
+	if err := ValidateWritableSize(size); err != nil {
+		t.Fatalf("single-layer capacity rejected the checkpoint boundary fixture: %v", err)
+	}
+	for _, source := range []string{"size", "template"} {
+		t.Run(source, func(t *testing.T) {
+			init := DiffInit{CreateSize: size}
+			if source == "template" {
+				templatePath := filepath.Join(t.TempDir(), "template.raw")
+				f, err := os.Create(templatePath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := f.Truncate(size); err != nil {
+					_ = f.Close()
+					t.Fatal(err)
+				}
+				if err := f.Close(); err != nil {
+					t.Fatal(err)
+				}
+				init = DiffInit{TemplatePath: templatePath}
+			}
+			dir := t.TempDir()
+			path := filepath.Join(dir, "active.diff")
+			cow, err := OpenDisk(path, nil, init, WithCheckpoint("oversized", ""))
+			if cow != nil {
+				_ = cow.Close()
+				t.Fatal("oversized checkpoint escaped synchronous validation")
+			}
+			if err == nil || !strings.Contains(err.Error(), "32 GiB") {
+				t.Fatalf("expected checkpoint capacity rejection, got %v", err)
+			}
+			entries, err := os.ReadDir(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(entries) != 0 {
+				t.Fatalf("capacity rejection retained fresh resources: %v", entries)
+			}
+			retry, err := OpenDisk(path, nil, DiffInit{CreateSize: cowBlockSize}, WithCheckpoint("retry", ""))
+			if err != nil {
+				t.Fatalf("capacity rejection blocked a valid retry: %v", err)
+			}
+			t.Cleanup(func() { _ = retry.Close() })
+			if err := retry.WaitMaterialized(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if err := retry.Close(); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }

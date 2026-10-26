@@ -1,6 +1,7 @@
 package versioned
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -184,5 +185,36 @@ func TestInfoAfterCloseKeepsIdentityWithoutContinuation(t *testing.T) {
 	info := s.Info()
 	if info.DiffID != "test" || info.LogicalSize != 64*PageSize || info.CurrentCheckpoint != "" || s.CanResume("current") {
 		t.Fatalf("closed store identity/continuation: %+v", info)
+	}
+}
+
+func TestProbeRejectsOversizedCapacityWithValidChecksum(t *testing.T) {
+	b, _, err := createHeader(Options{DiffID: "oversized", LogicalSize: PageSize})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var h header
+	n := int(le.Uint32(b[16:]))
+	if err := json.Unmarshal(b[20:20+n], &h); err != nil {
+		t.Fatal(err)
+	}
+	h.Info.LogicalSize = maxWritableSize + PageSize
+	payload, err := json.Marshal(h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clear(b[20 : PageSize-4])
+	le.PutUint32(b[16:], uint32(len(payload)))
+	copy(b[20:], payload)
+	sealPage(b)
+	if err := checkPage(b); err != nil {
+		t.Fatalf("invalid checksum in capacity fixture: %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "oversized.diff")
+	if err := os.WriteFile(path, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Probe(path); err == nil || !strings.Contains(err.Error(), "32 GiB") {
+		t.Fatalf("expected header capacity rejection before reading body metadata, got %v", err)
 	}
 }

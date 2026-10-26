@@ -24,6 +24,9 @@ import (
 var magic = [8]byte{0x89, 'K', 'D', 'X', 'T', 'S', '1', '\n'}
 var le = binary.LittleEndian
 
+// Keep the active bitmap within the fixed v4 presence reservation.
+const maxWritableSize int64 = 32 << 30
+
 const (
 	logCommitPage  = 2
 	logIndexPage   = 3
@@ -199,6 +202,9 @@ func validateInfo(i Info) error {
 	}
 	if len(i.DiffID) == 0 || len(i.DiffID) > 128 || filepath.Base(i.DiffID) != i.DiffID || i.DiffID == "." || i.DiffID == ".." {
 		return fmt.Errorf("diffstore: invalid DIFF identity")
+	}
+	if i.LogicalSize > maxWritableSize {
+		return fmt.Errorf("diffstore: checkpoint writable capacity must not exceed 32 GiB")
 	}
 	if err := presence.ValidateSize(i.LogicalSize); err != nil {
 		return err

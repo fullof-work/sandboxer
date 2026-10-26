@@ -181,11 +181,18 @@ never a Zero or lower-layer Hole. Unvisited subtrees are not audited at Open.
 
 ## Presence and physical layout
 
-Writable logical capacity must be positive, divisible by 4096 and at most 32 GiB.
-The limit is checked before fresh file/device preparation and when opening a DIFF
-or template. It excludes read-only devices, RAM, artifact metadata tails and
-physical storage retained by old versions. One presence bit per 4 KiB page uses
-at most 1 MiB of net bitmap bytes; this is not a claim about total cache memory.
+Writable logical capacity must be positive and divisible by 4096. Single-layer
+v3 supports up to 1 TiB; checkpoint v4 remains limited to 32 GiB because its
+active bitmap occupies a fixed reserved region before the record area. These
+limits apply to active DIFFs and template-derived writable capacity, and exclude
+read-only devices, RAM, artifact metadata tails and physical storage retained
+by old versions. One presence bit per 4 KiB page uses at most 32 MiB of net
+bitmap bytes for a 1 TiB disk, or 1 MiB for a 32 GiB disk. These are per-bitmap
+sizes, not total backend, frontend or cache memory bounds.
+
+The shared capacity check admits up to 1 TiB. The v4 backend separately checks
+its 32 GiB limit on creation and open, before initializing a fresh checkpoint
+file. Upper-level template or runtime preparation can precede that rejection.
 
 | P | Effective payload | Logical result |
 | --- | --- | --- |

@@ -7,7 +7,7 @@ import (
 )
 
 func TestBitmapBoundariesAndCorruption(t *testing.T) {
-	for _, size := range []int64{PageSize, 7 * PageSize, 8 * PageSize, 9 * PageSize, int64(PayloadSize) * 8 * PageSize, MaxSize} {
+	for _, size := range []int64{PageSize, 7 * PageSize, 8 * PageSize, 9 * PageSize, int64(PayloadSize) * 8 * PageSize, 32 << 30, MaxSize} {
 		bitmap := make([]byte, Bytes(size))
 		Set(bitmap, 0)
 		Set(bitmap, uint64(size/PageSize-1))
@@ -39,7 +39,7 @@ func TestBitmapBoundariesAndCorruption(t *testing.T) {
 	if _, err := Decode(b, PageSize, 0); err == nil {
 		t.Fatal("accepted out-of-capacity presence bit with valid checksum")
 	}
-	if Bytes(MaxSize) != 1<<20 || Pages(MaxSize) != 259 {
+	if Bytes(MaxSize) != 32<<20 || Pages(MaxSize) != 8265 {
 		t.Fatal("maximum bitmap layout changed")
 	}
 }
