@@ -18,8 +18,8 @@ import (
 // plaintext page. Reads prefer latest cached data; only misses reach the diff.
 // First partial writes materialize from base/zeros. A shared bounded cache
 // asynchronously writes frozen full pages. Block stripes serialize frontend
-// access; the worker never acquires them. Both formats load their complete
-// capacity-sized presence bitmap before accepting frontend operations.
+// access; the worker never acquires them. Reopen loads committed presence;
+// fresh owners establish an independent empty bitmap before accepting writes.
 type Disk struct {
 	opMu      sync.RWMutex // lifetime of frontend operations; never taken by writeback
 	lifeCtx   context.Context
@@ -56,8 +56,9 @@ const (
 )
 
 // OpenDisk opens or atomically creates the active diff described by init,
-// pairs it with the optional base, and loads logical upper presence without
-// scanning the checkpoint payload index.
+// pairs it with the optional base, and establishes logical upper presence.
+// Fresh checkpoint format initialization and publication run asynchronously;
+// WaitMaterialized is required before handing off or reopening the final path.
 //
 // If base is nil, reads to clean blocks return zeros. A supplied base is borrowed:
 // the caller keeps it open through Disk.Close and remains responsible for closing it.
@@ -106,14 +107,20 @@ func OpenDisk(diffPath string, base BlockReader, init DiffInit, rawOptions ...Di
 		}
 	}
 
+	return attachDisk(diff, fresh, bitmap, base, options)
+}
+
+// The backend is already owned and, for fresh checkpoint files, its initializer
+// already runs. Every failure below joins that owner directly, even before a
+// cache or coordinator exists.
+func attachDisk(diff diffBackend, fresh *freshDiffInit, bitmap []uint64, base BlockReader, options diskOptions) (*Disk, error) {
 	size := diff.Size()
 	if base != nil && base.Size() > size {
+		err := fmt.Errorf("diffstore: base size %d > diff size %d", base.Size(), size)
 		if fresh != nil {
-			_ = fresh.abort()
-		} else {
-			_ = diff.Close()
+			return nil, errors.Join(err, fresh.abort())
 		}
-		return nil, fmt.Errorf("diffstore: base size %d > diff size %d", base.Size(), size)
+		return nil, errors.Join(err, diff.Close())
 	}
 
 	cow := &Disk{
@@ -129,6 +136,7 @@ func OpenDisk(diffPath string, base BlockReader, init DiffInit, rawOptions ...Di
 	cow.lifeCtx, cow.cancel = context.WithCancel(context.Background())
 	cow.cache = options.cache
 	if cow.cache == nil {
+		var err error
 		cow.cache, err = NewCache(DefaultCacheSize, DefaultMaxDirtySize)
 		if err != nil {
 			cow.cancel()
@@ -508,52 +516,87 @@ func (c *Disk) WaitMaterialReady(ctx context.Context) error {
 func (c *Disk) runMaterializer(ctx context.Context) {
 	err := c.materializeTemplate(ctx)
 	c.materialMu.Lock()
-	intentionalDiscard := c.materialDiscard && errors.Is(err, context.Canceled)
-	if intentionalDiscard {
-		err = nil
-	}
 	c.materialErr = err
-	fresh := c.materialFresh
-	if err == nil {
-		c.materialTemplate = nil
-	}
 	done := c.materialDone
 	c.materialMu.Unlock()
-	if err == nil && intentionalDiscard && fresh != nil {
-		c.materialReaders.Wait()
-		_ = fresh.failMaterialization()
-	}
-	if err != nil && fresh != nil {
-		c.materialMu.Lock()
-		c.materialTemplate = nil
-		c.materialMu.Unlock()
-		c.materialReaders.Wait()
-		_ = fresh.failMaterialization()
-	}
-	// Publish failed health before waking waiters; report only after completion.
+	// On failure keep lower readers and private resources until Close has
+	// stopped admission and joined callers that already passed the health check.
+	// Keep the cache gate through completion: late handler installation cannot
+	// replay this failure before a handler can safely WaitMaterialized.
 	var report func(error)
-	if err != nil {
-		c.cache.mu.Lock()
-		report = c.cache.failLocked(fmt.Errorf("diffstore: diff template materialization: %w", err))
-		c.cache.mu.Unlock()
+	c.cache.mu.Lock()
+	if err != nil && !errors.Is(err, errMaterialDiscard) {
+		report = c.cache.failLocked(fmt.Errorf("diffstore: initialize/materialize diff: %w", err))
 	}
 	c.signalMaterialReady()
 	if done != nil {
 		close(done)
 	}
+	c.cache.mu.Unlock()
 	if report != nil {
 		report(err)
 	}
 }
+
+var errMaterialDiscard = fmt.Errorf("diffstore: disposable materialization stopped: %w", context.Canceled)
 
 func (c *Disk) materializeTemplate(ctx context.Context) error {
 	c.materialMu.Lock()
 	template := c.materialTemplate
 	fresh := c.materialFresh
 	c.materialMu.Unlock()
-	if template == nil || fresh == nil {
+	if fresh == nil {
 		return nil
 	}
+	// Never hold frontend stripes while waiting. Initialization belongs to the
+	// backend and cannot be canceled by ordinary teardown or a request timeout.
+	if err := c.diff.waitInitialized(context.Background()); err != nil {
+		return err
+	}
+	c.cache.mu.Lock()
+	c.cache.signalLocked()
+	c.cache.kickLocked(true)
+	c.cache.mu.Unlock()
+	if ctx.Err() != nil {
+		return errMaterialDiscard
+	}
+	if template != nil {
+		if err := c.materializeContents(ctx, template); err != nil {
+			if ctx.Err() != nil && errors.Is(err, ctx.Err()) {
+				return errMaterialDiscard
+			}
+			return err
+		}
+		// Detach only after every template page is owned by committed or
+		// cached upper state. Existing readers retain their borrowed source.
+		c.materialMu.Lock()
+		c.materialTemplate = nil
+		c.materialMu.Unlock()
+		c.materialReaders.Wait()
+		if err := template.Close(); err != nil {
+			return fmt.Errorf("close materialized diff template: %w", err)
+		}
+		fresh.template = nil
+	}
+	c.signalMaterialReady()
+	if err := c.cache.drain(ctx, c); err != nil {
+		if ctx.Err() != nil && errors.Is(err, ctx.Err()) {
+			return errMaterialDiscard
+		}
+		return err
+	}
+	// Publication is admitted under the teardown gate. Once admitted, preserve
+	// its real sync/rename/dirsync result even if Close requests disposal.
+	c.materialMu.Lock()
+	discard := c.materialDiscard
+	c.materialMu.Unlock()
+	if discard {
+		return errMaterialDiscard
+	}
+	return fresh.publish()
+}
+
+func (c *Disk) materializeContents(ctx context.Context, template diffTemplateSource) error {
 	staging := make([]byte, c.diff.policy().materialPages*cowBlockSize)
 	defer clear(staging)
 	for offset := uint64(0); offset < template.Size(); {
@@ -583,25 +626,7 @@ func (c *Disk) materializeTemplate(ctx context.Context) error {
 		offset = end
 	}
 
-	// Every template block is now either persisted in D or owned by foreground
-	// upper state. Detach T before waiting for cache drain so snapshot admission
-	// can reach the VM/backend quiesce boundary even under continuous writes.
-	c.materialMu.Lock()
-	if c.materialTemplate == template {
-		c.materialTemplate = nil
-	}
-	c.materialMu.Unlock()
-	c.materialReaders.Wait()
-	if err := template.Close(); err != nil {
-		return fmt.Errorf("close materialized diff template: %w", err)
-	}
-	fresh.template = nil
-	c.signalMaterialReady()
-
-	if err := c.cache.drain(ctx, c); err != nil {
-		return err
-	}
-	return fresh.publish()
+	return nil
 }
 
 func (c *Disk) WaitMaterialized(ctx context.Context) error {
@@ -667,6 +692,9 @@ func (c *Disk) Discard(offset, length int64) error {
 	endBlk := (offset + length) / blockSize
 	if startBlk >= endBlk {
 		return nil
+	}
+	if err := c.diff.waitInitialized(ctx); err != nil {
+		return err
 	}
 
 	if err := c.markModified(ctx); err != nil {
@@ -888,18 +916,21 @@ func (c *Disk) Close() error {
 		// Stop frontend admission first. The materializer does not enter through
 		// begin(), so a retained diff can still finish drain/sync/publication
 		// after all accepted frontend operations have crossed this barrier.
+		if c.materialCancel != nil && c.discardOnClose {
+			c.materialMu.Lock()
+			c.materialDiscard = true
+			c.materialCancel()
+			c.materialMu.Unlock()
+		}
 		c.cancel()
 		c.opMu.Lock()
 		c.opMu.Unlock()
 
 		if c.materialCancel != nil {
-			if c.discardOnClose {
-				c.materialMu.Lock()
-				c.materialDiscard = true
-				c.materialMu.Unlock()
-				c.materialCancel()
+			if err := c.WaitMaterialized(context.Background()); !errors.Is(err, errMaterialDiscard) {
+				c.closeErr = errors.Join(c.closeErr, err)
 			}
-			c.closeErr = errors.Join(c.closeErr, c.WaitMaterialized(context.Background()))
+			c.materialCancel()
 		}
 		c.closeErr = errors.Join(c.closeErr, c.cache.drain(context.Background(), c))
 		c.cache.detach(c)
@@ -907,6 +938,10 @@ func (c *Disk) Close() error {
 			c.closeErr = errors.Join(c.closeErr, c.cache.Close())
 		}
 		c.closeErr = errors.Join(c.closeErr, c.diff.Close())
+		c.materialReaders.Wait()
+		if c.materialFresh != nil {
+			c.closeErr = errors.Join(c.closeErr, c.materialFresh.failMaterialization())
+		}
 	})
 	return c.closeErr
 }

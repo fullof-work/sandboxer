@@ -1316,13 +1316,16 @@ func TestAsyncTemplateMaterializationFailureIsFatalAndUnpublished(t *testing.T) 
 	if _, err := os.Stat(finalPath); !os.IsNotExist(err) {
 		t.Fatalf("failed materialization published final path: %v", err)
 	}
-	if partials, _ := filepath.Glob(filepath.Join(dir, ".active.diff.*.partial")); len(partials) != 0 {
-		t.Fatalf("failed materialization left temporary files: %v", partials)
+	if partials, _ := filepath.Glob(filepath.Join(dir, ".active.diff.*.partial")); len(partials) != 1 {
+		t.Fatalf("failed owner lost its private file before Close: %v", partials)
 	}
 	if err := awaitError(t, reported); err != nil {
 		t.Fatal(err)
 	}
 	_ = cow.Close()
+	if partials, _ := filepath.Glob(filepath.Join(dir, ".active.diff.*.partial")); len(partials) != 0 {
+		t.Fatalf("Close retained failed private files: %v", partials)
+	}
 }
 
 func TestAsyncTemplateDiscardDoesNotReintroduceTemplateBlock(t *testing.T) {

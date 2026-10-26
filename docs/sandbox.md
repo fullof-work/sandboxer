@@ -2748,6 +2748,33 @@ files to be removed after the completed capture has collected their dependencies
 
 ### 11.5 Quiesce / Resume
 
+Fresh checkpoint DIFFs return a usable logical disk before bounded format I/O
+and final publication, including when no template is supplied. Lower reads and
+full/partial cached writes can proceed within the existing shared budget.
+The cache skips pending owners without freezing their pages; other initialized
+disks can write back. Size, immutable checkpoint identity and Guest FLUSH health
+remain available. Backend reads/mutations, Discard and GC wait for initialization.
+An empty Drain is only cache completion, not proof of a completed format.
+
+`WaitMaterialReady` includes initialization and the end of template dependence,
+before cache drain. `WaitMaterialized` additionally includes required writeback,
+file Sync, rename, claim release and directory Sync. Callers must wait for this
+existing boundary before handing off/reopening the final path. Offline Create
+and existing-file validation remain synchronous; v3/v4 bytes are unchanged.
+See [initialization and ownership](diffstore.md#ownership-and-completion) for the
+storage contract.
+
+Close stops frontend admission and joins the initializer's real I/O. A retained
+disk completes materialization, drains and publishes. Disposable Close records
+its stop request before waiting, then can skip unfinished template/publication
+work after initialization; it neither cancels initialization nor hides an error
+from already admitted publication. Initialization/publication errors can occur
+after cached writes were accepted and use the existing sticky fatal path.
+Completion precedes fatal callbacks, and a failed disk retains its template and
+private resources until Close joins admitted readers and releases them.
+Intentional disposal can complete Close successfully; a waiter whose publication
+was stopped receives cancellation rather than a false successful publication.
+
 Quiesce waits for in-flight block requests to leave and prevents new ones. All data/root views are read within the same quiesce window. Recovery makes backends serviceable before resuming CH and guest connections, avoiding permanent blocking of block requests after VM resume.
 
 Named disk capture first waits for every disk's template `WaitReady`, before
@@ -2932,6 +2959,27 @@ go test -tags no_rocksdb ./pkg/diffstore -run '^$' \
 Direct-I/O prefill distinguishes cached reads from warm kernel-file-cache effects. Hot-path checks cover nil/background/cancelable contexts and signaled waiters. Deterministic tests verify fixed batching deadlines, pressure/Drain bypass, no per-batch delay with backlog, oldest-dirty progress, bounded adjacent reads with small caches, mixed cache/base/hole reads, overlap/cancellation, sub-page and short-read boundaries, and copyout isolation from guest-mutated output buffers.
 
 For actual guest validation, use the existing owner E2E cases for diff templates, encrypted diffs, snapshot/restore and data disks, with `REQUIRE_KVM`, private `TMPDIR` and matching `BIN`/native/runtime inputs. Record each unavailable prerequisite as missing validation. A guest probe can write a 64 MiB span in 1 MiB requests, then warm and overwrite the first 4 MiB with 4,096 aligned 4 KiB operations using mmap-backed buffers and O_DIRECT. Verify byte counts and payloads. Guest descriptor segmentation does not measure 1 MiB host batches, and admission-only timing without Drain/fsync is not full writeback timing. Keep raw run results in the originating PR/Issue or immutable Git history.
+
+Fresh checkpoint initialization has an opt-in phase probe in the existing
+`checkpoint_template_perf_test.go`:
+
+```bash
+CHECKPOINT_INIT_PERF=1 CHECKPOINT_INIT_DISKS=4 CHECKPOINT_INIT_TEMPLATE=1 \
+CHECKPOINT_INIT_ENCRYPTED=1 CHECKPOINT_INIT_ACTION=drain \
+CHECKPOINT_INIT_LABEL=candidate CHECKPOINT_INIT_ROUND=1 \
+go test ./pkg/diffstore -run '^TestCheckpointInitializationPhases$' -count=1 -v
+```
+
+Use 1 and 4 disks, template/encryption values 0 and 1, and actions `drain`,
+`checkpoint` and `close`; repeat in alternating control/candidate order.
+The 32 GiB capacity is sparse, with only 64 KiB of template data when selected.
+Setup is excluded; results contain logical open, first useful I/O, completion
+observations, immediate boundary waits, CPU, allocations, RSS, physical extent
+accounting and process I/O. Completion observations include observer scheduling
+delay. Compare the same current synchronous batched initializer/bitmap baseline,
+not the historical serial bitmap writer. Keep all tails and failures. Also
+measure actual Guest startup through first health/tool response under single and
+concurrent launches; backend open timing alone cannot establish startup benefit.
 
 <a id="usage-validation"></a>
 

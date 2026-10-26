@@ -110,13 +110,7 @@ func openCheckpointDiff(path string, init DiffInit, options diskOptions) (diffBa
 	if err != nil {
 		return nil, nil, err
 	}
-	if fresh.template != nil {
-		return fresh.diff, fresh, nil
-	}
-	if err := fresh.publish(); err != nil {
-		return nil, nil, errors.Join(err, fresh.abort())
-	}
-	return fresh.diff, nil, nil
+	return fresh.diff, fresh, nil
 }
 
 func (d *diffFile) name() string {
@@ -134,6 +128,11 @@ func (d *diffFile) cleanupWriteFailure(pages []pageWrite) error {
 func (c *Disk) markModified(ctx context.Context) error {
 	if err := c.diff.markModified(ctx); err != nil {
 		if ctx.Err() != nil && errors.Is(err, ctx.Err()) {
+			return err
+		}
+		if initializationFailure(c.diff) {
+			// The initializer's coordinator publishes completion and cache
+			// failure together. Do not race it with an early fatal callback.
 			return err
 		}
 		c.cache.mu.Lock()
@@ -155,6 +154,9 @@ func (c *Disk) propagateBackendFailure(err error) error {
 	if err == nil || c.diff.err() == nil {
 		return err
 	}
+	if initializationFailure(c.diff) {
+		return err
+	}
 	c.cache.mu.Lock()
 	report := c.cache.failLocked(err)
 	fatal := c.cache.err
@@ -163,6 +165,21 @@ func (c *Disk) propagateBackendFailure(err error) error {
 		report(fatal)
 	}
 	return fatal
+}
+
+// Only used after observing a backend error. A pending fresh backend cannot
+// yet have a normal I/O failure: initialization owns its physical operations.
+// Err can observe the atomic failure just before the completion event closes.
+func initializationFailure(d diffBackend) bool {
+	if done := d.initialized(); done != nil {
+		select {
+		case <-done:
+			return d.waitInitialized(context.Background()) != nil
+		default:
+			return true
+		}
+	}
+	return false
 }
 
 type CheckpointID string
@@ -190,7 +207,7 @@ func (c *Disk) CheckpointInfo() (diffID, baseID string, enabled bool) {
 	if err != nil {
 		return "", "", false
 	}
-	info := d.store.Info()
+	info := versioned.Identity(d.store)
 	return info.DiffID, info.BaseID, true
 }
 

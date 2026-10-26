@@ -27,6 +27,31 @@ func TestProcessHelper(t *testing.T) {
 	}
 	path := os.Getenv("DIFFSTORE_PATH")
 	switch mode {
+	case "short-pending-initialization":
+		s, err := create(path, Options{DiffID: "pending-short", LogicalSize: presence.MaxSize}, true, func(stage string) error {
+			if stage != "initialize-presence" {
+				return nil
+			}
+			var limits unix.Rlimit
+			if err := unix.Getrlimit(unix.RLIMIT_FSIZE, &limits); err != nil {
+				return err
+			}
+			limits.Cur = presenceAreaPage*PageSize + PageSize + 512
+			return unix.Setrlimit(unix.RLIMIT_FSIZE, &limits)
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := WaitInitialized(s, context.Background()); !errors.Is(err, io.ErrShortWrite) || !errors.Is(s.Err(), io.ErrShortWrite) {
+			t.Fatalf("pending initialization lost real short write: %v / %v", err, s.Err())
+		}
+		if s.stop != nil || s.done != nil {
+			t.Fatal("GC started after incomplete format write")
+		}
+		if err := s.Close(); !errors.Is(err, io.ErrShortWrite) {
+			t.Fatal(err)
+		}
+		fmt.Println("PENDING_SHORT_WITHOUT_RETRY")
 	case "reader":
 		v, err := OpenExport(context.Background(), path, "pinned", nil)
 		if err != nil {

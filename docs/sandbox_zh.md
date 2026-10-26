@@ -2463,6 +2463,26 @@ Bundle checkpoint 可以引用相邻 tarstream，后续普通 publish 再生成�
 
 ### 11.5 Quiesce / Resume
 
+新建 Checkpoint DIFF 会在有界格式 I/O 和最终发布之前返回可用的逻辑磁盘，
+包括没有模板的情况。底层读取以及完整页、部分页缓存写入可在既有共享预算内继续。
+缓存跳过尚未初始化的 owner，不冻结其脏页；其他已初始化磁盘仍可回写。
+容量、不可变 Checkpoint 身份和 Guest FLUSH 健康检查仍然可用。后端读取/修改、
+Discard 和 GC 等待初始化完成。空缓存的 Drain 只表示缓存完成，不证明格式已初始化。
+
+`WaitMaterialReady` 包含初始化及模板依赖结束，先于缓存排空。
+`WaitMaterialized` 还包含所需回写、文件 Sync、rename、claim 释放和目录 Sync。
+交接或重新打开最终路径之前，调用方必须等待这个既有边界。离线 Create 和
+已有文件验证仍同步执行；v3/v4 字节格式不变。存储契约见
+[初始化与所有权](diffstore.md#ownership-and-completion)。
+
+Close 停止前台准入并等待初始化器的真实 I/O。保留磁盘完成材料化、排空并发布。
+临时磁盘 Close 在等待之前登记停止请求，初始化结束后可跳过尚未完成的模板/发布
+工作；它既不取消初始化，也不掩盖已经准入的发布操作产生的错误。初始化/发布错误
+可能在缓存写入已被接受之后出现，仍走既有粘滞致命错误路径。完成事件先于错误回调
+发布；失败磁盘保留模板及私有资源，直到 Close 等待已进入的读取结束后再释放。
+主动丢弃可以使 Close 正常成功；被停止发布的等待方收到取消结果，而不会误认为
+发布成功。
+
 Quiesce等待in-flight block request退出并阻止新request. 所有data/root views在同一quiesce窗口读取. Recovery顺序先恢复backend可服务状态,再恢复CH和guest连接,避免VM恢复后block request永久阻塞.
 
 命名磁盘捕获先等待所有磁盘模板 `WaitReady`，再暂停 CH 并冻结后端。在同一冻结
@@ -2620,6 +2640,25 @@ go test -tags no_rocksdb ./pkg/diffstore -run '^$' \
 Direct-I/O 预填充分离 cache 读取和温热 kernel file cache 的影响。热路径检查覆盖 nil/background/cancelable context 和收到信号的 waiter。确定性测试验证固定批处理 deadline、pressure/Drain 绕过等待、backlog 时无每批延迟、最老 dirty 进展、小 cache 下有界相邻读取、cache/base/hole 混合、重叠/取消、sub-page 和 short-read 边界，以及与 Guest 修改输出 buffer 隔离的 copyout。
 
 实际 Guest 验证使用现有 owner E2E 的 diff template、encrypted diff、snapshot/restore 和 data disk 用例，配合 `REQUIRE_KVM`、私有 `TMPDIR` 及匹配的 `BIN`/native/runtime 输入。每项缺失前置条件均记录为缺少验证。Guest probe 可先用 1 MiB 请求写入 64 MiB 范围，再预热并对前 4 MiB 执行 4,096 次对齐的 4 KiB 覆盖，使用 mmap-backed buffer 和 O_DIRECT，核对字节数和 payload。Guest descriptor 分段不等于 1 MiB Host batch 测量；没有 Drain/fsync 的准入计时不代表完整回写耗时。原始运行结果保留在原 PR/Issue 或不可变 Git 历史中。
+
+新建 Checkpoint 初始化的分阶段探针位于既有
+`checkpoint_template_perf_test.go`，需要显式启用：
+
+```bash
+CHECKPOINT_INIT_PERF=1 CHECKPOINT_INIT_DISKS=4 CHECKPOINT_INIT_TEMPLATE=1 \
+CHECKPOINT_INIT_ENCRYPTED=1 CHECKPOINT_INIT_ACTION=drain \
+CHECKPOINT_INIT_LABEL=candidate CHECKPOINT_INIT_ROUND=1 \
+go test ./pkg/diffstore -run '^TestCheckpointInitializationPhases$' -count=1 -v
+```
+
+分别使用 1、4 个磁盘，模板/加密取值 0、1，以及 `drain`、`checkpoint`、
+`close` 操作，交替安排对照与候选并重复执行。32 GiB 只是稀疏逻辑容量，
+启用模板时也只写入 64 KiB 模板数据。准备工作排除在计时之外；结果包含逻辑打开、
+首次有效 I/O、完成事件观察时间、立即调用边界的等待、CPU、分配量、RSS、
+物理占用及进程 I/O。完成事件观察时间包含观察者调度延迟。对照必须采用当前
+同步批量初始化及相同位图路径，不能使用历史逐页串行写入作为基线。保留全部尾部
+样本和失败；还应在单实例及并发启动下测量真实 Guest 到首次健康检查/工具响应，
+不能只用后端打开时间证明启动收益。
 
 <a id="usage-validation"></a>
 

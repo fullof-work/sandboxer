@@ -3,6 +3,8 @@ package diffstore
 import (
 	"context"
 	"io"
+
+	"github.com/kuasar-sandbox/sandboxer/pkg/diffstore/internal/versioned"
 )
 
 // pageWrite borrows a complete plaintext page. Before starting I/O the single
@@ -25,6 +27,8 @@ type diffBackend interface {
 	io.ReaderAt
 	io.WriterAt
 	Size() int64
+	initialized() <-chan struct{}
+	waitInitialized(context.Context) error
 	name() string
 	policy() batchPolicy
 	withDirectRead(int, int64, func([]byte) error) error
@@ -39,7 +43,27 @@ type diffBackend interface {
 	Close() error
 }
 
-func (d *diffFile) Size() int64 { return d.logicalSize }
+func (d *diffFile) Size() int64                               { return d.logicalSize }
+func (d *diffFile) initialized() <-chan struct{}              { return nil }
+func (d *diffFile) waitInitialized(ctx context.Context) error { return ctx.Err() }
+func (d *checkpointDiff) initialized() <-chan struct{}        { return versioned.Initialized(d.store) }
+func (d *checkpointDiff) waitInitialized(ctx context.Context) error {
+	return versioned.WaitInitialized(d.store, ctx)
+}
+
+// Called under the cache lock before freezing any page. A failed initializer
+// is reported by the coordinator after publishing materialDone, not by a
+// worker that could invoke a completion-waiting fatal handler too early.
+func backendWritable(d diffBackend) bool {
+	if done := d.initialized(); done != nil {
+		select {
+		case <-done:
+		default:
+			return false
+		}
+	}
+	return d.waitInitialized(context.Background()) == nil
+}
 func (d *diffFile) policy() batchPolicy {
 	// Reuse writeback batching for template materialization. Cap each staging
 	// and stripe-lock window at 256 KiB instead of publishing P per 4 KiB page.

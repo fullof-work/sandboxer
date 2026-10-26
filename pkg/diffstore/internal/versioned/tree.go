@@ -387,6 +387,9 @@ func (t *transaction) unset(key uint64) error {
 }
 
 func (s *Store) WritePages(ctx context.Context, pages []Page) error {
+	if err := WaitInitialized(s, ctx); err != nil {
+		return err
+	}
 	if len(pages) == 0 {
 		return ctx.Err()
 	}
@@ -487,6 +490,9 @@ func (s *Store) WritePages(ctx context.Context, pages []Page) error {
 	return nil
 }
 func (s *Store) ReadAt(p []byte, off int64) (int, error) {
+	if err := WaitInitialized(s, context.Background()); err != nil {
+		return 0, err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.healthy(context.Background()); err != nil {
@@ -564,6 +570,9 @@ func (s *Store) ReadAt(p []byte, off int64) (int, error) {
 	return done, nil
 }
 func (s *Store) Scan(ctx context.Context, visit func(uint64) error) error {
+	if err := WaitInitialized(s, ctx); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.healthy(ctx); err != nil {
@@ -579,6 +588,9 @@ func (s *Store) Scan(ctx context.Context, visit func(uint64) error) error {
 // batches. The range must contain aligned complete pages. Retained versions
 // keep their protected records until independent deletion and GC can free them.
 func (s *Store) Discard(ctx context.Context, off, length int64) error {
+	if err := WaitInitialized(s, ctx); err != nil {
+		return err
+	}
 	if off < 0 || length < 0 || off%PageSize != 0 || length%PageSize != 0 || off > s.Size() || length > s.Size()-off {
 		return fmt.Errorf("diffstore: invalid discard range")
 	}

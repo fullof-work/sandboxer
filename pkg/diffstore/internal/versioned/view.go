@@ -80,6 +80,9 @@ func OpenExport(ctx context.Context, path, id string, key *[32]byte) (*View, err
 	return openView(ctx, f, path+".lock", id, info, xc)
 }
 func (s *Store) Export(ctx context.Context, id string) (*View, error) {
+	if err := WaitInitialized(s, ctx); err != nil {
+		return nil, err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.healthy(ctx); err != nil {

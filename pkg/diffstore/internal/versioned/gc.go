@@ -35,6 +35,9 @@ type gcScan struct {
 }
 
 func (s *Store) GC(ctx context.Context, budget int) (GCResult, error) {
+	if err := WaitInitialized(s, ctx); err != nil {
+		return GCResult{}, err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.gcLocked(ctx, min(max(budget, 0), MaxBatchPages))

@@ -82,6 +82,55 @@ writes/discards win. A fully superseded range may consequently be read and then
 skipped. `WaitMaterialReady` and `WaitMaterialized` retain distinct readiness and
 publication boundaries.
 
+Fresh checkpoint-backed live disks initialize the format asynchronously, with
+or without a template. Preparation still validates identity, capacity (including
+template-derived capacity), encryption and exclusive ownership. It establishes
+an independent empty frontend P bitmap and the existing bounded cache before
+`OpenDisk` returns. Offline `Create` runs the same initializer synchronously;
+existing-file open still validates committed metadata and loads the real P bitmap.
+No file format or configuration switch is added.
+
+| Boundary | Completed work |
+| --- | --- |
+| `OpenDisk` returns | Validated ownership and logical view; absent upper pages read template/base/zero and cached writes may proceed. The final path may not exist yet. |
+| Internal initialization completion | Truncation, fixed reservation and the existing header/control/redo/batched bitmap writes completed, or one terminal error was recorded. Backend I/O and GC wait for success. |
+| `WaitMaterialReady` succeeds | Initialization completed and the view no longer depends on the template. This precedes cache drain so checkpoint can quiesce writers. |
+| `WaitMaterialized` succeeds | Initialization, optional template import, required writeback, file sync, rename, claim release and directory sync completed. This does not synchronize subsequent writes. |
+
+An empty `Drain` does not wait for initialization. Physical path handoff/reopen,
+active export and snapshot publication use `WaitMaterialized`. Immutable device
+identity, size, health checks and fresh checkpoint invalidation do not wait for
+format I/O. Discard and template backfill wait before taking frontend stripes.
+The one cache worker selects the oldest eligible dirty page across its bounded
+queue, skipping pending backends before freezing pages; a pending prefix longer
+than a batch cannot hide ready work. Pending pages remain readable and rewritable,
+but still consume the shared quota. If all work is pending, the worker sleeps
+until completion, new eligible work, failure or shutdown wakes it.
+
+Initialization is admitted once before fallible frontend attachment and is joined
+directly on construction failure. Request cancellation affects only the waiter;
+Close joins actual initialization I/O before releasing the file, lock or buffers.
+Successful initialization establishes GC ownership before publishing completion.
+The existing bounded MAP_SHARED direct-I/O workspaces remain safe while Guest
+process creation overlaps this work. There is no per-page initialization state.
+
+Late initialization/publication I/O errors are sticky runtime failures and may
+follow previously accepted cached writes. Completion is published before fatal
+callbacks, including late handler replay. A failed returned disk retains template
+readers and private resources until Close stops admission and joins existing
+users. Disposable Close may stop unfinished template work and prevent publication
+after initialization, but cannot cancel the initializer or hide a real error from
+an already admitted publication. Retained Close drains and publishes normally.
+Intentional disposal is a successful Close, but readiness/publication waiters
+receive cancellation when their boundary was not completed.
+
+This removes avoidable foreground waiting, not initialization work. Early backend
+use, cache pressure, immediate checkpoint/Close and concurrent disk initialization
+can still wait or contend for I/O. Compare current synchronous batched creation
+with the candidate using the same bitmap path, capacity, encryption, templates
+and cache budget; retain end-to-end startup tails and failures as well as logical
+open, first useful I/O, Ready, publication and Close timings.
+
 ## Ownership and completion
 
 - `Disk` owns its backend, materializer and its attachment to the cache. Its

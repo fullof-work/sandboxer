@@ -46,6 +46,9 @@ func loadPresence(read func(uint64) ([]byte, error), size int64) ([]byte, error)
 // PresenceBitmap returns a private complete logical-presence snapshot. Pending
 // frontend writes are deliberately absent; only committed store state is read.
 func (s *Store) PresenceBitmap(ctx context.Context) ([]byte, error) {
+	if err := WaitInitialized(s, ctx); err != nil {
+		return nil, err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.healthy(ctx); err != nil {
@@ -55,6 +58,9 @@ func (s *Store) PresenceBitmap(ctx context.Context) ([]byte, error) {
 }
 
 func (s *Store) Presence(ctx context.Context, start uint64, dst []bool) error {
+	if err := WaitInitialized(s, ctx); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.healthy(ctx); err != nil {

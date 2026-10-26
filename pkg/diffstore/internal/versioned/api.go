@@ -73,6 +73,8 @@ type Stats struct {
 
 type Store struct {
 	mu            sync.Mutex
+	initDone      chan struct{} // nil for an already opened store; closed exactly once by its initializer
+	initErr       error         // immutable after initDone closes; separate from later runtime health
 	file          *os.File
 	lock          *os.File
 	lockPath      string
@@ -124,7 +126,30 @@ func ValidID(id string) error {
 }
 
 func (s *Store) Size() int64 { return s.info.LogicalSize }
+
+// Identity is validated before either synchronous or asynchronous creation
+// returns. It never waits for format I/O and excludes mutable checkpoint state.
+func Identity(s *Store) Info { return s.info }
+
+// Initialized is the persistent completion event owned by the backend, not by
+// a Disk or cache attachment. A nil event means initialization is unnecessary.
+func Initialized(s *Store) <-chan struct{} { return s.initDone }
+
+// WaitInitialized cancels only this wait. Once admitted, initialization must
+// finish before its file, lock or direct-I/O buffers can be released.
+func WaitInitialized(s *Store, ctx context.Context) error {
+	if s.initDone != nil {
+		select {
+		case <-s.initDone:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return s.initErr
+}
+
 func (s *Store) Info() Info {
+	_ = WaitInitialized(s, context.Background())
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	out := s.info
@@ -204,6 +229,9 @@ func (s *Store) MarkModified(ctx context.Context) error {
 }
 
 func (s *Store) Sync() error {
+	if err := WaitInitialized(s, context.Background()); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
@@ -216,6 +244,11 @@ func (s *Store) Sync() error {
 }
 
 func (s *Store) Close() error {
+	// Join directly even when construction failed before a Disk coordinator
+	// could attach. The initializer establishes GC under mu before completing.
+	if s.initDone != nil {
+		<-s.initDone
+	}
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
