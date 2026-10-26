@@ -28,7 +28,7 @@ func TestProcessHelper(t *testing.T) {
 	path := os.Getenv("DIFFSTORE_PATH")
 	switch mode {
 	case "short-pending-initialization":
-		s, err := create(path, Options{DiffID: "pending-short", LogicalSize: presence.MaxSize}, true, func(stage string) error {
+		s, err := create(path, Options{DiffID: "pending-short", LogicalSize: maxWritableSize}, true, func(stage string) error {
 			if stage != "initialize-presence" {
 				return nil
 			}
@@ -176,12 +176,12 @@ func TestProcessHelper(t *testing.T) {
 		}
 		limits.Cur = presenceAreaPage*PageSize + PageSize + 512
 		if mode == "short-initial-presence-tail" {
-			limits.Cur = (presenceAreaPage+uint64(presence.Pages(presence.MaxSize))-1)*PageSize + 512
+			limits.Cur = (presenceAreaPage+uint64(presence.Pages(maxWritableSize))-1)*PageSize + 512
 		}
 		if err = unix.Setrlimit(unix.RLIMIT_FSIZE, &limits); err != nil {
 			t.Fatal(err)
 		}
-		err = writeInitialPresence(f, make([]byte, presence.Bytes(presence.MaxSize)), presence.MaxSize)
+		err = writeInitialPresence(f, make([]byte, presence.Bytes(maxWritableSize)), maxWritableSize)
 		if !errors.Is(err, io.ErrShortWrite) {
 			t.Fatalf("expected actual short initialization write, got %v", err)
 		}

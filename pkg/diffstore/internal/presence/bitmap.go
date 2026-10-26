@@ -11,7 +11,7 @@ import (
 
 const (
 	PageSize    = 4096
-	MaxSize     = int64(32 << 30)
+	MaxSize     = int64(1 << 40)
 	HeaderSize  = 32
 	PayloadSize = PageSize - HeaderSize - 4
 )
@@ -21,7 +21,7 @@ var le = binary.LittleEndian
 
 func ValidateSize(size int64) error {
 	if size <= 0 || size%PageSize != 0 || size > MaxSize {
-		return fmt.Errorf("diffstore: writable capacity must be a positive 4 KiB multiple no larger than 32 GiB")
+		return fmt.Errorf("diffstore: writable capacity must be a positive 4 KiB multiple no larger than 1 TiB")
 	}
 	return nil
 }

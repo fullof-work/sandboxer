@@ -12,13 +12,13 @@ import (
 )
 
 func TestCreatePresenceEncodingAndReopen(t *testing.T) {
-	for _, pages := range []int{1, 255, 256, 257, presence.Pages(presence.MaxSize)} {
+	for _, pages := range []int{1, 255, 256, 257, presence.Pages(maxWritableSize)} {
 		for _, encrypted := range []bool{false, true} {
 			t.Run(fmt.Sprintf("pages=%d/encrypted=%t", pages, encrypted), func(t *testing.T) {
 				// Exercise partially used last pages and the maximum capacity.
 				size := int64((pages-1)*presence.PayloadSize*8+1) * PageSize
-				if pages == presence.Pages(presence.MaxSize) {
-					size = presence.MaxSize
+				if pages == presence.Pages(maxWritableSize) {
+					size = maxWritableSize
 				}
 				var key *[32]byte
 				if encrypted {

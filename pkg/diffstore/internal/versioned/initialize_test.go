@@ -9,8 +9,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
+
+	"github.com/kuasar-sandbox/sandboxer/pkg/diffstore/internal/presence"
 )
 
 // The initializer is stopped before its first syscall. Cancellation exercises
@@ -199,5 +202,41 @@ func TestSynchronousCreateUsesSameInitializer(t *testing.T) {
 	case <-Initialized(s):
 	default:
 		t.Fatal("synchronous Create returned pending")
+	}
+}
+
+func TestCreateRejectsOversizedCapacitySynchronously(t *testing.T) {
+	size := maxWritableSize + PageSize
+	if err := presence.ValidateSize(size); err != nil {
+		t.Fatalf("shared bitmap capacity rejected the checkpoint boundary fixture: %v", err)
+	}
+	for _, test := range []struct {
+		name   string
+		create func(string, Options) (*Store, error)
+	}{
+		{name: "Create", create: Create},
+		{name: "CreatePending", create: CreatePending},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "oversized.diff")
+			s, err := test.create(path, Options{
+				DiffID: "oversized", LogicalSize: size, LockPath: path + ".lock",
+			})
+			if s != nil {
+				_ = s.Close()
+				t.Fatal("oversized checkpoint escaped synchronous validation")
+			}
+			if err == nil || !strings.Contains(err.Error(), "32 GiB") {
+				t.Fatalf("expected checkpoint capacity rejection, got %v", err)
+			}
+			entries, err := os.ReadDir(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(entries) != 0 {
+				t.Fatalf("capacity rejection created files or locks: %v", entries)
+			}
+		})
 	}
 }

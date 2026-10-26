@@ -107,7 +107,7 @@ func TestFragmentedMaximumBitmapCopyAndPartialGCReopen(t *testing.T) {
 				key = &[32]byte{71}
 			}
 			path := filepath.Join(t.TempDir(), "fragmented")
-			s, err := Create(path, Options{DiffID: "fragmented", LogicalSize: presence.MaxSize, Key: key})
+			s, err := Create(path, Options{DiffID: "fragmented", LogicalSize: maxWritableSize, Key: key})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -265,13 +265,13 @@ func TestBitmapOnlyChangeAndRedoRecovery(t *testing.T) {
 }
 
 func TestMaximumPresenceCopyBudgetAndBoundedGC(t *testing.T) {
-	s, err := Create(filepath.Join(t.TempDir(), "max.diff"), Options{DiffID: "max", LogicalSize: presence.MaxSize})
+	s, err := Create(filepath.Join(t.TempDir(), "max.diff"), Options{DiffID: "max", LogicalSize: maxWritableSize})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer s.Close()
 	stopTestGC(s)
-	if err := s.Discard(ctx, presence.MaxSize-PageSize, PageSize); err != nil {
+	if err := s.Discard(ctx, maxWritableSize-PageSize, PageSize); err != nil {
 		t.Fatal(err)
 	}
 	before := s.Stats()

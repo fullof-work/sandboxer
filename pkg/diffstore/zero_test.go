@@ -549,3 +549,114 @@ func TestTemplatePresenceAloneCoordinatesDiscardAndWrites(t *testing.T) {
 		}
 	}
 }
+
+func TestSingleTiBPresenceZeroDiscardReopen(t *testing.T) {
+	const size int64 = 1 << 40
+	const high int64 = (32 << 30) + cowBlockSize
+	ctx := context.Background()
+	for _, encrypted := range []bool{false, true} {
+		t.Run(fmt.Sprintf("encrypted=%t", encrypted), func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "active.diff")
+			base := presenceProbeBase{size: size}
+			var opts []DiskOption
+			if encrypted {
+				opts = append(opts, WithDiffEncryption(testDiffKey(32), true))
+			}
+			d, err := OpenDisk(path, base, DiffInit{CreateSize: size}, opts...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() {
+				if d != nil {
+					_ = d.Close()
+				}
+			}()
+			if d.Size() != size {
+				t.Fatalf("capacity=%d want=%d", d.Size(), size)
+			}
+			info, err := os.Stat(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if info.Size() != singleBodyOffset(size)+size {
+				t.Fatalf("file size=%d want=%d", info.Size(), singleBodyOffset(size)+size)
+			}
+
+			// Only these few pages have payload; the 1 TiB logical body stays sparse.
+			write := func(p []byte, off int64) {
+				t.Helper()
+				if n, err := d.WriteAt(p, off); err != nil || n != len(p) {
+					t.Fatalf("WriteAt(%d)=%d, %v", off, n, err)
+				}
+			}
+			patch := []byte{1, 2, 3}
+			write(bytes.Repeat([]byte{0x5c}, cowBlockSize), high)
+			write(patch, size-int64(len(patch)))
+			if err := d.Drain(ctx); err != nil {
+				t.Fatal(err)
+			}
+			// Discard both Data and Hole above the former 32 GiB boundary.
+			if err := d.Discard(high, 2*cowBlockSize); err != nil {
+				t.Fatal(err)
+			}
+			write(patch, high+cowBlockSize+37)
+			if err := d.Drain(ctx); err != nil {
+				t.Fatal(err)
+			}
+
+			zeroPartial := make([]byte, cowBlockSize)
+			copy(zeroPartial[37:], patch)
+			tail := bytes.Repeat([]byte{0xa7}, cowBlockSize)
+			copy(tail[len(tail)-len(patch):], patch)
+			check := func(stage string) {
+				t.Helper()
+				for _, page := range []struct {
+					name             string
+					offset           int64
+					want             []byte
+					logical, payload bool
+				}{
+					{"discarded", high, make([]byte, cowBlockSize), true, false},
+					{"partial-zero", high + cowBlockSize, zeroPartial, true, true},
+					{"hole", high + 2*cowBlockSize, bytes.Repeat([]byte{0xa7}, cowBlockSize), false, false},
+					{"last", size - cowBlockSize, tail, true, true},
+				} {
+					got := make([]byte, cowBlockSize)
+					if n, err := d.ReadAt(got, page.offset); err != nil || n != len(got) || !bytes.Equal(got, page.want) {
+						t.Fatalf("%s %s ReadAt(%d)=%d, %v: contents differ", stage, page.name, page.offset, n, err)
+					}
+					payload := make([]bool, 1)
+					if err := d.diff.payloadPresence(ctx, uint64(page.offset/cowBlockSize), payload); err != nil {
+						t.Fatal(err)
+					}
+					if logical := d.blockDirty(page.offset / cowBlockSize); logical != page.logical || payload[0] != page.payload {
+						t.Fatalf("%s %s logical/payload=%t/%t want=%t/%t",
+							stage, page.name, logical, payload[0], page.logical, page.payload)
+					}
+				}
+			}
+			check("written")
+			if err := d.Close(); err != nil {
+				t.Fatal(err)
+			}
+			d = nil
+			d, err = OpenDisk(path, base, DiffInit{Existing: true}, opts...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			check("reopened")
+		})
+	}
+}
+
+func TestSingleRejectsCapacityAboveTiB(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "oversized.diff")
+	d, err := OpenDisk(path, nil, DiffInit{CreateSize: (1 << 40) + cowBlockSize})
+	if err == nil {
+		_ = d.Close()
+		t.Fatal("accepted capacity above 1 TiB")
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("invalid capacity created target: %v", err)
+	}
+}

@@ -789,7 +789,7 @@ It does not promise constant total pause time, universal speedups, or guest-data
 durability across host crashes/power loss beyond the existing FLUSH contract.
 
 Reopening a v4 DIFF loads the complete one-bit-per-4-KiB presence bitmap P
-(at most 1 MiB net for the 32 GiB writable limit). P=0 is Hole and falls through
+(at most 1 MiB net for the 32 GiB checkpoint capacity limit). P=0 is Hole and falls through
 to base. P=1 with no payload is Zero and masks base; P=1 with payload is Data.
 Accepted cache writes count as Data. Ordinary zero writes remain Data; they are
 not scanned or compressed. Open still validates ownership, identity/key/capacity,
@@ -1381,7 +1381,13 @@ mounts:
     source: scratch
 ```
 
-Provisioning templates remain immutable inputs, distinct from active DIFF work files. Existing raw ext4 preparation and encrypted-template reading remain supported; no template rebuild or new creation command is required. The runtime reads the template and creates a separate v3/v4 working file. Templates used for writable disks must still satisfy the positive, 4 KiB aligned, at-most-32-GiB logical capacity limit.
+Provisioning templates remain immutable inputs, distinct from active DIFF work
+files. Existing raw ext4 preparation and encrypted-template reading remain
+supported. The runtime reads the template and creates a separate v3/v4 working
+file. Writable logical capacity must be positive and 4 KiB aligned. Single-layer
+v3 supports up to 1 TiB; enabling local checkpoints selects v4, which remains
+limited to 32 GiB. A larger single-layer work disk is selected by provisioning
+a larger filesystem template; no separate size setting is introduced.
 
 Use a new active diff: an existing diff takes precedence, so changing a template
 does not resize or replace existing data. Do not truncate an existing filesystem
