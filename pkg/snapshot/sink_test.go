@@ -90,7 +90,7 @@ func TestFileSinkArtifacts(t *testing.T) {
 	mem := make([]byte, size)
 	copy(mem[0:4], "HEAD")
 	copy(mem[size-4:], "TAIL")
-	holes := []sparse.Extent{{Offset: 4, Size: size - 8}}
+	holes := []sparse.Extent{{Offset: 4096, Size: size - 2*4096}}
 	snapshotConfig := []byte("version: 1\nsandbox_ref: manifest://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n")
 	zipTail, err := snapshotfile.BuildZIP([]byte("{}"), []byte("{}"), snapshotConfig)
 	if err != nil {
