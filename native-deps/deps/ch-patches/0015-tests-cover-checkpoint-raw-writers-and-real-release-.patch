@@ -1,0 +1,340 @@
+From 7b8c9f6f7abb38d8951d3b0d45c4f2999dd55fb4 Mon Sep 17 00:00:00 2001
+From: Chen Xiaohui <graych@gmail.com>
+Date: Thu, 29 Oct 2026 01:30:37 +0800
+Subject: [PATCH 15/15] tests: cover checkpoint raw writers and real release
+ and slot failures
+
+---
+ net_util/src/tap.rs                |  65 ++++++++++++++++++
+ virtio-devices/src/balloon.rs      |  43 ++++++++++++
+ virtio-devices/src/vsock/device.rs |  12 ++++
+ virtio-devices/src/vsock/packet.rs |  44 ++++++++++++
+ vmm/src/memory_manager.rs          | 105 +++++++++++++++++++++++++++++
+ 5 files changed, 269 insertions(+)
+
+diff --git a/net_util/src/tap.rs b/net_util/src/tap.rs
+index 36f0e2b..18635ab 100644
+--- a/net_util/src/tap.rs
++++ b/net_util/src/tap.rs
+@@ -551,6 +551,7 @@ impl AsRawFd for Tap {
+ #[cfg(test)]
+ #[cfg(devcli_testenv)] // we need special permissions in the ENV to create Tap devices
+ mod unit_tests {
++
+     use std::net::Ipv4Addr;
+     use std::sync::{LazyLock, Mutex, mpsc};
+     use std::time::Duration;
+@@ -887,3 +888,67 @@ mod unit_tests {
+         assert!(found_test_packet);
+     }
+ }
++
++#[cfg(test)]
++mod checkpoint_dirty_tests {
++    use super::*;
++    #[test]
++    fn test_checkpoint_dirty_net_rx_short_error_and_success() {
++        use std::os::fd::IntoRawFd;
++        use std::os::unix::net::UnixDatagram;
++        use virtio_queue::QueueT;
++        use vm_memory::bitmap::{AtomicBitmap, Bitmap};
++        use vm_memory::{Bytes, GuestAddress, GuestMemory, GuestMemoryRegion};
++        use vm_virtio::queue::testing::VirtQueue;
++        for length in [0usize, 5, 64] {
++            let mem = vm_memory::GuestMemoryMmap::<AtomicBitmap>::from_ranges(&[(
++                GuestAddress(0),
++                0x8000,
++            )])
++            .unwrap();
++            let guestq = VirtQueue::new(GuestAddress(0), &mem, 8);
++            guestq.dtable[0].set(0x4000, 8192, 2, 0);
++            guestq.avail.ring[0].set(0);
++            guestq.avail.idx.set(1);
++            let mut queue = guestq.create_queue();
++            let (input, output) = UnixDatagram::pair().unwrap();
++            input.set_nonblocking(true).unwrap();
++            let payload = vec![0x59u8; length];
++            if length != 0 {
++                output.send(&payload).unwrap();
++            }
++            // SAFETY: transfer the sole owned socket fd to the test Tap. The RX
++            // entry uses readv exactly as for a real tap; no ioctl is invoked.
++            let tap = Tap {
++                tap_file: unsafe { File::from_raw_fd(input.into_raw_fd()) },
++                if_name: vec![],
++            };
++            let bitmap = mem.find_region(GuestAddress(0)).unwrap().bitmap();
++            bitmap.get_and_reset();
++            let result = crate::queue_pair::RxVirtio::new()
++                .process_desc_chain(&mem, &tap, &mut queue, &mut None, None);
++            assert_eq!(result.is_err(), length == 5);
++            assert!(bitmap.dirty_at(0x4000) && bitmap.dirty_at(0x5000));
++            assert!(!bitmap.dirty_at(0x6000));
++            let mut bytes = vec![0; 8192];
++            mem.read_slice(&mut bytes, GuestAddress(0x4000)).unwrap();
++            let mut expected = vec![0; 8192];
++            expected[..length].copy_from_slice(&payload);
++            if length == 64 {
++                expected[10..12].copy_from_slice(&1u16.to_le_bytes());
++            }
++            assert_eq!(bytes, expected);
++            assert_eq!(guestq.used.idx.get(), if length == 64 { 1 } else { 0 });
++            if length == 64 {
++                assert!(bitmap.dirty_at(queue.used_ring() as usize));
++                assert_eq!(
++                    mem.read_obj::<u32>(vm_memory::GuestAddress(
++                        guestq.used.ring[0].location.0 + 4
++                    ))
++                    .unwrap(),
++                    64
++                );
++            }
++        }
++    }
++}
+diff --git a/virtio-devices/src/balloon.rs b/virtio-devices/src/balloon.rs
+index 375754b..742b3d6 100644
+--- a/virtio-devices/src/balloon.rs
++++ b/virtio-devices/src/balloon.rs
+@@ -695,3 +695,46 @@ impl Snapshottable for Balloon {
+ }
+ impl Transportable for Balloon {}
+ impl Migratable for Balloon {}
++
++#[cfg(test)]
++mod checkpoint_release_tests {
++    use super::*;
++    use std::fs::File;
++    use std::os::fd::FromRawFd;
++    use vm_memory::FileOffset;
++
++    #[test]
++    fn test_checkpoint_dirty_release_empty_madvise_and_punch_error() {
++        // SAFETY: static NUL-terminated name, returned fd transferred once.
++        let fd =
++            unsafe { libc::memfd_create(c"checkpoint-release".as_ptr(), libc::MFD_ALLOW_SEALING) };
++        assert!(fd >= 0);
++        let file = unsafe { File::from_raw_fd(fd) };
++        file.set_len(8192).unwrap();
++        let mem = GuestMemoryMmap::from_ranges_with_files(&[(
++            GuestAddress(0),
++            8192,
++            Some(FileOffset::new(file, 0)),
++        )])
++        .unwrap();
++        // Even an all-hole range must reach MADV, so misalignment fails. The
++        // former SEEK-first early return would incorrectly accept this call.
++        assert!(matches!(
++            BalloonEpollHandler::release_memory_range(&mem, GuestAddress(1), 4096),
++            Err(Error::MadviseFail(_))
++        ));
++        BalloonEpollHandler::release_memory_range(&mem, GuestAddress(0), 4096).unwrap();
++        mem.write_obj(0x5au8, GuestAddress(4096)).unwrap();
++        // Existing mappings remain writable, but inode mutation is forbidden:
++        // a real fallocate error must retain resident contents and fail.
++        assert_eq!(
++            unsafe { libc::fcntl(fd, libc::F_ADD_SEALS, libc::F_SEAL_FUTURE_WRITE) },
++            0
++        );
++        assert!(matches!(
++            BalloonEpollHandler::release_memory_range(&mem, GuestAddress(4096), 4096),
++            Err(Error::FallocateFail(_))
++        ));
++        assert_eq!(mem.read_obj::<u8>(GuestAddress(4096)).unwrap(), 0x5a);
++    }
++}
+diff --git a/virtio-devices/src/vsock/device.rs b/virtio-devices/src/vsock/device.rs
+index 7f59481..96341a0 100644
+--- a/virtio-devices/src/vsock/device.rs
++++ b/virtio-devices/src/vsock/device.rs
+@@ -916,7 +916,19 @@ mod unit_tests {
+                 .transport_reset_pending
+                 .load(Ordering::Acquire)
+         );
++        use vm_memory::bitmap::Bitmap;
++        use vm_memory::{GuestMemory, GuestMemoryRegion};
++        let bitmap = test_ctx
++            .mem
++            .find_region(vm_memory::GuestAddress(0))
++            .unwrap()
++            .bitmap();
++        bitmap.get_and_reset();
+         device.snapshot().unwrap();
++        assert!(bitmap.dirty_at(EVENT_ADDR as usize));
++        assert!(bitmap.dirty_at(ctx.guest_evvq.used.idx.location.0 as usize));
++        assert!(bitmap.dirty_at(ctx.guest_evvq.used.ring[0].location.0 as usize));
++        assert!(!bitmap.dirty_at(0x0070_0000));
+ 
+         assert!(
+             ctx.handler
+diff --git a/virtio-devices/src/vsock/packet.rs b/virtio-devices/src/vsock/packet.rs
+index c073bea..22fe845 100644
+--- a/virtio-devices/src/vsock/packet.rs
++++ b/virtio-devices/src/vsock/packet.rs
+@@ -506,6 +506,50 @@ impl VsockPacket {
+ 
+ #[cfg(test)]
+ mod unit_tests {
++    #[test]
++    fn test_checkpoint_dirty_vsock_rx_before_partial_write() {
++        use vm_memory::bitmap::Bitmap;
++        use vm_memory::{Bytes, GuestMemory, GuestMemoryRegion};
++        let test_ctx = TestContext::new();
++        let mut ctx = test_ctx.create_epoll_handler_context();
++        let bitmap = test_ctx.mem.find_region(GuestAddress(0)).unwrap().bitmap();
++        bitmap.get_and_reset();
++        let mut pkt = VsockPacket::from_rx_virtq_head(
++            &mut ctx.handler.queues[0]
++                .iter(&test_ctx.mem)
++                .unwrap()
++                .next()
++                .unwrap(),
++            None,
++        )
++        .unwrap();
++        // The raw payload alias is dirty before a backend receives it,
++        // including a short write followed by an I/O error. The header
++        // is an owned local copy until commit_hdr writes it through Bytes.
++        assert!(!bitmap.dirty_at(0x0040_0000));
++        assert!(bitmap.dirty_at(0x0040_1000));
++        assert!(!bitmap.dirty_at(0x0040_2000));
++        pkt.buf_mut().unwrap()[..7].copy_from_slice(b"partial");
++        pkt.set_len(7);
++        let mut data = vec![0; 4096];
++        test_ctx
++            .mem
++            .read_slice(&mut data, GuestAddress(0x0040_1000))
++            .unwrap();
++        assert_eq!(&data[..7], b"partial");
++        assert!(data[7..].iter().all(|b| *b == 0));
++        assert_eq!(pkt.len(), 7);
++        pkt.commit_hdr(&test_ctx.mem).unwrap();
++        assert!(bitmap.dirty_at(0x0040_0000));
++        let mut header = vec![0; VSOCK_PKT_HDR_SIZE];
++        test_ctx
++            .mem
++            .read_slice(&mut header, GuestAddress(0x0040_0000))
++            .unwrap();
++        assert_eq!(header, pkt.hdr());
++        assert!(bitmap.dirty_at(0x0040_1000));
++    }
++
+     use virtio_bindings::virtio_ring::VRING_DESC_F_WRITE;
+     use virtio_queue::QueueOwnedT;
+     use vm_memory::GuestAddress;
+diff --git a/vmm/src/memory_manager.rs b/vmm/src/memory_manager.rs
+index e45b826..a0b8951 100644
+--- a/vmm/src/memory_manager.rs
++++ b/vmm/src/memory_manager.rs
+@@ -3137,3 +3137,108 @@ impl Migratable for MemoryManager {
+         Ok(table)
+     }
+ }
++
++#[cfg(all(test, feature = "kvm"))]
++mod checkpoint_collector_tests {
++    use super::*;
++    use vm_memory::Bytes;
++    use std::os::fd::IntoRawFd;
++
++    #[test]
++    #[ignore = "requires real /dev/kvm; run explicitly in the system Workbench"]
++    fn test_checkpoint_dirty_real_later_slot_failure_and_retry() {
++        let hypervisor = hypervisor::new().unwrap();
++        let vm = hypervisor.create_vm(Default::default()).unwrap();
++        let mut zones = Vec::new();
++        for i in 0..2 {
++            let fd = MemoryManager::memfd_create(c"checkpoint-slot", libc::MFD_CLOEXEC).unwrap();
++            // SAFETY: new uniquely owned memfd, transferred to MemoryManager.
++            let file = unsafe { File::from_raw_fd(fd) };
++            file.set_len(32 << 20).unwrap();
++            let zone: MemoryZoneConfig = serde_json::from_value(serde_json::json!({"id":format!("zone{i}"),"size":32<<20,"shared":true,"fd":file.into_raw_fd()})).unwrap();
++            zones.push(zone);
++        }
++        let config = MemoryConfig {
++            size: 0,
++            zones: Some(zones),
++            thp: false,
++            ..Default::default()
++        };
++        let manager = MemoryManager::new(
++            vm.clone(),
++            &config,
++            None,
++            40,
++            #[cfg(feature = "tdx")]
++            false,
++            None,
++            Default::default(),
++        )
++        .unwrap();
++        let mut mm = manager.lock().unwrap();
++        mm.allocate_address_space().unwrap();
++        assert_eq!(mm.guest_ram_mappings.len(), 2);
++        assert!(
++            mm.checkpoint_dirty()
++                .unwrap()
++                .regions
++                .iter()
++                .all(|r| r.bitmap.iter().all(|w| *w == 0))
++        );
++        let a = mm.guest_ram_mappings[0].clone();
++        let b = mm.guest_ram_mappings[1].clone();
++        let mem = mm.guest_memory.memory();
++        mem.write_obj(0x37u8, GuestAddress(a.gpa + 4096)).unwrap();
++        mem.write_obj(0x59u8, GuestAddress(b.gpa + 8192)).unwrap();
++        let region = mem.find_region(GuestAddress(b.gpa)).unwrap();
++        // SAFETY: the region stays mapped and alive across removal/reinstall.
++        // The missing real KVM slot causes GET_DIRTY_LOG in the production
++        // collector to fail after software logs in both slots were consumed.
++        unsafe {
++            vm.remove_user_memory_region(
++                b.slot,
++                b.gpa,
++                b.size as usize,
++                region.as_ptr(),
++                false,
++                true,
++            )
++        }
++        .unwrap();
++        assert!(mm.checkpoint_dirty().is_err());
++        assert_eq!(mm.checkpoint_regions[0].bitmap[0], 2);
++        assert!(
++            mm.checkpoint_regions[1]
++                .bitmap
++                .iter()
++                .all(|w| *w == u64::MAX)
++        );
++        assert!(
++            mem.iter()
++                .all(|r| r.bitmap().get_and_reset().iter().all(|w| *w == 0))
++        );
++        unsafe {
++            vm.create_user_memory_region(
++                b.slot,
++                b.gpa,
++                b.size as usize,
++                region.as_ptr(),
++                false,
++                true,
++            )
++        }
++        .unwrap();
++        vm.start_dirty_log().unwrap();
++        let retry = mm.checkpoint_dirty().unwrap();
++        assert_eq!(retry.regions[0].bitmap[0], 2);
++        assert!(retry.regions[1].bitmap.iter().all(|w| *w == u64::MAX));
++        assert_eq!(
++            mem.read_obj::<u8>(GuestAddress(a.gpa + 4096)).unwrap(),
++            0x37
++        );
++        assert_eq!(
++            mem.read_obj::<u8>(GuestAddress(b.gpa + 8192)).unwrap(),
++            0x59
++        );
++    }
++}
+-- 
+2.43.0
+
