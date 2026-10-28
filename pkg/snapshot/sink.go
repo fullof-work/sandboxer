@@ -179,6 +179,9 @@ func (s *FileSink) writeArtifact(ctx context.Context, kind string, src sparse.So
 		return "", "", "", fmt.Errorf("set %s temporary permissions: %w", kind, err)
 	}
 	var options []tarstream.WriteOption
+	if kind == "snapshot" {
+		options = append(options, tarstream.WithIndexMemoryLimit(memoryIndexBudget))
+	}
 	if s.codec != nil {
 		options = append(options, tarstream.WithCodec(s.codec, s.required))
 	}
@@ -187,8 +190,13 @@ func (s *FileSink) writeArtifact(ctx context.Context, kind string, src sparse.So
 		_ = f.Close()
 		return "", "", "", fmt.Errorf("pack %s: %w", kind, err)
 	}
-	if err := f.Close(); err != nil {
-		return "", "", "", err
+	info, statErr := f.Stat()
+	closeErr := f.Close()
+	if statErr != nil || closeErr != nil {
+		return "", "", "", errors.Join(statErr, closeErr)
+	}
+	if kind == "snapshot" {
+		s.logf("snapshot memory carrier: physical_bytes=%d identity=%s:%s", info.Size(), scheme, digest)
 	}
 	final := filepath.Join(s.outDir, digest+"."+kind)
 	err = unix.Renameat2(unix.AT_FDCWD, tmp, unix.AT_FDCWD, final, unix.RENAME_NOREPLACE)

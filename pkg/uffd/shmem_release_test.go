@@ -13,7 +13,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func realShmemHandler(t *testing.T, pages int, source SnapshotReader) (*Handler, []byte, []byte) {
+func realShmemHandler(t *testing.T, pages int, source SnapshotReader, wp ...bool) (*Handler, []byte, []byte) {
 	t.Helper()
 	size := pages * PageSize
 	memfd, err := unix.MemfdCreate("restore-release", unix.MFD_CLOEXEC)
@@ -47,11 +47,17 @@ func realShmemHandler(t *testing.T, pages int, source SnapshotReader) (*Handler,
 		}
 	}()
 	features := uffdFeatureMissingShmem | uffdFeatureEventRemove | uffdFeatureEventUnmap
+	protected := len(wp) > 0 && wp[0]
+	mode := uffdRegisterMissing
+	if protected {
+		features |= (1 << 12) | uffdFeaturePagefaultWP
+		mode |= uffdRegisterWP
+	}
 	if got, err := ioctlUffdAPI(fd, features); err != nil || got&features != features {
 		t.Fatalf("UFFD features=%x err=%v", got, err)
 	}
 	va := uint64(uintptr(unsafe.Pointer(&cpu[0])))
-	if err := ioctlUffdRegister(fd, va, uint64(size)); err != nil {
+	if err := ioctlUffdRegisterMode(fd, va, uint64(size), mode); err != nil {
 		t.Fatal(err)
 	}
 	m := NewAddressMap(uint64(size))
@@ -61,7 +67,7 @@ func realShmemHandler(t *testing.T, pages int, source SnapshotReader) (*Handler,
 	if err := m.RegisterVMA(ProcessBackend, uint64(uintptr(unsafe.Pointer(&backend[0]))), uint64(size), 0); err != nil {
 		t.Fatal(err)
 	}
-	h, err := NewWithBackendUffd(fd, m, Config{MemfdFD: memfd, Size: size, Source: source, NumWorkers: 2, Logf: t.Logf})
+	h, err := NewWithBackendUffd(fd, m, Config{MemfdFD: memfd, Size: size, Source: source, NumWorkers: 2, Logf: t.Logf, WriteProtect: protected})
 	if err != nil {
 		t.Fatal(err)
 	}

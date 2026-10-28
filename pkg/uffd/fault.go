@@ -17,12 +17,18 @@ import (
 )
 
 type uffdOps struct {
-	copy     func(fd int, dst uint64, src []byte) (int64, error)
-	zeropage func(fd int, dst, length uint64) (int64, error)
-	wake     func(fd int, start, length uint64) error
+	copyWP       func(fd int, dst uint64, src []byte) (int64, error)
+	writeProtect func(fd int, start, length uint64, protect bool) error
+	copy         func(fd int, dst uint64, src []byte) (int64, error)
+	zeropage     func(fd int, dst, length uint64) (int64, error)
+	wake         func(fd int, start, length uint64) error
 }
 
 var realUffdOps = uffdOps{
+	copyWP: func(fd int, dst uint64, src []byte) (int64, error) {
+		return ioctlUffdCopyMode(fd, dst, uint64(uintptr(unsafe.Pointer(&src[0]))), uint64(len(src)), uffdCopyModeWP)
+	},
+	writeProtect: ioctlUffdWriteProtect,
 	copy: func(fd int, dst uint64, src []byte) (int64, error) {
 		return ioctlUffdCopy(fd, dst, uint64(uintptr(unsafe.Pointer(&src[0]))), uint64(len(src)))
 	},
@@ -64,6 +70,7 @@ func (h *Handler) handleFault(ev faultEvent, pageBuf []byte) {
 
 	memfdOffset, ok := h.addrMap.Locate(ev.address)
 	if !ok {
+		h.invalidateCapture(fmt.Errorf("uffd: fault registration missing at 0x%x", ev.address))
 		h.logf("uffd: handleFault unknown va 0x%x", ev.address)
 		h.stats.errors.Add(1)
 		h.wake(ev.uffdFD, ev.address&^(PageSize-1), PageSize)
@@ -73,6 +80,12 @@ func (h *Handler) handleFault(ev faultEvent, pageBuf []byte) {
 	pageOffset := memfdOffset &^ (PageSize - 1)
 	pageIdx := pageOffset / PageSize
 
+	if ev.flags&uffdPagefaultFlagWP != 0 {
+		if err := h.handleWP(ev.uffdFD, pageVA, pageOffset); err != nil {
+			h.failRead(err)
+		}
+		return
+	}
 	switch state := h.state.Get(pageIdx); state {
 	case StateAbsent:
 		h.stats.faultsAbsent.Add(1)
@@ -82,9 +95,12 @@ func (h *Handler) handleFault(ev faultEvent, pageBuf []byte) {
 		h.handleZeroFault(ev.uffdFD, pageVA, pageOffset, pageIdx, StateReleased)
 	case StateLoaded:
 		h.stats.faultsLoaded.Add(1)
-		// A MISSING fault on StateLoaded means the balloon reclaimed the
-		// folio before its remove event was observed. Preserve the existing
-		// safety rule: refill only this page with zero and do not speculate.
+		if err := h.checkLoadedPage(pageOffset); err != nil {
+			h.failRead(err)
+			return
+		}
+		// A released page may be repopulated with zero. A duplicate queued
+		// fault on a resident page converges through the ioctl EEXIST path.
 		if _, err := h.urgentZero(ev.uffdFD, pageVA, pageIdx, StateLoaded); err != nil {
 			h.logf("uffd: ZEROPAGE(loaded) va=0x%x: %v", pageVA, err)
 			h.stats.errors.Add(1)
@@ -478,7 +494,7 @@ func (h *Handler) urgentCopy(fd int, dst uint64, pageIdx uint64, expected PageSt
 		return urgentOutcome{}, err
 	}
 	started := time.Now()
-	completed, err := h.ops.copy(fd, dst, page)
+	completed, err := h.copyCleanLocked(fd, dst, page)
 	h.stats.urgentCopyNs.Add(uint64(time.Since(started).Nanoseconds()))
 	h.stats.urgentCopyCalls.Add(1)
 	h.stats.copies.Add(1)
@@ -507,15 +523,7 @@ func (h *Handler) urgentZero(fd int, dst uint64, pageIdx uint64, expected PageSt
 
 func (h *Handler) urgentZeroLocked(fd int, dst uint64, pageIdx uint64, expected PageState) (urgentOutcome, error) {
 	started := time.Now()
-	completed, err := h.ops.zeropage(fd, dst, PageSize)
-	zero := true
-	// Shmem does not implement ZEROPAGE on all supported kernels. A bounded
-	// shared zero buffer is only read by COPY and never aliases guest memory.
-	if completed == 0 && (errors.Is(err, unix.EINVAL) || errors.Is(err, unix.EOPNOTSUPP)) {
-		completed, err = h.ops.copy(fd, dst, zeroScratch[:PageSize])
-		zero = false
-		h.stats.copies.Add(1)
-	}
+	completed, err, zero := h.zeroCleanLocked(fd, dst, PageSize)
 	h.stats.urgentZeroNs.Add(uint64(time.Since(started).Nanoseconds()))
 	h.stats.urgentZeroCalls.Add(1)
 	h.stats.zeropages.Add(1)
@@ -856,16 +864,11 @@ func (h *Handler) executeTailIO(task tailTask, data []byte, length uint64) (uint
 	var err error
 	zero := task.kind == tailZero
 	if task.kind == tailZero {
-		completed, err = h.ops.zeropage(task.uffdFD, task.dstVA, length)
-		if completed == 0 && (errors.Is(err, unix.EINVAL) || errors.Is(err, unix.EOPNOTSUPP)) {
-			completed, err = h.ops.copy(task.uffdFD, task.dstVA, zeroScratch[:length])
-			zero = false
-			h.stats.copies.Add(1)
-		}
+		completed, err, zero = h.zeroCleanLocked(task.uffdFD, task.dstVA, length)
 		h.stats.tailZeroNs.Add(uint64(time.Since(started).Nanoseconds()))
 		h.stats.zeropages.Add(1)
 	} else {
-		completed, err = h.ops.copy(task.uffdFD, task.dstVA, data)
+		completed, err = h.copyCleanLocked(task.uffdFD, task.dstVA, data)
 		h.stats.tailCopyNs.Add(uint64(time.Since(started).Nanoseconds()))
 		h.stats.copies.Add(1)
 	}

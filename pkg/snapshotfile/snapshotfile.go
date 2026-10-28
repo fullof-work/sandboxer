@@ -42,6 +42,8 @@ const (
 	zipEpochDate           = 33
 )
 
+var ErrTailBudget = errors.New("snapshot ZIP tail budget exceeded")
+
 // Root owns one opened Snapshot. FullStream and Memory share a single close
 // owner. Memory preserves the carrier's authoritative Hole/Zero/Data runs and
 // ends exactly at ArchiveBase, so UFFD can never observe the ZIP tail.
@@ -87,6 +89,13 @@ func BuildZIPWithDirty(configJSON, stateJSON, snapshotConfig, dirty []byte) ([]b
 		if len(entry.Body) == 0 || len(entry.Body) > entryLimit(entry.Name) {
 			return nil, fmt.Errorf("snapshot ZIP entry %s size is outside limits", entry.Name)
 		}
+	}
+	total := uint64(eocdSize)
+	for _, entry := range entries {
+		total += uint64(localHeaderSize + centralHeaderSize + 2*len(entry.Name) + len(entry.Body))
+	}
+	if total > MaxTailBytes {
+		return nil, ErrTailBudget
 	}
 	return tailzip.EncodeCanonical(entries)
 }

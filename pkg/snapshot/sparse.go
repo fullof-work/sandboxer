@@ -8,6 +8,7 @@ import (
 	"syscall"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
+	"github.com/kuasar-sandbox/sandboxer/pkg/memory"
 	"golang.org/x/sys/unix"
 )
 
@@ -23,41 +24,7 @@ const (
 //
 // Implementation walks SEEK_DATA / SEEK_HOLE alternately. A trailing
 // hole (no data after offset) is included.
-func WalkHoles(fd int, size int64) ([]sparse.Extent, error) {
-	var holes []sparse.Extent
-	var off int64
-	for off < size {
-		dataOff, err := syscall.Seek(fd, off, seekData)
-		if err != nil {
-			if errors.Is(err, syscall.ENXIO) {
-				// No more data → rest is hole.
-				if off < size {
-					holes = append(holes, sparse.Extent{
-						Offset: uint64(off),
-						Size:   uint64(size - off),
-					})
-				}
-				return holes, nil
-			}
-			return nil, fmt.Errorf("SEEK_DATA at %d: %w", off, err)
-		}
-		if dataOff > off {
-			holes = append(holes, sparse.Extent{
-				Offset: uint64(off),
-				Size:   uint64(dataOff - off),
-			})
-		}
-		holeOff, err := syscall.Seek(fd, dataOff, seekHole)
-		if err != nil {
-			return nil, fmt.Errorf("SEEK_HOLE at %d: %w", dataOff, err)
-		}
-		if holeOff > size {
-			holeOff = size
-		}
-		off = holeOff
-	}
-	return holes, nil
-}
+func WalkHoles(fd int, size int64) ([]sparse.Extent, error) { return memory.WalkHoles(fd, size) }
 
 // SparseCopy copies fd[0..size) into dst, preserving holes.
 // SEEK_DATA / SEEK_HOLE drive the walk; only data extents are copied

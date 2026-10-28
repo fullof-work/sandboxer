@@ -35,20 +35,21 @@ type VAReportServer struct {
 	// HandshakeDeadline bounds the read of one va_report message (CH→host
 	// uffd-fd handoff). 0 = no deadline: the host waits as long as CH needs
 	// to issue the handoff. Set positive to fail fast.
-	HandshakeDeadline time.Duration
+	HandshakeDeadline    time.Duration
+	RequireDirtyTracking bool
 
 	// OnReady is invoked synchronously on the FIRST va_report. The
 	// handler should adopt the uffd fd (the server passes ownership)
 	// and start its goroutines. Returning an error causes the
 	// va_report to be NAK'd and the fd closed.
-	OnReady func(uffdFD int, vaStart, size, memfdOffset uint64) error
+	OnReady func(uffdFD int, vaStart, size, memfdOffset uint64, writeProtect bool) error
 
 	// OnRegister is invoked synchronously on each SUBSEQUENT va_report.
 	// The handler should adopt the new uffd fd (also passed by
 	// ownership) and add it to its epoll set. Returning an error NAKs.
 	// May be left nil; in that case any second va_report is rejected
 	// (single-region mode).
-	OnRegister func(uffdFD int, vaStart, size, memfdOffset uint64) error
+	OnRegister func(uffdFD int, vaStart, size, memfdOffset uint64, writeProtect bool) error
 
 	connMu            sync.Mutex
 	activeConn        *net.UnixConn
@@ -140,15 +141,21 @@ func (s *VAReportServer) Stop() {
 }
 
 type vaReportMsg struct {
-	Type    string `json:"type"`
-	ZoneID  string `json:"zone_id,omitempty"`
-	VAStart uint64 `json:"va_start"`
-	Size    uint64 `json:"size"`
+	Type       string  `json:"type"`
+	ZoneID     string  `json:"zone_id,omitempty"`
+	VAStart    uint64  `json:"va_start"`
+	Size       uint64  `json:"size"`
+	Version    uint32  `json:"version"`
+	PageShift  uint32  `json:"page_shift"`
+	FileOffset *uint64 `json:"file_offset"`
+	CopyModeWP bool    `json:"copy_mode_wp"`
 }
 
 type ackMsg struct {
-	Type string `json:"type"`
-	Msg  string `json:"msg,omitempty"`
+	Type       string `json:"type"`
+	Msg        string `json:"msg,omitempty"`
+	Version    uint32 `json:"version,omitempty"`
+	CopyModeWP bool   `json:"copy_mode_wp"`
 }
 
 func (s *VAReportServer) handle(conn *net.UnixConn) {
@@ -184,9 +191,16 @@ func (s *VAReportServer) handle(conn *net.UnixConn) {
 		return
 	}
 
+	if s.RequireDirtyTracking && (req.Version != 1 || req.PageShift != 12 || req.FileOffset == nil) {
+		_ = writeLPJSON(conn, ackMsg{Type: "error", Msg: "dirty tracking protocol v1 required"})
+		return
+	}
 	s.mu.Lock()
 	regionIdx := s.regionsRegistered
 	memfdOffset := s.nextMemfdOffset
+	if req.FileOffset != nil {
+		memfdOffset = *req.FileOffset
+	}
 	if regionIdx > 0 && s.OnRegister == nil {
 		s.mu.Unlock()
 		s.Logf("vareport: extra report (zone=%s, region #%d) but OnRegister not set — single-region mode",
@@ -202,7 +216,7 @@ func (s *VAReportServer) handle(conn *net.UnixConn) {
 		} else {
 			adoptErr = s.AddrMap.RegisterVMA(ProcessCH, req.VAStart, req.Size, memfdOffset)
 			if adoptErr == nil {
-				adoptErr = s.OnReady(uffdFD, req.VAStart, req.Size, memfdOffset)
+				adoptErr = s.OnReady(uffdFD, req.VAStart, req.Size, memfdOffset, req.CopyModeWP)
 				if adoptErr != nil {
 					s.AddrMap.removeStaged(req.VAStart, req.Size, memfdOffset)
 				}
@@ -211,7 +225,7 @@ func (s *VAReportServer) handle(conn *net.UnixConn) {
 	} else {
 		// Handler stages the interval and atomically commits fd adoption with
 		// installation visibility. A failed epoll add leaves neither published.
-		adoptErr = s.OnRegister(uffdFD, req.VAStart, req.Size, memfdOffset)
+		adoptErr = s.OnRegister(uffdFD, req.VAStart, req.Size, memfdOffset, req.CopyModeWP)
 	}
 	if adoptErr != nil {
 		s.mu.Unlock()
@@ -228,7 +242,7 @@ func (s *VAReportServer) handle(conn *net.UnixConn) {
 
 	s.Logf("vareport: accepted region #%d zone=%s va=0x%x size=%d memfd_off=0x%x uffd_fd=%d",
 		regionIdx, req.ZoneID, req.VAStart, req.Size, memfdOffset, uffdFD)
-	if err := writeLPJSON(conn, ackMsg{Type: "ack"}); err != nil {
+	if err := writeLPJSON(conn, ackMsg{Type: "ack", Version: req.Version, CopyModeWP: req.CopyModeWP}); err != nil {
 		s.Logf("vareport: write ack: %v", err)
 	}
 }

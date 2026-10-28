@@ -10,7 +10,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -101,7 +100,7 @@ func testMandatoryReadFatalDuringPostSpawn(t *testing.T, blockReady bool) {
 			}
 			defer conn.Close()
 			conn.SetDeadline(time.Now().Add(time.Second))
-			body, _ := json.Marshal(map[string]any{"type": "va_report", "va_start": uint64(0x100000), "size": uint64(4096)})
+			body, _ := json.Marshal(map[string]any{"type": "va_report", "va_start": uint64(0x100000), "size": uint64(4096), "version": 1, "page_shift": 12, "file_offset": 0, "copy_mode_wp": false})
 			frame := make([]byte, 4+len(body))
 			binary.LittleEndian.PutUint32(frame, uint32(len(body)))
 			copy(frame[4:], body)
@@ -116,7 +115,10 @@ func testMandatoryReadFatalDuringPostSpawn(t *testing.T, blockReady bool) {
 			if _, err = io.ReadFull(conn, ack); err != nil {
 				return err
 			}
-			if !strings.Contains(string(ack), "ack") {
+			var response struct {
+				Type string `json:"type"`
+			}
+			if json.Unmarshal(ack, &response) != nil || response.Type != "ack" {
 				return errors.New(string(ack))
 			}
 			var fault [32]byte
