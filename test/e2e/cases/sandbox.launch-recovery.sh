@@ -231,6 +231,23 @@ launch:
   restart: never
 YAML
 
+vm_identity() {
+    python3 - "$RUN_PID" <<'PYVM'
+import pathlib,sys
+parent=int(sys.argv[1])
+children=pathlib.Path(f"/proc/{parent}/task/{parent}/children").read_text().split()
+matches=[]
+for child in children:
+    p=pathlib.Path("/proc")/child
+    if p.joinpath("exe").resolve().name == "cloud-hypervisor":
+        fields=p.joinpath("stat").read_text().rpartition(")")[2].split()
+        assert int(fields[1])==parent
+        matches.append((int(child),int(fields[19])))
+assert len(matches)==1, matches
+print("%s:%s" % matches[0])
+PYVM
+}
+
 mode "stall:$APP_KEYS"
 readiness_begin_capture "$WORK/launch.ready"
 READY_READER=$READY_READER_PID
@@ -241,8 +258,7 @@ readiness_close_parent_writer
 readiness_wait_event "$WORK/launch.ready" 1 control_ready "$RUN_PID"
 wait_file "$WORK/launch.log" 'launch_ack received' "$RUN_PID"
 wait_fault_count 0 1 "$RUN_PID"
-CH_PID=$(pgrep -P "$RUN_PID" -x cloud-hypervisor)
-[ -n "$CH_PID" ] || e2e_fail "no original VM"
+CH_ID=$(vm_identity) || e2e_fail "no original VM"
 # Observe retries of the selected exec read beyond the old post-ACK budget.
 # Each record comes from a received request; elapsed time alone is insufficient.
 wait_fault_count 0 4 "$RUN_PID"
@@ -269,7 +285,7 @@ mode healthy
 readiness_wait_event "$WORK/launch.ready" 2 ready "$RUN_PID"
 readiness_assert_wire "$WORK/launch.ready" "$READY_READER" $'control_ready\nready\n'
 wait_file "$WORK/launch.app.log" '^LAUNCH-APP-STARTED$' "$RUN_PID"
-[ "$(pgrep -P "$RUN_PID" -x cloud-hypervisor)" = "$CH_PID" ] || e2e_fail "VM was replaced"
+[ "$(vm_identity)" = "$CH_ID" ] || e2e_fail "VM was replaced"
 [ "$(grep -c 'CH started pid=' "$WORK/launch.log")" = 1 ] || e2e_fail "launch was replayed"
 
 BEFORE=$(fault_count)
@@ -279,7 +295,7 @@ wait_fault_count "$BEFORE" 4 "$RUN_PID"
 ! grep -q '^LAUNCH-READ-RECOVERED$' "$WORK/launch.app.log" || e2e_fail "ordinary read bypassed fault"
 mode healthy
 wait_file "$WORK/launch.app.log" '^LAUNCH-READ-RECOVERED$' "$RUN_PID"
-[ "$(pgrep -P "$RUN_PID" -x cloud-hypervisor)" = "$CH_PID" ] || e2e_fail "ordinary read replaced VM"
+[ "$(vm_identity)" = "$CH_ID" ] || e2e_fail "ordinary read replaced VM"
 kill -TERM "$RUN_PID"
 wait "$RUN_PID"
 SESSIONS=()
