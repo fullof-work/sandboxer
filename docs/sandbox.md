@@ -1769,6 +1769,13 @@ consume an old token for a new Launch. Host upgrade cannot replace init inside
 an existing snapshot. Primary restart retains the completed initial fact and
 existing supervision/notifications.
 
+The supported prewarm boundary is a live `runtime_ready` instance followed by
+Launch. The current SDK rejects Snapshot/Export before running, and a Guest
+without a workload rejects restore/attach/quiesce. Persisted prewarm-memory
+restore followed by a new Launch is not an implemented API. If such a state is
+provided by another lifecycle, the new Launch still requires the compatible
+Guest capability; this does not make an old snapshot's init upgradeable.
+
 Default PingFatalThreshold remains zero. Indefinite recovery can retain resources
 until cancellation/Close, permanent failure or real VM exit. Positive AppStart or
 explicit PingFatal selects bounded termination and cannot simultaneously promise
@@ -2859,6 +2866,19 @@ The original error is latched and the owner notified before cleanup I/O. While r
 ## 12. Validation, errors, and security
 
 ### 12.0 Runtime SDK lifecycle validation
+
+The prepared [launch recovery case](../test/e2e/cases/sandbox.launch-recovery.sh)
+blocks selected, observed Cache requests after ACK, crosses the former two-second
+window, injects partial responses and SIGKILL/connection refusal, and checks the
+same VM plus exact ordinary-read bytes after recovery. It uses ordinary Store
+and Cache services, independent of service drain or retained listeners.
+The [cgroup case](../test/e2e/cases/sandbox.cgroup.sh) checks the initial fact
+before and after a real primary restart; [restore](../test/e2e/cases/snapshot.restore.sh)
+checks the original token/state across an ordinary snapshot restore.
+The opt-in [SDK KVM test](../pkg/runtime/kvm_test.go) checks live runtime_ready,
+rejected prewarm capture/reattach, then a successful initial Launch. Record actual
+Host/init revisions and Bundle digests for old/new version tests; a local run is
+separate from trusted CI and from published artifact rollout.
 
 The initial-state regressions in [runtime_initial_launch_test.go](../pkg/sandbox/runtime_initial_launch_test.go)
 hold a real child after ACK across the old two-second window, drop app_started,

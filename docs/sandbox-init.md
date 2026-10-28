@@ -172,6 +172,13 @@ the Guest baseline. A Host upgrade cannot replace init in an existing snapshot.
 An ordinary restore attaches to its existing application; a restored prewarm
 runtime that will accept a new Launch must already contain a compatible init.
 
+The supported prewarm boundary is a live `runtime_ready` instance followed by
+Launch. The current SDK rejects Snapshot/Export before running, and a Guest
+without a workload rejects restore/attach/quiesce. Persisted prewarm-memory
+restore followed by a new Launch is not an implemented API. If such a state is
+provided by another lifecycle, the new Launch still requires the compatible
+Guest capability; this does not make an old snapshot's init upgradeable.
+
 The Host supplies a unique `initial_launch_token` in LaunchSpec. Guest records
 a mutex-protected snapshot for that token: `pending` before workload preparation,
 `started` at the existing initial primary publication boundary, `failed` on a

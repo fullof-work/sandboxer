@@ -1552,6 +1552,11 @@ Guest 新字段。已有应用的普通 restore 保留 restore/attach 语义，�
 作为新 Launch 事实。Host 升级无法替换 snapshot 中的 init。Primary restart 保持
 已完成初始事实及原监督/通知语义。
 
+当前支持的预热边界是仍存活的 `runtime_ready` 实例随后执行 Launch。SDK 在
+running 前拒绝 Snapshot/Export；尚无工作负载的 Guest 拒绝 restore/attach/quiesce。
+“保存预热内存、恢复后再 Launch”不是已实现的 API。若其他生命周期提供这种状态，
+新 Launch 仍须满足 Guest 能力要求；这不代表可以升级旧 snapshot 内的 init。
+
 默认 PingFatalThreshold 仍为零。无限恢复可能持续持有资源，直到取消/Close、
 永久错误或真实 VM 退出。正数 AppStart 或显式 PingFatal 选择有界终止，不能同时
 保证无限恢复。Portable 制品不含宿主策略，Builder 保留外层 work deadline。
@@ -2544,6 +2549,16 @@ Close 幂等，排空及关闭错误沿 run/restore 传播。销毁也必须等�
 ## 12. Validation、错误与安全
 
 ### 12.0 Runtime SDK 生命周期验证
+
+已准备的 [启动恢复用例](../test/e2e/cases/sandbox.launch-recovery.sh) 在 ACK 后阻断
+精确且已观测的 Cache 请求，跨越原两秒窗口，注入半响应、SIGKILL 和连接拒绝，
+恢复后核对同一 VM 及普通必要读取的完整字节。测试使用普通 Store/Cache，不依赖
+服务排空或保留 listener。[cgroup 用例](../test/e2e/cases/sandbox.cgroup.sh) 在真实
+primary restart 前后比较初始事实；[restore 用例](../test/e2e/cases/snapshot.restore.sh)
+比较普通快照恢复前后的原 token/状态。[可选 SDK KVM 测试](../pkg/runtime/kvm_test.go)
+覆盖 live runtime_ready、预热 capture/reattach 的拒绝及之后的正常初始 Launch。
+新旧版本测试须记录实际 Host/init revision 和 Bundle 摘要；本地执行、正式受信 CI
+及已发布制品生效是不同证据。
 
 执行 `go test ./...` 和 `go test -race ./...`。
 [`runtime_sdk_test.go`](../pkg/sandbox/runtime_sdk_test.go) 使用真实子进程和 Unix socket

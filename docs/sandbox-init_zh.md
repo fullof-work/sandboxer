@@ -149,6 +149,11 @@ Host 从 `runtime_ready` 开始 ping；launch_ack/app_started 保持既有语义
 与 sandbox-runtime Bundle。升级 Host 不会替换已有 snapshot 内的 init。普通 restore
 接回已有应用；恢复后将接受新 Launch 的预热 Runtime 必须原本就含兼容 init。
 
+当前支持的预热边界是仍存活的 `runtime_ready` 实例随后执行 Launch。SDK 在
+running 前拒绝 Snapshot/Export；尚无工作负载的 Guest 拒绝 restore/attach/quiesce。
+“保存预热内存、恢复后再 Launch”不是已实现的 API。若其他生命周期提供这种状态，
+新 Launch 仍须满足 Guest 能力要求；这不代表可以升级旧 snapshot 内的 init。
+
 Host 在 LaunchSpec 提供唯一 `initial_launch_token`。Guest 以同一把锁记录绑定
 该 token 的一致快照：工作负载准备前为 `pending`，在既有初始 primary 发布边界为
 `started`，启动硬错误为 `failed`，接受终止时为终态 `exited`。快照包含初始 PID
