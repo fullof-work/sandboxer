@@ -97,8 +97,12 @@ class LocalRestoreTickTests(unittest.TestCase):
             binary = work / 'sandbox-ctl'
             binary.write_text('#!/bin/bash\nprintf "TICK 17\\n" >> "$TEST_LOG"\ntouch "$TEST_SNAPSHOT"\n')
             binary.chmod(0o755)
+            probe = work / 'initial-probe'
+            probe.write_text('#!/bin/bash\nprintf \'%s\\n\' \'{"token":"fixture","state":"started"}\'\n')
+            probe.chmod(0o755)
             setup = r'''
 WORK=$TEST_WORK; BIN=$WORK; OUT=$WORK; SID1=source
+LAUNCH_RECOVERY_BIN=$WORK/initial-probe
 mkdir "$WORK/snapshot"
 LOG1=$WORK/source.log; LOG2=$WORK/restore.log
 export TEST_LOG=$LOG1 TEST_SNAPSHOT=$WORK/snapshot/source.snapshot
