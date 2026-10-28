@@ -79,7 +79,7 @@ restore(){
  launch_restore "$source" "$name"
  if [ -n "$baseline_ram" ];then
   cmp "$baseline_ram" "$(ram_path 0)"
-  python3 - "$baseline_ram" "$(ram_path 0)" "$source" >"$OUT/$name-comparison.json" <<'PYRESTORE'
+  python3 - "$baseline_ram" "$(ram_path 0)" "$source" >"$OUT/$name-restore-comparison.json" <<'PYRESTORE'
 import hashlib,json,pathlib,sys
 paths=list(map(pathlib.Path,sys.argv[1:3]));sizes=[p.stat().st_size for p in paths]
 assert sizes==[256<<20,256<<20],sizes
@@ -88,7 +88,7 @@ assert hashes[0]==hashes[1]
 print(json.dumps(dict(complete_comparison='equal-independent-restores',logical_bytes=sizes[0],sha256=hashes[0],baseline_ram=str(paths[0]),dirty_ram=str(paths[1]),source=sys.argv[3])))
 PYRESTORE
  else
-  "$MEMORY_COMPARE_BIN" "$source" "$(ram_path 0)" >"$OUT/$name-comparison.json"
+  "$MEMORY_COMPARE_BIN" "$source" "$(ram_path 0)" >"$OUT/$name-restore-comparison.json"
  fi
 }
 # x86 KVM restores rewrite the wall-clock MSR's 12-byte guest structure before
