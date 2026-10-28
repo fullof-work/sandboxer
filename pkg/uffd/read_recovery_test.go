@@ -540,6 +540,7 @@ func TestRealUffdUnmapWakesRecoveringKernelFault(t *testing.T) {
 				if err == nil {
 					mapped = false
 				} else {
+					mapped = true
 					t.Errorf("unmap cleanup: %v", err)
 				}
 			case <-time.After(time.Second):
@@ -560,14 +561,21 @@ func TestRealUffdUnmapWakesRecoveringKernelFault(t *testing.T) {
 	defer func() { h.cancel(); receiveSignal(t, done) }()
 	receiveSignal(t, entered)
 	unmapped = make(chan error, 1)
+	// Transfer sole Munmap ownership before starting it. If the kernel does
+	// not join, cleanup must not start a second Munmap of the same slice.
+	mapped = false
 	go func() { unmapped <- unix.Munmap(mem) }()
 	readEvent(uffdEventUnmap)
-	err = <-unmapped
-	unmapJoined = true
-	if err != nil {
-		t.Fatal(err)
+	select {
+	case err = <-unmapped:
+		unmapJoined = true
+		if err != nil {
+			mapped = true
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("UNMAP did not return after its event was acknowledged")
 	}
-	mapped = false
 	select {
 	case got := <-gup:
 		joined = true
