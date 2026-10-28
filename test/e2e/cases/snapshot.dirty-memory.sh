@@ -8,7 +8,13 @@ source "$SANDBOXER_LIB/tarstream.sh"
 : "${WORK:?}" "${OUT:?}" "${DIRTY_MEMORY_GUEST_BIN:?}" "${MEMORY_COMPARE_BIN:?}" "${MEMORY_BASELINE_BIN:?}"
 require_root
 require_kvm
-for cmd in python3 mkfs.ext4 truncate timeout;do require_command "$cmd";done
+# ARM host KVM implementations can reconstruct migration metadata in guest RAM
+# while restoring GIC state. Compare independent full and dirty restores on ARM;
+# both observations still cover every byte. x86 uses the no-kvmclock fixture.
+if [ "$(uname -m)" = aarch64 ];then
+ : "${DIRTY_MEMORY_RESTORE_BASELINE:=1}"
+fi
+for cmd in python3 mkfs.ext4 truncate timeout cmp;do require_command "$cmd";done
 for binary in sandbox-ctl cloud-hypervisor flatten-ctl;do require_binary "$binary";done
 mkdir -p "$WORK/root/bin" "$WORK/root/tmp" "$WORK/root/etc" "$WORK/root/proc" "$WORK/root/sys" "$WORK/root/dev" "$WORK/runtime" "$WORK/base" "$OUT"
 cp "$DIRTY_MEMORY_GUEST_BIN" "$WORK/root/bin/probe"
