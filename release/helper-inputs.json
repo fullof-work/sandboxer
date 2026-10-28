@@ -39,7 +39,9 @@
       "name": "launch-recovery",
       "env": "LAUNCH_RECOVERY_BIN",
       "cases": [
-        "sandbox.launch-recovery.sh"
+        "sandbox.launch-recovery.sh",
+        "sandbox.cgroup.sh",
+        "snapshot.restore.sh"
       ]
     }
   ]

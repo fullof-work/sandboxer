@@ -13,6 +13,7 @@ source "$SANDBOXER_LIB/tarstream.sh"
 : "${E2E_IMAGE:?E2E_IMAGE is required}"
 : "${CGROUP_FORK_PROBE_BIN:?CGROUP_FORK_PROBE_BIN is a required prepared fixture}"
 
+: "${LAUNCH_RECOVERY_BIN:?prepared initial-state probe required}"
 require_root
 require_kvm
 for command in base64 docker mkfs.ext4 timeout truncate; do
@@ -188,7 +189,7 @@ files:
 
       touch "/tmp/cg-\${role}.\${generation}.ready"
       case "\$role:\$generation" in
-        primary:1) while [ ! -e /tmp/cg-plugin.2.ready ]; do sleep 0.01; done; exit 42 ;;
+        primary:1) while [ ! -e /tmp/cg-plugin.2.ready ] || [ ! -e /tmp/initial-launch-observed ]; do sleep 0.01; done; exit 42 ;;
         plugin:1) exit 43 ;;
         exec:*) exit 0 ;;
       esac
@@ -220,6 +221,11 @@ EOF
     local run_pid=$!
     PIDS+=("$run_pid")
 
+    wait_marker "CG-primary-GEN-1-SELF $expected" "$log" "$run_pid" || e2e_fail "$name initial primary did not start"
+    wait_runtime_ready "$ready_log" "$run_pid" || e2e_fail "$name initial readiness missing"
+    "$LAUNCH_RECOVERY_BIN" pong "$run_root/$sid/vsock.sock" >"$OUT/$name-initial-before.json"
+    "$BIN/sandbox-ctl" exec --sandbox-id "$sid" --run-root "$run_root" -- touch /tmp/initial-launch-observed
+
     wait_marker "CG-primary-GEN-2-SELF $expected" "$log" "$run_pid" || e2e_fail "$name primary did not restart in expected cgroup"
     wait_marker "CG-primary-GEN-2-FORK-OK 128" "$log" "$run_pid" || e2e_fail "$name primary immediate-fork placement failed"
     wait_marker "CG-plugin-GEN-2-SELF $expected" "$log" "$run_pid" || e2e_fail "$name plugin did not restart in expected cgroup"
@@ -236,6 +242,14 @@ EOF
         e2e_fail "$name sandbox did not reach host running readiness"
     }
 
+    "$LAUNCH_RECOVERY_BIN" pong "$run_root/$sid/vsock.sock" >"$OUT/$name-initial-after.json"
+    python3 - "$OUT/$name-initial-before.json" "$OUT/$name-initial-after.json" <<'PY_INITIAL'
+import json,sys
+before,after=[json.load(open(p)) for p in sys.argv[1:]]
+assert before and before["token"] and before["state"]=="started", before
+assert after==before,(before,after)
+PY_INITIAL
+    [ "$(grep -c '^ready$' "$ready_log")" = 1 ] || e2e_fail "$name restart repeated readiness"
     local exec_log="$OUT/$name-exec.log"
     "$BIN/sandbox-ctl" exec --sandbox-id "$sid" --run-root "$run_root" -- \
         /cgroup-fork-probe /probe.sh exec "$expected" "$pid_mode" "$control" "$real_check" >"$exec_log" 2>&1 || {

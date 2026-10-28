@@ -6,6 +6,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"strconv"
@@ -14,6 +15,8 @@ import (
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/codec"
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
+	"github.com/kuasar-sandbox/sandboxer/pkg/guestlink"
+	"github.com/kuasar-sandbox/sandboxer/pkg/proto"
 )
 
 func keys(args []string) error {
@@ -97,14 +100,32 @@ func guest() error {
 		time.Sleep(time.Hour)
 	}
 }
+
+// pong uses the existing Guest management exchange, including its EOF barrier.
+func pong(args []string) error {
+	if len(args) != 1 {
+		return fmt.Errorf("pong VSOCK_SOCKET")
+	}
+	host := guestlink.HostClient{BasePath: args[0]}
+	reply, err := host.RoundTripContext(context.Background(), &proto.Message{Type: proto.TypePing, ID: 1}, 5*time.Second)
+	if err != nil {
+		return err
+	}
+	if reply.Type != proto.TypePong {
+		return fmt.Errorf("expected Pong: %s", reply.Type)
+	}
+	return json.NewEncoder(os.Stdout).Encode(reply.InitialLaunchState)
+}
 func main() {
 	var err error
 	if len(os.Args) > 1 && os.Args[1] == "guest" {
 		err = guest()
+	} else if len(os.Args) > 1 && os.Args[1] == "pong" {
+		err = pong(os.Args[2:])
 	} else if len(os.Args) > 1 && os.Args[1] == "keys" {
 		err = keys(os.Args[2:])
 	} else {
-		err = fmt.Errorf("expected keys or guest")
+		err = fmt.Errorf("expected keys, guest or pong")
 	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
