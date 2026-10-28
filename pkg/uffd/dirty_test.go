@@ -113,3 +113,49 @@ func TestCaptureRejectsUnexplainedLoadedHole(t *testing.T) {
 		t.Fatal("Loaded hole without R accepted")
 	}
 }
+
+func TestWPRetryReleasesInstallGateAndRetainsDirty(t *testing.T) {
+ if runtime.GOARCH != "amd64" { t.Skip("x86 WP retry path") }
+	h, _, _ := realShmemHandler(t, 1, ZeroSource{}, true)
+	h.installMu.Lock()
+	fd := h.uffds[0].Fd()
+	h.addrMap.mu.RLock()
+	var va uint64
+	for _, v := range h.addrMap.vmas {
+		if v.process == ProcessCH {
+			va = v.start
+			break
+		}
+	}
+	h.addrMap.mu.RUnlock()
+	attempts := 0
+	first := make(chan struct{})
+	h.ops.writeProtect = func(_ int, _ uint64, _ uint64, _ bool) error {
+		if !h.cfg.Dirty.Contains(0) {
+			t.Error("unprotect attempted before dirty publication")
+		}
+		attempts++
+		if attempts == 1 {
+			close(first)
+			return unix.EAGAIN
+		}
+		return nil
+	}
+	h.installMu.Unlock()
+	done := make(chan error, 1)
+	go func() { done <- h.handleWP(int(fd), va, 0) }()
+	<-first
+	h.installMu.Lock()
+	h.handleRemoveLocked(va, va+PageSize, int(fd))
+	h.installMu.Unlock()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if attempts < 2 || !h.cfg.Dirty.Contains(0) || !h.released.Contains(0) {
+		t.Fatal("retry lost D/R")
+	}
+	h.ops.writeProtect = func(int, uint64, uint64, bool) error { return unix.EIO }
+	if err := h.handleWP(int(fd), va, 0); err == nil || !h.cfg.Dirty.Contains(0) {
+		t.Fatal("failed unprotect lost D", err)
+	}
+}

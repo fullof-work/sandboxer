@@ -143,3 +143,75 @@ func TestVAReportStopInterruptsIncompleteHandshake(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestVAReportFragmentedFramePreservesFD(t *testing.T) {
+	for _, onBody := range []bool{false, true} {
+		t.Run(map[bool]string{false: "prefix-fd", true: "body-fd"}[onBody], func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "report.sock")
+			listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer listener.Close()
+			var pipe [2]int
+			if err := unix.Pipe(pipe[:]); err != nil {
+				t.Fatal(err)
+			}
+			defer unix.Close(pipe[0])
+			defer unix.Close(pipe[1])
+			body := []byte(`{"type":"va_report","version":1}`)
+			var prefix [4]byte
+			binary.LittleEndian.PutUint32(prefix[:], uint32(len(body)))
+			sent := make(chan error, 1)
+			go func() {
+				c, err := net.DialUnix("unix", nil, &net.UnixAddr{Name: path, Net: "unix"})
+				if err != nil {
+					sent <- err
+					return
+				}
+				defer c.Close()
+				c.SetDeadline(time.Now().Add(3 * time.Second))
+				rights := unix.UnixRights(pipe[0])
+				if onBody {
+					rights = nil
+				}
+				if _, _, err = c.WriteMsgUnix(prefix[:1], rights, nil); err != nil {
+					sent <- err
+					return
+				}
+				time.Sleep(10 * time.Millisecond)
+				if _, err = c.Write(prefix[1:]); err != nil {
+					sent <- err
+					return
+				}
+				rights = nil
+				if onBody {
+					rights = unix.UnixRights(pipe[0])
+				}
+				_, _, err = c.WriteMsgUnix(body, rights, nil)
+				sent <- err
+			}()
+			conn, err := listener.AcceptUnix()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			conn.SetDeadline(time.Now().Add(3 * time.Second))
+			got, fds, err := readLPJSONWithFDs(conn)
+			defer closeAll(fds)
+			if err != nil || string(got) != string(body) || len(fds) != 1 {
+				t.Fatalf("frame=%s fds=%v err=%v", got, fds, err)
+			}
+			if err := <-sent; err != nil {
+				t.Fatal(err)
+			}
+			if _, err := unix.Write(pipe[1], []byte{9}); err != nil {
+				t.Fatal(err)
+			}
+			var data [1]byte
+			if _, err := unix.Read(fds[0], data[:]); err != nil || data[0] != 9 {
+				t.Fatal("received descriptor invalid", err)
+			}
+		})
+	}
+}

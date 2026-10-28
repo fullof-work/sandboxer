@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"sync"
@@ -250,32 +251,38 @@ func (s *VAReportServer) handle(conn *net.UnixConn) {
 // readLPJSONWithFDs reads u32 LE length + JSON body, possibly with
 // SCM_RIGHTS-attached fds on the same recvmsg.
 func readLPJSONWithFDs(c *net.UnixConn) ([]byte, []int, error) {
-	// Read length prefix first (no FDs expected on this part).
+	var fds []int
+	oob := make([]byte, syscall.CmsgSpace(4*16))
+	readFull := func(dst []byte) error {
+		for len(dst) != 0 {
+			n, oobN, flags, _, err := c.ReadMsgUnix(dst, oob)
+			// Preserve ownership even on a short/truncated frame, so the caller
+			// closes every received descriptor on rejection.
+			fds = append(fds, parseFDsFromOOB(oob[:oobN])...)
+			if flags&(syscall.MSG_CTRUNC|syscall.MSG_TRUNC) != 0 || len(fds) > 16 {
+				return fmt.Errorf("truncated/oversized ancillary data")
+			}
+			if err != nil {
+				return err
+			}
+			if n == 0 {
+				return io.ErrUnexpectedEOF
+			}
+			dst = dst[n:]
+		}
+		return nil
+	}
 	var lenBuf [4]byte
-	oob := make([]byte, syscall.CmsgSpace(4*16)) // up to 16 fds
-	n, oobN, _, _, err := c.ReadMsgUnix(lenBuf[:], oob)
-	if err != nil {
-		return nil, nil, fmt.Errorf("read length+oob: %w", err)
+	if err := readFull(lenBuf[:]); err != nil {
+		return nil, fds, fmt.Errorf("read length+oob: %w", err)
 	}
-	if n != 4 {
-		return nil, nil, fmt.Errorf("short length read: %d", n)
-	}
-	fds := parseFDsFromOOB(oob[:oobN])
-
 	bodyLen := binary.LittleEndian.Uint32(lenBuf[:])
-	if bodyLen > 64*1024 {
-		return nil, fds, fmt.Errorf("oversized message: %d bytes", bodyLen)
+	if bodyLen == 0 || bodyLen > 64*1024 {
+		return nil, fds, fmt.Errorf("invalid message length: %d", bodyLen)
 	}
 	body := make([]byte, bodyLen)
-	off := 0
-	// In case fds came on the same recvmsg as the length but body is
-	// in separate recvmsg(s), read the body now (no more OOB expected).
-	for off < int(bodyLen) {
-		nn, err := c.Read(body[off:])
-		if err != nil {
-			return body[:off], fds, fmt.Errorf("read body: %w", err)
-		}
-		off += nn
+	if err := readFull(body); err != nil {
+		return nil, fds, fmt.Errorf("read body+oob: %w", err)
 	}
 	return body, fds, nil
 }
