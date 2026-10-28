@@ -4,11 +4,13 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
+	"github.com/kuasar-sandbox/sandboxer/pkg/ctl"
 	"github.com/kuasar-sandbox/sandboxer/pkg/guestlink"
 	"github.com/kuasar-sandbox/sandboxer/pkg/proto"
 	"github.com/kuasar-sandbox/sandboxer/pkg/sandbox"
@@ -72,6 +74,9 @@ func TestKVMRuntimeLaunch(t *testing.T) {
 		if err != nil || reply.Type != proto.TypePong {
 			t.Fatalf("base Guest ping=%+v/%v", reply, err)
 		}
+		if reply.InitialLaunchState != nil {
+			t.Fatalf("base runtime fabricated initial launch: %+v", reply.InitialLaunchState)
+		}
 		if _, err := owner.Stats(ctx); err != nil {
 			t.Fatal(err)
 		}
@@ -83,6 +88,24 @@ func TestKVMRuntimeLaunch(t *testing.T) {
 	}
 	if _, _, err := owner.Exec(ctx, proto.ExecSpec{Argv: []string{"/bin/true"}}); err == nil {
 		t.Fatal("base runtime accepted workload exec")
+	}
+	// Prewarm memory capture/restore is not a supported SDK lifecycle.
+	// These operations must reject without consuming the later live Launch.
+	for name, capture := range map[string]func(context.Context, ctl.Request) (ctl.Response, error){
+		"snapshot": owner.Snapshot, "export": owner.Export,
+	} {
+		if _, err := capture(ctx, ctl.Request{}); err == nil || !strings.Contains(err.Error(), "runtime_ready") {
+			t.Fatalf("base %s=%v", name, err)
+		}
+	}
+	for _, kind := range []string{proto.TypeRestore, proto.TypeAttach, proto.TypeQuiesce} {
+		reply, err := host.RoundTripContext(ctx, &proto.Message{Type: kind, ID: 18}, 5*time.Second)
+		if err != nil || reply.Type != proto.TypeError || !strings.Contains(reply.Msg, "workload not launched") {
+			t.Fatalf("base %s=%+v/%v", kind, reply, err)
+		}
+	}
+	if owner.State() != "runtime_ready" {
+		t.Fatal(owner.State())
 	}
 	launch := sandbox.LaunchSpecFromConfig(cfg)
 	launch.Storage = storage
@@ -97,6 +120,14 @@ func TestKVMRuntimeLaunch(t *testing.T) {
 	}
 	if _, err := owner.Stats(ctx); err != nil {
 		t.Fatal(err)
+	}
+	reply, err := host.RoundTripContext(ctx, &proto.Message{Type: proto.TypePing, ID: 19}, 5*time.Second)
+	if err != nil || reply.Type != proto.TypePong || reply.InitialLaunchState == nil ||
+		reply.InitialLaunchState.Token == "" || reply.InitialLaunchState.State != proto.InitialLaunchStarted {
+		t.Fatalf("launched Guest fact=%+v/%v", reply, err)
+	}
+	if err := owner.Launch(ctx, launch); err == nil {
+		t.Fatal("running runtime accepted a second initial Launch")
 	}
 	if err := owner.Close(); err != nil {
 		t.Fatal(err)
