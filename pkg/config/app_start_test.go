@@ -6,25 +6,28 @@ import (
 	"time"
 )
 
-func TestAppStartDeadlineIsIndependentAndAlwaysBounded(t *testing.T) {
+func TestAppStartDeadlineOptionalAndIndependent(t *testing.T) {
 	c := SandboxConfig{Timeouts: TimeoutsConfig{AppNotify: "1h"}}
-	if c.AppStartDeadline() != 2*time.Second {
-		t.Fatal(c.AppStartDeadline())
+	for _, raw := range []string{"", "0", "0s", "3s"} {
+		c.Timeouts.AppStart = raw
+		if err := c.Timeouts.validate(); err != nil {
+			t.Fatal(raw, err)
+		}
+		want := time.Duration(0)
+		if raw == "3s" {
+			want = 3 * time.Second
+		}
+		if c.AppStartDeadline() != want || c.AppNotifyDeadline() != time.Hour {
+			t.Fatalf("%q: app_start=%s app_notify=%s", raw, c.AppStartDeadline(), c.AppNotifyDeadline())
+		}
 	}
-	for _, raw := range []string{"0", "0s", "-1s", "nonsense"} {
+	for _, raw := range []string{"-1s", "nonsense"} {
 		c.Timeouts.AppStart = raw
 		if err := c.Timeouts.validate(); err == nil || !strings.Contains(err.Error(), "timeouts.app_start") {
 			t.Fatal(raw, err)
 		}
-		if c.AppStartDeadline() <= 0 {
-			t.Fatal("unbounded startup", raw)
-		}
 	}
-	c.Timeouts.AppStart = "3s"
-	if err := c.Timeouts.validate(); err != nil {
-		t.Fatal(err)
-	}
-	if c.AppStartDeadline() != 3*time.Second || c.AppNotifyDeadline() != time.Hour {
-		t.Fatal(c.Timeouts)
+	if DefaultAppStartDeadline != 0 {
+		t.Fatal("compatibility constant reintroduced a deadline")
 	}
 }

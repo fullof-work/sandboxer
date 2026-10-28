@@ -144,6 +144,29 @@ virtio-pmem 挂在 `/`(`root=/dev/pmem0 ... rootflags=dax=always`),阶段 1 把�
 Host 从 `runtime_ready` 开始 ping；launch_ack/app_started 保持既有语义，app_started
 不证明 execve 成功或应用健康。已有内存快照使用 restore/attach，不走冷启动握手。
 
+**初始 Launch 确认：** runtime-ready hello 声明 `initial_launch_state_v1`。
+新 Host 在 apply Launch 前检查能力；升级 Guest 基线时须同时重建 sandbox-init
+与 sandbox-runtime Bundle。升级 Host 不会替换已有 snapshot 内的 init。普通 restore
+接回已有应用；恢复后将接受新 Launch 的预热 Runtime 必须原本就含兼容 init。
+
+Host 在 LaunchSpec 提供唯一 `initial_launch_token`。Guest 以同一把锁记录绑定
+该 token 的一致快照：工作负载准备前为 `pending`，在既有初始 primary 发布边界为
+`started`，启动硬错误为 `failed`，接受终止时为终态 `exited`。快照包含初始 PID
+或失败/退出信息。PID 存在与 Ping 可达都不能证明启动成功。正常 primary restart
+保留已完成的初始状态及既有监督语义。
+
+既有 `app_started` 快速通知与 Ping/Pong 都携带 `initial_launch_state`；
+`app_exited` 携带终态快照。Host 使用同一确认入口，核对当前 token、ACK/MUX 屏障、
+取消、永久错误与 VM 退出。pending、旧 token 和重复事实不能提交。既有 Pinger
+只发布轻量事实，不新增 Guest 发送者或轮询循环。管理连接先到达 EOF 并退出连接
+join，再运行用户 callback；成功提交先通知 Launch waiter，再执行 callback。
+
+`timeouts.app_start` 属于 Host policy：省略、空值或零不增加 post-ACK 期限；
+正时长主动选择 post-ACK 整体期限，负数/非法值为错误。这不改变
+`launch.start_timeout`、`app_notify` 交换期限、取消、启动硬错误或 VM 退出。
+`PingFatalThreshold` 默认仍为零；显式配置正阈值可能在依赖尚未恢复时终止 Runtime。
+Portable E/S 制品不携带此 Host policy。
+
 **volume 卷的 source 与搬运**:`empty` 卷的 source 是 raw ext4 上 `/overlay/upper/volumes/<i>`
 (与 overlay 的 `upperdir/` 物理隔离,同在 vdb、一起进磁盘快照),bind 到 sysroot 内的
 target;switch-root 的 `MS_MOVE /sysroot → /` 会把该 bind 随整棵子树搬进新 `/`

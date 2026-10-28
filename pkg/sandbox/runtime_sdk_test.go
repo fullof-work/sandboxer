@@ -2,6 +2,7 @@ package sandbox
 
 import (
 	"archive/zip"
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
@@ -12,6 +13,7 @@ import (
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/ctl"
 	"github.com/kuasar-sandbox/sandboxer/pkg/diffstore"
+	"github.com/kuasar-sandbox/sandboxer/pkg/guestlink"
 	"github.com/kuasar-sandbox/sandboxer/pkg/proto"
 	"github.com/kuasar-sandbox/sandboxer/pkg/stdio"
 	"github.com/kuasar-sandbox/sandboxer/pkg/vhost"
@@ -22,6 +24,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -131,17 +134,47 @@ func TestSDKChild(t *testing.T) {
 	if sock == "" {
 		return
 	}
+	var initial atomic.Pointer[proto.InitialLaunchState]
+	listener, err := net.Listen("unix", sock)
+	if err != nil {
+		os.Exit(29)
+	}
+	defer listener.Close()
+	go func() {
+		for {
+			c, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer c.Close()
+				reader := bufio.NewReader(c)
+				line, err := reader.ReadString('\n')
+				if err != nil || line != "CONNECT 5000\n" {
+					return
+				}
+				if _, err := io.WriteString(c, "OK 5000\n"); err != nil {
+					return
+				}
+				req, err := proto.ReadMessage(reader)
+				if err == nil && req.Type == proto.TypePing {
+					_ = proto.WriteMessage(c, &proto.Message{Type: proto.TypePong, ID: req.ID, InitialLaunchState: initial.Load()})
+				}
+			}()
+		}
+	}()
 	conn, err := net.Dial("unix", sock+"_5000")
 	if err != nil {
 		os.Exit(21)
 	}
-	if err := proto.WriteMessage(conn, &proto.Message{Type: proto.TypeHello, Phase: "runtime_ready"}); err != nil {
+	if err := proto.WriteMessage(conn, &proto.Message{Type: proto.TypeHello, Phase: "runtime_ready", InitialLaunchStateV1: os.Getenv("SDK_TEST_OLD_GUEST") != "1"}); err != nil {
 		os.Exit(22)
 	}
 	msg, err := proto.ReadMessage(conn)
 	if err != nil || msg.Type != proto.TypeLaunch {
 		os.Exit(23)
 	}
+	initial.Store(&proto.InitialLaunchState{Token: msg.Launch.InitialLaunchToken, State: proto.InitialLaunchPending})
 	if os.Getenv("SDK_TEST_REJECT") == "1" {
 		_ = proto.WriteMessage(conn, &proto.Message{Type: proto.TypeError, Msg: "injected launch failure"})
 		select {}
@@ -167,11 +200,27 @@ func TestSDKChild(t *testing.T) {
 		}
 		time.Sleep(d)
 	}
+	if gate := os.Getenv("SDK_TEST_APP_GATE"); gate != "" {
+		g, err := net.Dial("unix", gate)
+		if err != nil {
+			os.Exit(30)
+		}
+		_, err = io.ReadFull(g, make([]byte, 1))
+		g.Close()
+		if err != nil {
+			os.Exit(31)
+		}
+	}
+	initial.Store(&proto.InitialLaunchState{Token: msg.Launch.InitialLaunchToken, State: proto.InitialLaunchStarted, PID: 42})
+	if os.Getenv("SDK_TEST_DROP_APP_STARTED") == "1" {
+		_, _ = io.Copy(io.Discard, conn)
+		os.Exit(0)
+	}
 	started, err := net.Dial("unix", sock+"_5000")
 	if err != nil {
 		os.Exit(26)
 	}
-	_ = proto.WriteMessage(started, &proto.Message{Type: proto.TypeAppStarted, PID: 42})
+	_ = proto.WriteMessage(started, &proto.Message{Type: proto.TypeAppStarted, PID: 42, InitialLaunchState: initial.Load()})
 	_, _ = proto.ReadMessage(started)
 	started.Close()
 	// Keep the MUX transport alive until the owner terminates this child.
@@ -374,7 +423,10 @@ func TestLaunchOutcomeLinearization(t *testing.T) {
 		t.Run(first, func(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
-			r := &Runtime{state: runtimeLaunching, launchContext: ctx}
+			r := &Runtime{state: runtimeLaunching, launchContext: ctx, lifeCtx: context.Background(),
+				launch: completedLaunchServer(t), initialLaunchToken: "current",
+				initialLaunchState: proto.InitialLaunchState{Token: "current", State: proto.InitialLaunchStarted, PID: 42},
+				launchDone:         make(chan struct{})}
 			switch first {
 			case "cancel":
 				cancel()
@@ -558,7 +610,7 @@ func TestSDKLaunchContextBoundsGuestPreparation(t *testing.T) {
 	}
 }
 
-func TestSDKMissingAppStartedRemainsBounded(t *testing.T) {
+func TestSDKMissingInitialFactHonorsOwnerDeadline(t *testing.T) {
 	t.Setenv("SDK_TEST_APP_STARTED_DELAY", "10s")
 	shape, launch := sdkFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -568,8 +620,8 @@ func TestSDKMissingAppStartedRemainsBounded(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer r.Close()
-	if err := r.Launch(ctx, launch); err == nil || !strings.Contains(err.Error(), "app_started notification timed out after 2s") {
-		t.Fatalf("lost notification no longer bounded: %v", err)
+	if err := r.Launch(ctx, launch); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("pending launch did not honor owner: %v", err)
 	}
 	if r.State() != "closed" {
 		t.Fatalf("state=%s", r.State())
@@ -618,4 +670,40 @@ func TestSDKLaunchStartTimeoutStillBoundsGuestPreparation(t *testing.T) {
 	if r.State() != "closed" {
 		t.Fatalf("state=%s", r.State())
 	}
+}
+
+// Exercise the real ACK/MUX protocol even in the commit race unit tests.
+func completedLaunchServer(t *testing.T) *guestlink.LaunchServer {
+	t.Helper()
+	s := &guestlink.LaunchServer{Path: filepath.Join(t.TempDir(), "launch.sock"), Spec: &proto.LaunchSpec{Exec: "/bin/true"}, DeferLaunch: true}
+	if err := s.Listen(); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { _ = s.Serve(ctx); close(done) }()
+	t.Cleanup(func() { cancel(); s.Stop(); <-done })
+	c, err := net.Dial("unix", s.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if err := proto.WriteMessage(c, &proto.Message{Type: proto.TypeHello, Phase: "runtime_ready", InitialLaunchStateV1: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := proto.ReadMessage(c); err != nil {
+		t.Fatal(err)
+	}
+	if err := proto.WriteMessage(c, &proto.Message{Type: proto.TypeLaunchAck}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := proto.ReadMessage(c); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-s.MUXReady():
+	case <-time.After(time.Second):
+		t.Fatal("MUX gate did not open")
+	}
+	return s
 }

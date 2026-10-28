@@ -415,7 +415,7 @@ func TestLaunchServerDeferredRuntimeReadyAndLaunch(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer conn.Close()
-	if err := proto.WriteMessage(conn, &proto.Message{Type: proto.TypeHello, Phase: "runtime_ready"}); err != nil {
+	if err := proto.WriteMessage(conn, &proto.Message{Type: proto.TypeHello, Phase: "runtime_ready", InitialLaunchStateV1: true}); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -481,7 +481,7 @@ func TestLaunchServerDeferredStopUnblocksHello(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer conn.Close()
-	if err := proto.WriteMessage(conn, &proto.Message{Type: proto.TypeHello, Phase: "runtime_ready"}); err != nil {
+	if err := proto.WriteMessage(conn, &proto.Message{Type: proto.TypeHello, Phase: "runtime_ready", InitialLaunchStateV1: true}); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -538,7 +538,7 @@ func TestDeferredStopJoinsBlockedLaunchAck(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer conn.Close()
-	_ = proto.WriteMessage(conn, &proto.Message{Type: proto.TypeHello, Phase: "runtime_ready"})
+	_ = proto.WriteMessage(conn, &proto.Message{Type: proto.TypeHello, Phase: "runtime_ready", InitialLaunchStateV1: true})
 	<-srv.RuntimeReady()
 	if err := srv.SetSpec(&proto.LaunchSpec{Exec: "/app"}); err != nil {
 		t.Fatal(err)

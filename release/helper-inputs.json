@@ -1,7 +1,9 @@
 {
   "schema": 1,
   "recipe": "scripts/build-e2e-helpers.sh",
-  "dependencies": ["accelerator"],
+  "dependencies": [
+    "accelerator"
+  ],
   "helpers": [
     {
       "name": "artifact-ref",
@@ -31,6 +33,13 @@
       "env": "CGROUP_FORK_PROBE_BIN",
       "cases": [
         "sandbox.cgroup.sh"
+      ]
+    },
+    {
+      "name": "launch-recovery",
+      "env": "LAUNCH_RECOVERY_BIN",
+      "cases": [
+        "sandbox.launch-recovery.sh"
       ]
     }
   ]

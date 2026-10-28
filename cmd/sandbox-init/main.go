@@ -128,6 +128,7 @@ func main() {
 	if err != nil {
 		die("launch handshake: %v", err)
 	}
+	initialLaunch.begin(spec.InitialLaunchToken)
 	logf("runtime ready: launch spec received; assembling workload root")
 
 	if err := phaseWorkloadRoot(spec); err != nil {
@@ -162,6 +163,7 @@ func main() {
 	sup.appBackoff.onStart(time.Now())
 	sup.pluginReg.start(spec.Plugins)
 	supervisor.Store(sup)
+	initialLaunch.started(appPid)
 	if err := notifyAppStarted(appPid); err != nil {
 		logf("warn: app_started notify failed (continuing): %v", err)
 	}
@@ -382,7 +384,7 @@ func waitForLaunch() (*proto.LaunchSpec, *vsockConn, error) {
 		_ = conn.Close()
 		return nil, nil, err
 	}
-	if err := proto.WriteMessage(conn, &proto.Message{Type: proto.TypeHello, Phase: "runtime_ready"}); err != nil {
+	if err := proto.WriteMessage(conn, &proto.Message{Type: proto.TypeHello, Phase: "runtime_ready", InitialLaunchStateV1: true}); err != nil {
 		return fail(fmt.Errorf("send runtime_ready: %w", err))
 	}
 	msg, err := proto.ReadMessage(conn)
@@ -633,6 +635,7 @@ func phase3Supervise(s *supervisorState, b *consoleBridge, sigCh chan os.Signal)
 			}
 		case syscall.SIGTERM, syscall.SIGINT:
 			s.shutdown.Store(true) // stop any in-flight app restart from re-forking
+			initialLaunch.exited(0)
 			stopSig := s.stopSignal
 			if stopSig == 0 {
 				stopSig = syscall.SIGTERM
@@ -671,6 +674,7 @@ func handleAppExit(status syscall.WaitStatus, s *supervisorState, b *consoleBrid
 		go restartApp(s, b, delay)
 		return false
 	}
+	initialLaunch.exited(code)
 	logf("app exited code=%d signal=%d (restart=%s) — draining MUX, notifying host, rebooting", code, sig, s.spec.Restart)
 	b.appExited() // close app fds, flush guest→host streams (bounded)
 	notifyAppExited(code, sig)
@@ -747,6 +751,7 @@ func waitOrTimeout(pid int, timeout time.Duration) {
 }
 
 func doReboot() {
+	initialLaunch.exited(0)
 	guestUsage.close()
 	// POWER_OFF (not RESTART): the sandbox model is one-shot — when
 	// the user app exits, the sandbox is done and CH should exit too.
@@ -1029,6 +1034,7 @@ func logf(format string, args ...any) {
 }
 
 func die(format string, args ...any) {
+	initialLaunch.failed(fmt.Errorf(format, args...))
 	logf(format, args...)
 	os.Exit(1)
 }

@@ -1729,7 +1729,8 @@ through the bound backends.
 `Launch` accepts only one workload. Pure input/state validation may reject
 without consuming the opportunity. Once `launching` begins, failure or
 cancellation terminates the runtime; another workload cannot replace it. The
-acknowledged `app_started` transition commits launch success against Close,
+token-bound initial started fact, after the ACK/MUX barriers, commits launch
+success against Close,
 cancellation and CH exit. This retains existing startup readiness: it does not
 prove target execve success or application health. Waiting for assignment after
 `runtime_ready` is outside the launch execution timeout. Base runtimes retain
@@ -1737,13 +1738,42 @@ resource reservations, controller heartbeat and resource stats, but do not
 report workload ready or Settled before launch.
 
 The SDK cold-launch path waits for `launch_ack` under `launch.start_timeout`
-and the operation context. After ACK, `timeouts.app_start` bounds guest process
-bootstrap and receipt of `app_started` (default `2s`; explicit values must be
-positive). It is independent of `timeouts.app_notify`, the socket read deadline
-for one message. A missing event or canceled operation closes the runtime.
+and the operation context. Post-ACK `timeouts.app_start` is an optional overall
+deadline: omitted/empty/`0` adds none; positive opts into a bound; negative/invalid
+is a configuration error. Only positive values create a timer.
+`DefaultAppStartDeadline` remains a deprecated zero constant and must not be
+passed unconditionally to NewTimer. Socket `timeouts.app_notify` and other phase
+policies retain their own semantics.
 
-A readiness callback that remains blocked after launch has committed does not
-turn that success into an application-start timeout.
+Host supplies a unique initial Launch token. Guest records pending, started,
+failed or exited at the actual startup/termination boundary. The fast app_started
+notification and existing Pinger's verified Pong publish the same fact to one
+confirmation entry. PID presence, reachability and restore's fixed running field
+are insufficient. Success requires ACK and MUX; failed/terminal facts also end
+pre-ACK waiting. Old tokens are ignored, invalid states fail, and late started
+cannot overwrite a terminal error.
+
+Commit checks owner/operation cancellation, Runtime state, permanent read errors
+and the current fact under the existing readiness/Runtime lock order. It signals
+internal completion before the user callback. Blocked callbacks cannot strand
+Launch, Pinger Pause/Stop or management-connection join. Pinger only publishes a
+bounded fact; callbacks run outside its tick and after notification connection
+close. Success and timeout/cancel/exit retain one linearized result.
+
+New Launch requires `initial_launch_state_v1` in runtime-ready hello before
+LaunchSpec/apply. Build sandbox-init and runtime Bundle together, including any
+prewarmed Guest intended for a new Launch. Missing capability fails explicitly
+without a two-second fallback. Old Hosts ignore additive Guest fields. Ordinary
+restore of an existing application retains restore/attach semantics and does not
+consume an old token for a new Launch. Host upgrade cannot replace init inside
+an existing snapshot. Primary restart retains the completed initial fact and
+existing supervision/notifications.
+
+Default PingFatalThreshold remains zero. Indefinite recovery can retain resources
+until cancellation/Close, permanent failure or real VM exit. Positive AppStart or
+explicit PingFatal selects bounded termination and cannot simultaneously promise
+unlimited recovery. Portable artifacts exclude host policy; Builder retains its
+outer work deadline.
 
 Operation contexts bound startup, launch, restore, live operations and individual
 waits. Canceling a successfully completed startup/launch context cannot kill the
@@ -2829,6 +2859,14 @@ The original error is latched and the owner notified before cleanup I/O. While r
 ## 12. Validation, errors, and security
 
 ### 12.0 Runtime SDK lifecycle validation
+
+The initial-state regressions in [runtime_initial_launch_test.go](../pkg/sandbox/runtime_initial_launch_test.go)
+hold a real child after ACK across the old two-second window, drop app_started,
+and confirm the same Launch through Pong. They cover old tokens, terminal and
+protocol errors, and concurrent confirmations. Guest/Pinger tests verify coherent
+snapshots and EOF/Pause/Stop barriers. These are protocol/subprocess evidence,
+not real Guest kernel or trusted CI acceptance.
+
 
 Run `go test ./...` and `go test -race ./...`. The SDK regressions in
 [`runtime_sdk_test.go`](../pkg/sandbox/runtime_sdk_test.go) use real child processes
