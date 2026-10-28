@@ -206,8 +206,8 @@ DATA=$("$BIN/manifest-ctl" store --manifest-config "$WORK/manifest.yaml" --no-pr
 # debugfs resolves actual inode blocks; the fixture uses the canonical carrier
 # parser to validate logical geometry and the manifest table to select requests.
 # Manifest offsets address decoded disk bytes, not tarstream carrier positions.
-ENTRY_BLOCK=$(debugfs -R 'blocks /entry' "$WORK/data.raw" 2>/dev/null | awk '{print $1}')
-PAYLOAD_BLOCK=$(debugfs -R 'blocks /payload' "$WORK/data.raw" 2>/dev/null | awk '{print $257}')
+ENTRY_BLOCK=$(debugfs -R 'bmap /entry 0' "$WORK/data.raw" 2>/dev/null | awk '{print $1}')
+PAYLOAD_BLOCK=$(debugfs -R 'bmap /payload 256' "$WORK/data.raw" 2>/dev/null | awk '{print $1}')
 [ -n "$ENTRY_BLOCK" ] && [ -n "$PAYLOAD_BLOCK" ] || e2e_fail "missing physical file blocks"
 APP_KEYS=$("$LAUNCH_RECOVERY_BIN" keys "$WORK/data.manifest" "$WORK/data.img" "$((ENTRY_BLOCK*4096))" 4096)
 READ_KEYS=$("$LAUNCH_RECOVERY_BIN" keys "$WORK/data.manifest" "$WORK/data.img" "$((PAYLOAD_BLOCK*4096))" 4096)
