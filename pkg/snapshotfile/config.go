@@ -12,7 +12,7 @@ import (
 )
 
 // ReadConfig reads only snapshot.cfg and the bounded ZIP headers required to
-// locate it. It validates the canonical three-entry layout, limits and the
+// locate it. It validates the canonical three/four-entry layout, limits and the
 // selected entry's CRC. CPU/state bodies belong to execution restore, not a
 // checkpoint keep graph; they and the memory payload are never read here.
 // The caller retains stream ownership. Carrier authentication/retries remain
@@ -25,7 +25,13 @@ func ReadConfig(ctx context.Context, stream fetch.Stream) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	names := []string{ConfigJSONName, StateJSONName, SnapshotCfgName}
+	names, err := archiveNames(footer.Count)
+	if err != nil {
+		return nil, err
+	}
+	if stream.Size()-footer.Base > MaxTailBytes {
+		return nil, errors.New("snapshot config: canonical tail exceeds limit")
+	}
 	centralSize := uint64(0)
 	for _, name := range names {
 		centralSize += centralHeaderSize + uint64(len(name))
@@ -63,6 +69,15 @@ func ReadConfig(ctx context.Context, stream fetch.Stream) ([]byte, error) {
 		if binary.LittleEndian.Uint32(header) != localHeaderSignature || !bytes.Equal(header[4:26], h[6:28]) ||
 			binary.LittleEndian.Uint16(header[26:]) != uint16(len(name)) || binary.LittleEndian.Uint16(header[28:]) != 0 || string(header[30:]) != name {
 			return nil, errors.New("snapshot config: local/central header mismatch")
+		}
+		if name == MemoryDirtyName {
+			header, err := readAt(ctx, stream, local+headerSize, min(size, DirtyHeaderSize))
+			if err != nil {
+				return nil, err
+			}
+			if err := validateDirtyHeader(header, size, footer.Base); err != nil {
+				return nil, err
+			}
 		}
 		if name == SnapshotCfgName {
 			cfg, err = readAt(ctx, stream, local+headerSize, size)

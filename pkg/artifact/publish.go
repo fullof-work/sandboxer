@@ -533,7 +533,7 @@ func (p *Publisher) publishSnapshotRoot(ctx context.Context, identity string, sc
 	if err != nil {
 		return "", "", err
 	}
-	source, err := snapshotfile.BuildSource(root.Memory, root.ConfigJSON, root.StateJSON, newConfig)
+	source, err := snapshotfile.BuildSourceWithDirty(root.Memory, root.ConfigJSON, root.StateJSON, newConfig, root.MemoryDirty)
 	if err != nil {
 		return "", "", err
 	}
