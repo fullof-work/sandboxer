@@ -195,7 +195,7 @@ type handlerStats struct {
 	removeEventsBatched atomic.Uint64 // events that went through the batch path (avg events/syscall = removeEventsBatched / madviseCalls)
 	backendLookupMiss   atomic.Uint64 // EVENT_REMOVE with no backend VMA covering the offset (registration bug)
 
-	inflight        atomic.Int64 // faults currently being serviced (gauge; ≤ NumWorkers)
+	inflight        atomic.Int64 // faults currently being serviced (workers plus one reader WP attempt)
 	inflightHWM     atomic.Uint64
 	queueDepthHWM   atomic.Uint64
 	faultQueueWait  latHist
@@ -588,6 +588,15 @@ func (h *Handler) dispatch(msg *uffdMsg, fromFD int) {
 			_ = ioctlUffdWake(fromFD, pf.Address&^(PageSize-1), PageSize)
 			return
 		}
+		// WP resolves one already-materialized page without source I/O. Try it
+		// once here to avoid a worker handoff on every first guest write.
+		// drain has published every release in this read batch and opened the
+		// installation gate. EAGAIN still goes to the bounded worker retry
+		// queue: the reader must never wait for a future REMOVE event.
+		if pf.Flags&uffdPagefaultFlagWP != 0 &&
+			!h.handleFault(faultEvent{address: pf.Address, flags: pf.Flags, uffdFD: fromFD}, nil) {
+			return
+		}
 		idx := offset / PageSize
 		hashed := pageIdxHash(idx) % uint64(len(h.queue))
 		select {
@@ -957,7 +966,7 @@ func (h *Handler) Stats() map[string]uint64 {
 	}
 }
 
-// Inflight is the number of faults currently being serviced (≤ NumWorkers).
+// Inflight is the number of faults currently being serviced (≤ NumWorkers+1 (including the reader WP attempt)).
 func (h *Handler) Inflight() int64 { return h.stats.inflight.Load() }
 
 // QueueDepth is the number of faults enqueued but not yet picked up by a

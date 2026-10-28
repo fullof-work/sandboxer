@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kuasar-sandbox/sandboxer/pkg/memory"
+
 	"golang.org/x/sys/unix"
 )
 
@@ -182,6 +184,117 @@ func TestWPRetryDrainsQueueBeforeRelease(t *testing.T) {
 			time.Sleep(3 * time.Millisecond)
 			if attempts.Load() != before {
 				t.Fatal("ioctl after Close")
+			}
+		})
+	}
+}
+
+// A first write to a protected resident page must not wait for another worker
+// to be scheduled. Only mmap_changing/EAGAIN needs the asynchronous retry path.
+func TestWPDispatchAttemptsOnceBeforeQueue(t *testing.T) {
+	for _, result := range []struct {
+		name   string
+		err    error
+		queued int
+	}{{"complete", nil, 0}, {"retry", unix.EAGAIN, 1}, {"fatal", unix.EIO, 0}} {
+		t.Run(result.name, func(t *testing.T) {
+			h := newUnitHandler(t, 2*PageSize, ZeroSource{})
+			defer h.cancel()
+			var err error
+			h.cfg.Dirty, err = memory.NewDirty(2 * PageSize)
+			if err != nil {
+				t.Fatal(err)
+			}
+			h.writeProtect = map[int]bool{unitFD: true}
+			h.queue = []chan faultEvent{make(chan faultEvent, 1)}
+			h.state.Set(0, StateLoaded)
+			calls := 0
+			h.ops.writeProtect = func(fd int, va, length uint64, protect bool) error {
+				calls++
+				if fd != unitFD || va != unitCHVA || length != PageSize || protect || !h.cfg.Dirty.Contains(0) {
+					t.Fatal("unprotect without exact ownership and prior dirty publication")
+				}
+				return result.err
+			}
+			var msg uffdMsg
+			msg.Event = uffdEventPagefault
+			binary.LittleEndian.PutUint64(msg.Arg[0:8], uffdPagefaultFlagWP)
+			binary.LittleEndian.PutUint64(msg.Arg[8:16], unitCHVA)
+			h.dispatch(&msg, unitFD)
+			if calls != 1 || len(h.queue[0]) != result.queued {
+				t.Fatalf("attempts=%d queued=%d", calls, len(h.queue[0]))
+			}
+			if h.state.Get(0) != StateLoaded || h.cfg.Dirty.Contains(PageSize) {
+				t.Fatal("WP changed content state or marked a clean neighbor")
+			}
+			if result.err == unix.EIO && h.ctx.Err() == nil {
+				t.Fatal("permanent WP failure not fatal")
+			}
+		})
+	}
+}
+
+// The reader acknowledges the whole kernel batch before handling faults. A WP
+// appearing before REMOVE/UNMAP in that batch must observe the release first.
+func TestWPDispatchObservesEntireReleaseBatch(t *testing.T) {
+	for _, event := range []byte{uffdEventRemove, uffdEventUnmap} {
+		t.Run(map[byte]string{uffdEventRemove: "remove", uffdEventUnmap: "unmap"}[event], func(t *testing.T) {
+			var pipe [2]int
+			if err := unix.Pipe2(pipe[:], unix.O_NONBLOCK|unix.O_CLOEXEC); err != nil {
+				t.Fatal(err)
+			}
+			defer unix.Close(pipe[1])
+			memfd, err := unix.MemfdCreate("wp-batch", unix.MFD_CLOEXEC)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer unix.Close(memfd)
+			if err := unix.Ftruncate(memfd, 2*PageSize); err != nil {
+				t.Fatal(err)
+			}
+			m := NewAddressMap(2 * PageSize)
+			if err := m.RegisterVMA(ProcessCH, unitCHVA, 2*PageSize, 0); err != nil {
+				t.Fatal(err)
+			}
+			h, err := NewWithBackendUffd(pipe[0], m, Config{MemfdFD: memfd, Size: 2 * PageSize, Source: ZeroSource{}, WriteProtect: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer h.Close()
+			calls := 0
+			h.ops.writeProtect = func(int, uint64, uint64, bool) error {
+				calls++
+				if !h.released.Contains(0) || !h.cfg.Dirty.Contains(0) {
+					t.Error("unprotect preceded release or dirty publication")
+				}
+				return nil
+			}
+			// Deliberately place WP first in one complete read batch.
+			var raw [64]byte
+			raw[0] = uffdEventPagefault
+			binary.LittleEndian.PutUint64(raw[8:], uffdPagefaultFlagWP)
+			binary.LittleEndian.PutUint64(raw[16:], unitCHVA)
+			raw[32] = event
+			binary.LittleEndian.PutUint64(raw[40:], unitCHVA)
+			binary.LittleEndian.PutUint64(raw[48:], unitCHVA+PageSize)
+			if n, err := unix.Write(pipe[1], raw[:]); err != nil || n != len(raw) {
+				t.Fatalf("write=%d %v", n, err)
+			}
+			done := make(chan struct{})
+			go func() { h.drain(pipe[0], make([]byte, len(raw)), 32); close(done) }()
+			select {
+			case <-done:
+			case <-time.After(3 * time.Second):
+				t.Fatal("reader held release gate during WP")
+			}
+			if !h.released.Contains(0) {
+				t.Fatal("release missing")
+			}
+			if event == uffdEventRemove && (calls != 1 || h.ctx.Err() != nil) {
+				t.Fatalf("remove: attempts=%d err=%v", calls, h.ctx.Err())
+			}
+			if event == uffdEventUnmap && (calls != 0 || h.ctx.Err() == nil) {
+				t.Fatalf("unmap: attempts=%d err=%v", calls, h.ctx.Err())
 			}
 		})
 	}
