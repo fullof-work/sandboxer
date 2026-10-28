@@ -1156,6 +1156,7 @@ Snapshot S layout:
   config.json
   state.json
   snapshot.cfg
+  memory.dirty  (optional)
 ]
 ```
 
@@ -1171,6 +1172,17 @@ from_refs:
 `sandbox_ref` 指向同一 freeze point 生成的 E. `from_refs` 是 top-to-bottom memory parent chain. S 不重复 capacity、runtime、root/data graph、launch、mounts、files、init 或 metadata.
 
 Snapshot ZIP 与 config 同样 strict、bounded、canonical。`config.json` 和 `state.json` 各限 16 MiB，`snapshot.cfg` 限 1 MiB，`from_refs` 最多 64 项。源码见 [snapshotfile.go](../pkg/snapshotfile/snapshotfile.go) 和 [snapshot/config.go](../pkg/snapshot/config.go)。旧 disk-schema input 返回 `unsupported snapshot format/version`,不 dual-read、不 migration、不 cold fallback.
+
+`memory.dirty` 可选：缺失表示本层全部显式 Data/Zero 都是 dirty；存在且全零表示没有
+脏页。正常恢复始终读取完整 memory，包括 clean 副本。条目先写 16 字节小端头部：
+`uint32 version=1`、`uint32 page_shift=12`、`uint64 memory_size`，再写每个 4 KiB
+页一位的 bitset，低位优先，尾部无效位必须为零。每个置位页必须由 Data/Zero 完整覆盖，
+可跨多个 run。无条目的旧层保留原 byte geometry。`snapshot.cfg` version 仍为 1。
+
+完整 ZIP 尾部含所有 header、directory 和 footer，上限 64 MiB。`ReadConfig` 校验
+完整几何与 cfg CRC，仅读取 dirty 的 16 字节头部；完整 reader 另校验位图 CRC 与覆盖。
+等价 publish/copy/rebase 原样保留条目存在性及 body；未验证 rewrite 或内容裁减保守
+使用全 dirty。内容或位图变化都会生成新 identity。
 
 ## 4. 资源模型
 
@@ -1707,12 +1719,31 @@ owner，验证完整保留集，再通过 metadata backend 分批删除无用版
 需要的 DIFF。已有 read pin 延后物理回收。此过程不打开活动 Disk，也不解密
 guest 页；保留集或目录身份检查失败时不会开始修改。
 
-`merge_ref=false` 独立记录本轮驻留工作集。已有 `S1 -> S0` 时，下一次捕获先流式生成新的
-不可变历史 Snapshot `S1′ = S1(memory) 覆盖 S0(memory)`，再写出
-`S2(当前工作集) -> S1′`。后续本地捕获重复该组合，最新 S 下最多保留一个本沙箱拥有的本地
-内存 lower。`merge_ref=true` 将当前驻留内存与整个可合并本地前缀合并；false → true → false
-切换同样收敛。reader 仍支持旧的多层输入。恢复执行状态和 `sandbox_ref` 只来自最新 S，
-历史 S 只提供 memory。
+运行基线 B 固定于 cold start 或 restore。实例的 D（dirty）与 R（released）累计保存，
+成功/失败 capture 和模式切换均不清空。pause、backend quiesce、CH 状态写入及最终日志
+采集完成后，CaptureView 在 UFFD install gate 下固定驻留页 M。变化层 C 为 D∩M 的
+Data 加 R\M 的 Zero；工作集 W 为全部 M 的 Data 加 R\M 的 Zero。其他 dirty hole
+仍继承 B，不能任意补零。
+
+`merge_ref=true`（默认）将 C 与裁剪后的本地历史 H 合成；false 独立输出 W，标记其
+clean 副本，并仍将历史裁剪成 H，单父层也适用。历史先合并有效 dirty 候选得到 U，
+再从原始完整有序视图 V 取得最终 Data/Zero。只有层声明的完整有序父身份等于实际后缀
+才使用 clean 标注，否则该层保守全 dirty；兄弟层不能当成已证明祖先。最新 S 下最多
+保留一个 owned 本地内存 lower，false → true → false 同样收敛。只有最新 S 提供
+执行状态和 `sandbox_ref`。
+
+本地 tarstream 写入前只扫描元数据，检查 1 TiB payload、含 sentinel 的 `1<<20`
+extent 以及 256 MiB 索引内存计费预算；Bundle/ingest 沿用各自载体上限。碎片超限
+按制品使用旧未裁剪二态覆盖 P 和完整三态真值 F：P 内输出 Data，字节取 F；P 外只
+保留必要 Zero 或 Hole。true self 的 P 是当前 M 加完整 owned 历史；false H 仅用
+完整 owned 历史；false self 仅用当前 M，不能填外部 hole。额外 Data 全 dirty，只有
+此退化允许 Zero-as-Data；退化后仍超限则报错。仅新 capture 可因新增 bitmap 单独
+导致 ZIP 超限而明确省略它、将显式内容全计 dirty，普通发布不能删。日志记录原因、
+载体退化的额外 Data、Data/bitmap/ZIP 字节及 FileSink 物理字节。父视图未证明的退化
+单独报告相对仅位图候选的额外逻辑 Data/Zero，从最终 V 取值，并扣除当前 C 的重叠；
+该诊断差集不能授权裁剪未证明的层。ZIP 已含 bitmap body，逻辑 Zero 不等于物理存储。
+尺寸比较还须计 H 和按 identity
+去重后的可达本地制品总量。
 
 前缀必须属于当前沙箱的规范 `BaseDir/checkpoint`。先按完整来源绑定和 Bundle 实际成员选择
 物理载体，再比较路径。named location 或外部模板是边界，即使文件可在本机读取、甚至映射

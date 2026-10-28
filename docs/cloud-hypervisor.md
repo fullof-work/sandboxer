@@ -97,7 +97,7 @@ The memory-backing and external-fault-handler contracts are:
   Externally owned backing does not itself require uffd.
 - **Both `fd` and `uffd_socket` are set**: in addition to the backing behavior,
   CH performs `userfaultfd()` → `UFFDIO_API` →
-  `UFFDIO_REGISTER MISSING on chVA` → `connect uffd_socket` →
+  `UFFDIO_REGISTER MISSING (plus negotiated WP) on chVA` → `connect uffd_socket` →
   `sendmsg(va_report; SCM_RIGHTS=uffd_fd)` → wait for acknowledgement.
   vCPUs must not run before the acknowledgement.
 
@@ -278,67 +278,21 @@ that deterministic ordering. Run both with the prepared source/artifact contract
 and the existing KVM pressure coverage, including the Linux 5.10 floor. These are
 validation requirements, not a claim that an unexecuted run passed.
 
-### 3.4 0004 — skip hole-only runs during balloon release
+### 3.4 0004 — balloon hole probing (ordering superseded by 0013)
 
-Subject: **virtio-devices: balloon — skip PUNCH_HOLE/MADV_DONTNEED on already-sparse
-user-managed ranges**.
+0004 introduced SEEK_DATA for file-backed RAM and allowed SYS_lseek in the
+balloon thread. Patch 0013 retains that probe but requires chVA MADV_DONTNEED
+even for an entirely sparse interval: an unmaterialized restore hole may still
+inherit nonzero parent content, so logical release must notify the handler.
 
-Changed files: `virtio-devices/src/balloon.rs` and
-`virtio-devices/src/seccomp_filters.rs`.
-
-**Background**: balloon allocation in the configured guest does not request
-`__GFP_ZERO`, and the platform guest configuration does not enable `init_on_alloc`.
-The inflate path updates page metadata and PFN arrays rather than zeroing every
-returned page. The externally managed zone is not prefaulted. Offsets never
-previously touched by the guest can therefore still be holes in the memfd, with
-no inode page or PTE in either process. This does not mean every balloon page at
-cold start is necessarily a hole: the guest can have touched and released pages
-before handing them to the balloon.
-
-Without the probe, CH calls `release_memory_range` for each returned run:
-`fallocate(PUNCH_HOLE|KEEP_SIZE)` on the memfd plus `madvise(MADV_DONTNEED)` on chVA.
-In the documented uffd model, `MADV_DONTNEED` produces an `EVENT_REMOVE` even for an
-already empty range and waits for the external handler to consume it. Inflating
-across sparse `Capacity − InitialBudget` memory can thus create unnecessary
-serialized work and back-pressure the balloon thread. The chVA `MADV_DONTNEED`,
-not merely the memfd `fallocate`, is the source of this handshake, so avoiding it
-requires skipping both operations for an empty run.
-
-**Mechanism**:
-
-- For a region with a file offset, `release_memory_range` probes
-  `[file_off, file_off + len)` with `lseek(fd, file_off, SEEK_DATA)`:
-  - `ENXIO`, or a next-data offset at or beyond `file_off + len`, means the whole
-    run is a hole. Skip both `fallocate` and `madvise` and return `Ok(())`.
-  - Data within the run retains the ordinary `PUNCH_HOLE` plus
-    `MADV_DONTNEED` release of the complete run.
-  - Other `lseek` errors fall through to the ordinary release path; they are not
-    interpreted as proof that the range is empty.
-- The actual predicate is `region.file_offset().is_some()`, not the
-  `user_managed` flag. The probe can also apply to other file-backed regions.
-  Regions without a file offset retain the original path.
-- In the platform memfd use, CH uses mappings and explicitly positioned
-  `fallocate`, not reads/writes dependent on the shared file position. Moving the
-  position for the probe therefore does not change that data path.
-- **Seccomp**: the balloon thread adds `SYS_lseek` to its allowlist. `fallocate`
-  was already allowed and `madvise` comes from the virtio common set. Without this
-  addition, the first probe could terminate the thread with `SIGSYS`.
-
-**Correctness**: only a run found to contain no data is skipped. A resident run
-that actually requires reclaiming retains the release operations. For the
-untouched external-memory holes described above, the suppressed backendVA
-reclaim would itself be a no-op, so the final host-memory state is unchanged.
-
-**Effect and tradeoffs**: on the x86_64 4 KiB path, where `pbp` batching is bypassed,
-releasing an entirely sparse balloon interval without the probe can entail about
-`inflated bytes / 4 KiB` synchronous handler handshakes. The probe substitutes a
-local `lseek` for those unnecessary release operations. Pages still resident from
-previous guest activity are not skipped. Guest-exit unmapping and its events are
-separate from inflation. On this path, probing can still cost one `lseek` per
-page; it avoids the corresponding empty-range `madvise`, handler handshake, and
-shared-inode invalidation work. The hole fraction and convergence time depend on
-the workload and environment; this specification makes no universal 99% hole-rate
-or instantaneous-convergence claim.
+The current order is **chVA MADV_DONTNEED → SEEK_DATA → necessary PUNCH_HOLE**.
+Reading REMOVE publishes R before acknowledging the release. The probe avoids
+an unnecessary inode punch; it cannot suppress the logical release event.
+MADV or punch failures fail the operation, preserving any accumulated R/D.
+SEEK_DATA returning ENXIO means no Data remains; other SEEK errors conservatively
+proceed with PUNCH_HOLE. The
+handler reads events, records R/D and publishes Released under installMu, the
+same gate used by installers and CaptureView.
 
 ### 3.5 0005 — persist the vsock host local-port cursor
 
@@ -489,6 +443,38 @@ by the ordinary full E2E selection. Retain the native architecture and product
 provenance; cross-compilation alone does not exercise KVM resume. A successful
 small sample does not establish a failure rate or diagnose unrelated restore
 errors.
+
+### 3.10 0013–0014 — cumulative dirty memory and atomic clean installation
+
+Externally managed RAM enables MemoryManager-level KVM dirty logging during
+initialization. Existing software bits are accumulated first, without the VM
+migration hook that resets them. `GET /api/v1/vm.dirty-memory` returns version=1,
+page_shift=12, and each slot's GPA, size, memfd file_offset and cumulative u64
+bitmap. Every consumed source/slot is ORed into persistent state before reading
+the next or responding. A failed slot is made all dirty before returning its
+error. Patch 0014 validates the complete coordinate map before consuming any
+logs; changed registrations conservatively retain all known regions before
+returning an error. Lost responses and repeated collection never clear the accumulator.
+Go reads the complete bounded HTTP response, validates region coverage, overlap,
+offsets and unused bits, then converts into memfd coordinates. Raw net/vsock
+writable aliases and Go vhost DMA/status/used-ring writes mark their ranges
+before exposure, including partially failed writes.
+
+va_report v1 carries page_shift, file_offset and copy_mode_wp; its ACK confirms
+the negotiated result. On x86 with shmem WP support, registration uses MISSING|WP
+and every clean Data, Zero, parent Hole, tail and EnsureLoaded installation uses
+atomic COPY_MODE_WP. A separate WP branch marks D before unprotecting, without
+missing-page refill. EAGAIN returns the worker to its event queue; retries are
+page-deduplicated, RAM-bounded and rotated in small batches, so a full WP queue
+cannot prevent the reader from reaching REMOVE/UNMAP. Native 4 KiB ARM uses MISSING and KVM logging. Unsupported
+x86 WP conservatively marks materialized pages dirty and reports the fallback;
+larger host pages are rejected.
+
+After pause, backend quiesce, CH snapshot writes and final log collection,
+CaptureView fixes M/D/R. UNMAP, registration gaps, broken event streams, or a
+Loaded page becoming Hole without release fail capture. Success, failure and
+merge_ref switches never reset D/R; existing lifecycle and exec/stdio barriers
+remain in force. See [Snapshot S and history](sandbox.md#snapshot-format).
 
 ## 4. Build workflow
 

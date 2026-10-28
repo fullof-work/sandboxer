@@ -190,6 +190,12 @@ func DataCoverage(source sparse.Source) sparse.Source {
 // BuildCaptureSource is exclusively for new capture artifacts. Equivalent
 // publication continues using BuildSourceWithDirty and never drops metadata.
 func BuildCaptureSource(ctx context.Context, sink ArtifactSink, mem sparse.Source, dirty, config, state, cfg []byte, coverage, values, proofCandidates sparse.Source, logf func(string, ...any)) (sparse.Source, MemoryStorage, error) {
+	return buildCaptureSource(ctx, sink, mem, dirty, config, state, cfg, coverage, values, proofCandidates, logf, memoryExtentBudget, memoryIndexBudget)
+}
+
+// The production entry point fixes both limits. Explicit internal limits let
+// carrier integration tests exercise full outputs at tractable payload sizes.
+func buildCaptureSource(ctx context.Context, sink ArtifactSink, mem sparse.Source, dirty, config, state, cfg []byte, coverage, values, proofCandidates sparse.Source, logf func(string, ...any), extentLimit, indexLimit uint64) (sparse.Source, MemoryStorage, error) {
 	var stats MemoryStorage
 	if proofCandidates != nil {
 		stats.ParentProofFallback = "parent view unproved; retaining all explicit content"
@@ -215,7 +221,7 @@ func BuildCaptureSource(ctx context.Context, sink ArtifactSink, mem sparse.Sourc
 		return nil, stats, err
 	}
 	if _, file := sink.(*FileSink); file {
-		err = checkMemoryCarrier(ctx, source, memoryExtentBudget, memoryIndexBudget)
+		err = checkMemoryCarrier(ctx, source, extentLimit, indexLimit)
 		if errors.Is(err, errMemoryBudget) {
 			reason := err.Error()
 			mem, err = MemoryFallback(mem, coverage, values)
@@ -227,7 +233,7 @@ func BuildCaptureSource(ctx context.Context, sink ArtifactSink, mem sparse.Sourc
 			if err != nil {
 				return nil, stats, err
 			}
-			if err = checkMemoryCarrier(ctx, source, memoryExtentBudget, memoryIndexBudget); err != nil {
+			if err = checkMemoryCarrier(ctx, source, extentLimit, indexLimit); err != nil {
 				return nil, stats, fmt.Errorf("memory fallback still exceeds carrier budget: %w", err)
 			}
 			if stats.Fallback != "" {

@@ -81,7 +81,7 @@ CH `--memory-zone` 增加两个 key:
 - **仅写 fd**:CH 把 fd 当 backing,跳过 memfd_create;snapshot 时跳过 dump;
   restore 时不 fill。这条独立成立(无 uffd 仍可外部托管)
 - **fd + uffd_socket 同时写**:在 fd 行为基础上叠加,CH 内 `userfaultfd()`
-  → `UFFDIO_API` → `UFFDIO_REGISTER MISSING on chVA` → `connect uffd_socket`
+  → `UFFDIO_API` → `UFFDIO_REGISTER MISSING (plus negotiated WP) on chVA` → `connect uffd_socket`
   → `sendmsg(va_report; SCM_RIGHTS=uffd_fd)` → 等 ack。ack 之前 vCPU 不允许
   跑
 
@@ -238,50 +238,17 @@ guest 的 pinning/prefetch 可能填充候选页，因此 E2E 本身不能证明
 结合现有 KVM 内存压力覆盖执行两类测试，并验证 Linux 5.10 最低版本。
 这些是验证要求，不代表尚未执行的测试已经通过。
 
-### 3.4 0004 — balloon release 跳过 user-managed zone 的空洞 run
+### 3.4 0004 — balloon 空洞探测（当前顺序由 0013 修正）
 
-主题:**virtio-devices: balloon — skip PUNCH_HOLE/MADV_DONTNEED on already-sparse
-user-managed ranges**
+0004 引入 file-backed RAM 的 SEEK_DATA 探测及 balloon 线程 `SYS_lseek`
+seccomp 放行。0013 保留探测，但不再跳过空洞区间的 chVA `MADV_DONTNEED`：
+restore 的未物化 Hole 可能仍继承父层非零内容，逻辑释放必须先通知 handler。
 
-改动文件:`virtio-devices/src/balloon.rs` / `virtio-devices/src/seccomp_filters.rs`
-
-**背景**。配置中的 guest balloon 分配不带 `__GFP_ZERO`,平台 guest 内核未启用
-`init_on_alloc`;inflate 路径修改 page 元数据与 PFN 数组,而非把交还的每页清零。
-外部托管 zone 不做 prefault,因此 guest 此前从未访问的 offset 可能仍是 memfd 空洞,
-没有 inode 页,两个进程也没有相应 PTE。但这不代表冷启动交给 balloon 的每一页都必然是
-空洞:guest 可能已经访问并释放过其中一部分页。
-
-不做探测时,CH 对每个交还 run 调用 `release_memory_range`:
-memfd 上的 `fallocate(PUNCH_HOLE|KEEP_SIZE)` 加 chVA 上的 `madvise(MADV_DONTNEED)`。
-在这里的 uffd 模型中,即使范围已空,后者仍产生 `EVENT_REMOVE` 并等待外部 handler
-消费。对稀疏的 `Capacity − InitialBudget` 区间充气会产生多余串行握手并反压 balloon
-线程。该握手来自 chVA 的 `MADV_DONTNEED`,不只是 memfd 的 fallocate,所以对空 run
-必须同时跳过两者。
-
-**机制**:
-
-- 对具有 file offset 的 region,`release_memory_range` 使用
-  `lseek(fd, file_off, SEEK_DATA)` 探测 `[file_off, file_off + len)`:
-  - `ENXIO`,或下一数据 offset `≥ file_off + len`:整段为空洞,跳过 fallocate 和 madvise,
-    直接 `Ok(())`。
-  - run 内有数据:保持覆盖整段的 `PUNCH_HOLE` + `MADV_DONTNEED`。
-  - 其他 lseek 错误:落回原 release 路径,不能把错误当作范围为空的证据。
-- 实际条件为 `region.file_offset().is_some()`,而不是 `user_managed` 标志;
-  其他 file-backed region 也可能进入探测。没有 file offset 的 region 保持原路径。
-- 平台对 memfd 使用 mmap 与显式 offset 的 fallocate,不依赖共享文件位置进行读写;
-  lseek 修改文件位置不影响该数据路径。
-- **seccomp**:balloon 线程增加 `SYS_lseek`。fallocate 已在 allowlist 中,madvise 来自
-  virtio 公共集合;缺少新增项时第一次探测可能触发 SIGSYS。
-
-**正确性**:只跳过探测为空的 run;真正需要回收的驻留数据仍执行完整 release。
-对前述从未触碰的外部内存空洞,被抑制的 backendVA reclaim 本身也是 no-op,
-所以 host 内存终态不变。
-
-**效果与取舍**:x86_64 4 KiB 路径绕过 pbp 批处理时,若不探测,完全稀疏的充气区间
-可能产生约 `充气字节 / 4 KiB` 次同步 handler 握手。探测用本地 lseek 替代这些多余操作;
-guest 先前访问后仍驻留的页不会被跳过。guest 退出时 unmap 及其事件独立于充气阶段。
-该路径仍可能每页执行一次 lseek,但避免对应空范围的 madvise、handler 握手和共享 inode
-失效工作。空洞比例及收敛时间取决于工作负载与环境,本文不作普遍 99% 空洞率或瞬时收敛承诺。
+当前 release 顺序为 **chVA MADV_DONTNEED → SEEK_DATA → 必要的 PUNCH_HOLE**。
+即使整个区间已稀疏，也先等待 REMOVE 被读取并发布 R。探测只能避免 inode 的
+无效 punch，不能省掉逻辑释放事件。MADV 或 punch 失败走错误路径；SEEK_DATA 返回 ENXIO 表示没有 Data，其他 SEEK 错误则保守继续 PUNCH_HOLE。已累计 R/D
+不回退。handler 在 installMu 下同时读取事件、记录 R/D 和发布 Released 状态，
+从而让事件 ACK、后台填充和 CaptureView 使用同一个顺序边界。
 
 ### 3.5 0005 — 持久化 vsock host local-port 游标
 
@@ -402,6 +369,32 @@ identity；不具备对应身份的既有二进制不能用于验证回移。重
 `sandbox.memory-budget` 恢复、pause/wake，以及保留当前 direct-I/O 完整性断言的
 `snapshot.restore`，之后执行普通全量 E2E。记录原生架构和产品来源；仅交叉编译不会
 执行真实 KVM resume。小样本成功不能确定故障率，也不能据此诊断其他恢复错误。
+
+### 3.10 0013–0014 — 累计 dirty memory 与原子 clean 填充
+
+每个外部托管 RAM 实例初始化时就启用 MemoryManager 级 KVM dirty logging，
+先消费并累计已有软件 bitmap，不调用会清空软件记录的 VM migration hook。
+`GET /api/v1/vm.dirty-memory` 返回 version=1、page_shift=12 以及每个 slot 的
+GPA、size、memfd file_offset 和累计 u64 bitmap。各来源/slot 消费后立即 OR 到
+实例累计集合，再处理下一个 slot 或返回响应；失败 slot 先全 dirty 再报错。
+响应丢失或重复采集不清空累计集合。Go 端使用完整、有界 HTTP 读取并验证 region
+覆盖/重叠/偏移与尾部无效位后转换成 memfd 坐标。net/vsock 原始可写别名和 Go
+vhost 的 DMA/status/used-ring 写入在暴露缓冲区前标记范围，部分失败不会撤销记录。
+
+0014 在消费日志前先检查完整坐标映射；注册变化时先把全部已知 region 保守标脏再报错。
+WP 遇到 EAGAIN 后立即归还 worker，以按页去重、RAM 页数有界的小批轮转队列重试，
+避免满 WP 队列阻止 reader 读取 REMOVE/UNMAP；每次重试仍先校验注册并记 D。
+
+va_report v1 显式传 page_shift、file_offset 和 copy_mode_wp，ACK 回显协商结果。
+x86 有 shmem WP 能力时注册 MISSING|WP，所有 clean Data、Zero、父 Hole、tail
+和 EnsureLoaded 填充都原子使用 COPY_MODE_WP。WP fault 单独分支先标记 D 再
+unprotect，不走 missing refill。4 KiB ARM 使用 MISSING 和原生 KVM 日志；x86
+能力不足时将物化页保守计 dirty 并记录退化。更大 host page 被明确拒绝。
+
+捕获在 pause、backend quiesce、CH snapshot 写入及日志采集后取得固定 M/D/R。
+UNMAP、registration 缺口、事件流损坏、Loaded 无 release 却变 Hole 均使捕获
+报错。D/R 不因捕获成功、失败或 merge_ref 切换清空；生命周期和 exec/stdio 屏障
+仍沿用既有流程。S 编码及历史裁剪见 [sandbox.md 中文版](sandbox_zh.md#snapshot-format)。
 
 ## 4. 构建工作流
 

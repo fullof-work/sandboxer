@@ -3,8 +3,11 @@ package snapshot
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
@@ -168,4 +171,165 @@ func TestDirtyMemoryFileBundleIngestRoundTrip(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestMemoryFallbackArtifactRolesThroughFileCarrier(t *testing.T) {
+	ctx := context.Background()
+	h := sparse.Hole
+	d := sparse.Data
+	z := sparse.Zero
+	history := pageMemory([]sparse.RunKind{h, h, d, z, d, d, h, h}, []byte{0, 0, 2, 0, 4, 5, 0, 0})
+	selected := pageMemory([]sparse.RunKind{h, h, d, h, d, h, h, h}, []byte{0, 0, 2, 0, 4, 0, 0, 0})
+	current := pageMemory([]sparse.RunKind{d, h, h, h, h, h, z, h}, []byte{9, 0, 0, 0, 0, 0, 0, 0})
+	working := pageMemory([]sparse.RunKind{d, d, h, h, h, h, z, h}, []byte{9, 1, 0, 0, 0, 0, 0, 0})
+	for _, role := range []string{"true-self", "false-H", "false-self"} {
+		t.Run(role, func(t *testing.T) {
+			var required, coverage, values sparse.Source = selected, history, history
+			limit := uint64(3)
+			expected := []sparse.RunKind{h, h, d, d, d, d, h, h}
+			if role == "true-self" {
+				required = fetch.NewLayered(memoryBorrow{current}, memoryBorrow{selected})
+				coverage = fetch.NewLayered(memoryBorrow{DataCoverage(working)}, memoryBorrow{history})
+				values = fetch.NewLayered(memoryBorrow{working}, memoryBorrow{history})
+				expected = []sparse.RunKind{d, d, d, d, d, d, z, h}
+				limit = 4
+			} else if role == "false-self" {
+				// W already has every M byte. Converting its required Zero outside M
+				// cannot reduce fragmentation without expanding P; reject such a limit.
+				required = pageMemory([]sparse.RunKind{d, h, d, h, d, h, z, h}, []byte{9, 0, 2, 0, 4, 0, 0, 0})
+				coverage = DataCoverage(required)
+				values = required
+			}
+			sink := NewFileSink(t.TempDir(), role, nil, false, nil)
+			defer sink.Close()
+			source, stats, err := buildCaptureSource(ctx, sink, required, nil, []byte("{}"), []byte("{}"), []byte("{}"), coverage, values, nil, nil, limit, memoryIndexBudget)
+			if role == "false-self" {
+				if err == nil || !strings.Contains(err.Error(), "still exceeds") {
+					t.Fatalf("expanded false W to escape budget: %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantExtra := uint64(2 * 4096)
+			if role == "true-self" {
+				wantExtra = 3 * 4096
+			}
+			if stats.Fallback == "" || stats.ExtraDataBytes != wantExtra {
+				t.Fatalf("fallback costs %+v", stats)
+			}
+			ref, path, err := sink.AbsorbSnapshot(ctx, source)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = sink.CommitSnapshot(ctx, ref, path); err != nil {
+				t.Fatal(err)
+			}
+			stream, err := fetch.OpenTarStream(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			root, err := snapshotfile.Open(ctx, stream)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer root.Close()
+			if root.MemoryDirty != nil {
+				t.Fatal("extra fallback Data is not all dirty")
+			}
+			for page, kind := range expected {
+				r, e := root.Memory.RunAt(uint64(page)*4096, 4096)
+				if e != nil || r.Kind() != kind {
+					t.Fatalf("%s page %d: %v %v", role, page, r, e)
+				}
+			}
+			// The retained external page is supplied only by E on both sides.
+			external := pageMemory([]sparse.RunKind{h, h, h, h, h, h, h, d}, []byte{0, 0, 0, 0, 0, 0, 0, 77})
+			actual := fetch.NewLayered(root.Memory, memoryBorrow{external})
+			wantSource := fetch.NewLayered(memoryBorrow{values}, memoryBorrow{external})
+			got, want := make([]byte, 8*4096), make([]byte, 8*4096)
+			if _, err = actual.ReadAt(ctx, got, 0); err != nil {
+				t.Fatal(err)
+			}
+			if _, err = wantSource.ReadAt(ctx, want, 0); err != nil || !bytes.Equal(got, want) {
+				t.Fatal("complete fallback bytes differ", err)
+			}
+			t.Logf("role=%s bytes=%d extra_data=%d reason=%s", role, stats.DataBytes, stats.ExtraDataBytes, stats.Fallback)
+		})
+	}
+}
+
+func TestFalseWorkingSetBitmapBudgetFallbackWritesCompleteCarrier(t *testing.T) {
+	ctx := context.Background()
+	const size = uint64(1 << 40)
+	// The logical size creates a 32 MiB bitmap, but only one Data page is owned.
+	// Validate the full sparse map plus every explicit byte, without reading a
+	// trillion implicit zeros or widening the working-set ownership boundary.
+	working := &memorySource{size: size, resolve: func(off, limit uint64) (sparse.Run, error) {
+		if off < 4096 {
+			return memoryRun{off: off, end: min(off+limit, 4096), kind: sparse.Data, read: func(_ context.Context, b []byte, _ uint64) (int, error) {
+				for i := range b {
+					b[i] = 0x79
+				}
+				return len(b), nil
+			}}, nil
+		}
+		return memoryRun{off: off, end: off + limit, kind: sparse.Hole}, nil
+	}}
+	dirty, err := snapshotfile.EncodeDirty(size, make([]byte, size/4096/8))
+	if err != nil {
+		t.Fatal(err)
+	}
+	config, state := bytes.Repeat([]byte{' '}, 16<<20), bytes.Repeat([]byte{' '}, 16<<20)
+	copy(config, "{}")
+	copy(state, "{}")
+	if _, err = snapshotfile.BuildSourceWithDirty(working, config, state, []byte("{}"), dirty); !errors.Is(err, snapshotfile.ErrTailBudget) {
+		t.Fatal("ordinary reconstruction removed bitmap", err)
+	}
+	sink := NewFileSink(t.TempDir(), "false-top", nil, false, nil)
+	defer sink.Close()
+	source, stats, err := BuildCaptureSource(ctx, sink, working, dirty, config, state, []byte("{}"), working, working, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.DataBytes != 4096 || stats.ExtraDataBytes != 0 || stats.BitmapBytes != 0 || !strings.Contains(stats.Fallback, "bitmap") {
+		t.Fatalf("working set changed: %+v", stats)
+	}
+	ref, path, err := sink.AbsorbSnapshot(ctx, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = sink.CommitSnapshot(ctx, ref, path); err != nil {
+		t.Fatal(err)
+	}
+	stream, err := fetch.OpenTarStream(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := snapshotfile.Open(ctx, stream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	if root.Memory.Size() != size || root.MemoryDirty != nil || !bytes.Equal(config, root.ConfigJSON) || !bytes.Equal(state, root.StateJSON) {
+		t.Fatal("fallback body/geometry changed")
+	}
+	data, err := root.Memory.RunAt(0, size)
+	if err != nil || data.Kind() != sparse.Data || data.End() != 4096 {
+		t.Fatal("owned Data map", data, err)
+	}
+	got := make([]byte, 4096)
+	if _, err = data.ReadAt(ctx, got, 0); err != nil || !bytes.Equal(got, bytes.Repeat([]byte{0x79}, 4096)) {
+		t.Fatal("owned Data bytes", err)
+	}
+	hole, err := root.Memory.RunAt(4096, size-4096)
+	if err != nil || hole.Kind() != sparse.Hole || hole.End() != size {
+		t.Fatal("expanded false working set", hole, err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("false top bitmap fallback: logical=%d data=%d bitmap=%d ZIP=%d physical=%d reason=%s", size, stats.DataBytes, stats.BitmapBytes, stats.ZIPBytes, info.Size(), stats.Fallback)
 }
