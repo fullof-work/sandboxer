@@ -148,7 +148,7 @@ share-storage live migration 场景)。我们的 user_managed zone 满足"file-b
 
 改动文件:`memory_manager.rs` / `seccomp_filters.rs`
 
-要点:
+以下是 0003 最初的 MISSING-only 握手；当前协议由 0013 扩展，见示例后的说明。
 
 - `create_ram_region` 在 mmap 完成后,如果 zone 配了 `uffd_socket`:
 
@@ -205,8 +205,10 @@ worker 退出后才替换内存表。
 队列能够推进；`ENOENT` 或无效注册使请求失败。真正的 CPU MISSING fault
 遇到 Loaded 页仍走独立的已回收页处理路径。
 
-`va_report` 的线格式不变。已计算的 memfd 偏移通过内部回调传递，并与实际 CH
-VA 区间及持有的 UFFD fd 关联。只有成功接管后，新注册才可用于加载；接管失败
+当前 `va_report` v1 显式传递 `version=1`、`page_shift=12`、`file_offset`
+及 `copy_mode_wp` 能力。x86 尝试 MISSING+WP 注册，并要求 ACK 确认原子
+COPY_MODE_WP；无法协商时保守记录物化页为 dirty。ARM 使用原生 KVM 日志。
+memfd 偏移通过内部回调传递，并与实际 CH VA 区间及持有的 UFFD fd 关联。只有成功接管后，新注册才可用于加载；接管失败
 回滚暂存的地址映射，由回调调用方清理 fd。加载可取消地等待注册就绪，并在区域
 边界拆分。UNMAP 使对应注册区间失效；REMOVE 释放页内容但保留注册。
 

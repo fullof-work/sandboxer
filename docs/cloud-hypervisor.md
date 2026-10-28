@@ -172,7 +172,8 @@ Subject: **memory: external uffd handler via in-process create + SCM_RIGHTS hand
 
 Changed files: `memory_manager.rs` and `seccomp_filters.rs`.
 
-Key points:
+0003 originally used the MISSING-only exchange below. The current protocol is
+extended by 0013 as described after the example.
 
 - After mapping a region, `create_ram_region` performs the following when
   `uffd_socket` is configured:
@@ -236,9 +237,12 @@ retries cancelably outside the worker, permitting the event reader and CPU fault
 queues to progress; `ENOENT`/invalid registration fails the request. A genuine
 CPU MISSING fault on a Loaded page remains a separate reclaimed-page path.
 
-`va_report` retains its wire format. Its computed memfd offset is passed through
-the internal callbacks and associated with the actual CH VA interval and owned
-UFFD descriptor. New registrations become usable only after successful adoption;
+Current `va_report` v1 carries explicit `version=1`, `page_shift=12`,
+`file_offset` and `copy_mode_wp`. x86 attempts MISSING+WP registration and
+requires ACK confirmation of atomic COPY_MODE_WP; unavailable negotiation
+conservatively marks materialized pages dirty. ARM uses the native KVM log.
+The memfd offset passes through internal callbacks and is associated with the
+actual CH VA interval and owned UFFD descriptor. New registrations become usable only after successful adoption;
 failed adoption rolls back the staged map and leaves fd cleanup to the sender of
 the callback. Loads wait cancelably for registration readiness and split at
 region boundaries. UNMAP invalidates the affected registration interval; REMOVE
