@@ -70,6 +70,21 @@ class EvidenceTest(unittest.TestCase):
             if mutation=='tail': bad['regions'][0]['bitmap']=[16]
             with self.assertRaises(AssertionError): evidence.validate_loss(report(1),report(5),bad)
 
+    def test_loss_records_include_the_dropped_collection(self):
+        report=lambda word: dict(version=1,page_shift=12,regions=[dict(slot=0,gpa=0,size=4096*4,file_offset=0,bitmap=[word])])
+        records=[dict(run_id='same',pid=42,capture_sequence=i,resume_sequence=i+1,size=256<<20,dirty=report(word)) for i,word in enumerate((1,1,5,7),1)]
+        self.assertEqual(evidence.validate_loss_records(records,report(5))['newly_consumed_lost_pages'],1)
+        for kind in ('missing','extra','pid','run','round','lost'):
+            bad=copy.deepcopy(records)
+            lost=report(5)
+            if kind=='missing': bad.pop(2)
+            if kind=='extra': bad.append(bad[-1])
+            if kind=='pid': bad[-1]['pid']+=1
+            if kind=='run': bad[2]['run_id']='stale'
+            if kind=='round': bad[2]['resume_sequence']+=1
+            if kind=='lost': lost=report(7)
+            with self.assertRaises(AssertionError): evidence.validate_loss_records(bad,lost)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -141,10 +141,9 @@ python3 - "$DIRTY_OBSERVATIONS" "$OUT" <<'PY'
 import json,pathlib,sys
 p=pathlib.Path(sys.argv[1]);out=pathlib.Path(sys.argv[2])
 sys.path.insert(0,str(pathlib.Path(__import__('os').environ['SANDBOXER_LIB'])))
-from dirty_memory_evidence import validate_loss
-reports=[json.loads(line)['dirty'] for line in (p/'capture-residency.jsonl').read_text().splitlines()]
-assert len(reports)==3, 'two successful captures then recovered capture expected'
-print(json.dumps(validate_loss(reports[-2],json.loads((p/'lost-dirty-response.json').read_text()),reports[-1])))
+from dirty_memory_evidence import validate_loss_records
+reports=[json.loads(line) for line in (p/'capture-residency.jsonl').read_text().splitlines()]
+print(json.dumps(validate_loss_records(reports,json.loads((p/'lost-dirty-response.json').read_text()))))
 for new,old in [('c2','legacy-C'),('h','legacy-W')]:
  a=json.loads((out/(new+'-comparison.json')).read_text());b=json.loads((out/(old+'-comparison.json')).read_text())
  assert a['sha256']==b['sha256']

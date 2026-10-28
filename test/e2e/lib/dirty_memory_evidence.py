@@ -38,6 +38,16 @@ def validate(directory, output):
     return {"run_id": run, "pid": pid, "captures": 2, "memory_bytes": size, "observer_materializes_memory": True, "codec": "plaintext"}
 
 
+def validate_loss_records(records, lost):
+    assert len(records) == 4, 'two successes, dropped response, then recovered capture expected'
+    first=records[0]
+    assert first['run_id'] and first['pid'] > 0
+    for i,record in enumerate(records,1):
+        assert (record['run_id'],record['pid'],record['capture_sequence'],record['resume_sequence'],record['size']) == (first['run_id'],first['pid'],i,i+1,256<<20), 'response loss round mismatch'
+    assert records[2]['dirty'] == lost, 'saved dropped response differs from collection record'
+    return validate_loss(records[1]['dirty'],lost,records[3]['dirty'])
+
+
 def validate_loss(previous, lost, recovered):
     def regions(report):
         assert (report['version'], report['page_shift']) == (1, 12)
