@@ -2196,7 +2196,7 @@ Tail对其连续有效范围只发出一次multi-page `UFFDIO_COPY`或
 `EVENT_REMOVE`使已丢弃范围重新成为missing,tail提交使用条件状态更新,不能覆盖并发
 产生的`Released`. Context cancellation停止worker并关闭fd/stream owner.
 
-UFFD 直接重试必需的 `Run.ReadAt`. urgent 页及包含它的 Chunk window 属于必需读取. 纯 speculative tail 只执行一次最佳努力尝试. 保留现有 `ChunkRun` 能力、buffer、tail 预留和 ioctl 部分进展/EEXIST/EAGAIN 收敛. 所有 vhost GPA/UVA 访问首先通过所属 CH UFFD 等待确认填充；内存准备失败在发布 used-ring 完成记录前终止请求。CPU urgent、后端 mandatory 和 speculative tail 安装与内核 REMOVE/UNMAP 事件读取及状态发布共用同一把锁。延迟读取的来源数据在锁内重新校验；观察到释放后丢弃历史字节，不再安排过期 tail。注册、取消、所有权边界与真实共享 memfd/O_DIRECT 回归见 [cloud-hypervisor_zh.md §3.3](cloud-hypervisor_zh.md#33-0003--external-uffd-handler-via-in-process-create--scm_rights)。
+UFFD 直接重试必需的 `Run.ReadAt`. urgent 页及包含它的 Chunk window 属于必需读取. 纯 speculative tail 只执行一次最佳努力尝试. 保留现有 `ChunkRun` 能力、buffer、tail 预留和 ioctl 部分进展/EEXIST/EAGAIN 收敛. 所有 vhost GPA/UVA 访问首先通过所属 CH UFFD 等待确认填充；内存准备失败在发布 used-ring 完成记录前终止请求。CPU urgent、后端 mandatory 和 speculative tail 安装与内核 REMOVE/UNMAP 事件读取及状态发布共用同一把锁。延迟读取的来源数据在锁内重新校验；观察到释放后丢弃历史字节，不再安排过期 tail。UNMAP 还会唤醒原 UFFD 范围上的等待者，使内核 GUP/KVM 缺页请求重新检查已删除的 VMA 并退出；它不会安装替代字节，也不会在 runner 停止前 detach 资源。注册、取消、所有权边界与真实共享 memfd/O_DIRECT 回归见 [cloud-hypervisor_zh.md §3.3](cloud-hypervisor_zh.md#33-0003--external-uffd-handler-via-in-process-create--scm_rights)。
 
 共享[源读取恢复策略](#read-recovery)保留操作 context 和首个终态原因。
 

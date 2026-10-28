@@ -6,6 +6,8 @@ import (
 	"crypto/sha256"
 	"errors"
 	"io"
+	"os"
+	"os/exec"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -398,5 +400,186 @@ func TestFullFaultQueueCancellationJoinsReaderAndWorkers(t *testing.T) {
 	}
 	if h.stats.inflight.Load() != 0 || h.tailBusy.Load() {
 		t.Fatal("Close retained source work")
+	}
+}
+
+// Kernel GUP waiters (including KVM asynchronous page faults) must recheck
+// a removed VMA even when a source read is still recovering. Keep the UFFD
+// open throughout the assertion so closing it cannot supply the missing wake.
+func TestRealUffdUnmapWakesRecoveringKernelFault(t *testing.T) {
+	// Kernel-origin faults require CAP_SYS_PTRACE when the host keeps
+	// vm.unprivileged_userfaultfd=0. Elevate only this exact test in the
+	// existing source gate's sudo-capable system instance, not the package.
+	// The same compiled binary retains race instrumentation; no host policy
+	// is changed and missing privileges are a test failure.
+	if os.Geteuid() != 0 {
+		if os.Getenv("SANDBOXER_KERNEL_FAULT_TEST_CHILD") == "1" {
+			t.Fatal("kernel-fault test child did not acquire root capability")
+		}
+		executable, err := os.Executable()
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, "sudo", "-n", "--", "env",
+			"SANDBOXER_KERNEL_FAULT_TEST_CHILD=1", executable,
+			"-test.run=^TestRealUffdUnmapWakesRecoveringKernelFault$", "-test.v", "-test.timeout=15s")
+		output, err := cmd.CombinedOutput()
+		t.Logf("isolated kernel-fault test:\n%s", output)
+		if err != nil {
+			t.Fatalf("kernel-fault test requires explicit root capability: %v", err)
+		}
+		return
+	}
+	mem, err := unix.Mmap(-1, 0, PageSize, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_PRIVATE|unix.MAP_ANONYMOUS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mapped := true
+	defer func() {
+		if mapped {
+			unix.Munmap(mem)
+		}
+	}()
+	fd, err := createUffd(unix.O_CLOEXEC | unix.O_NONBLOCK)
+	if err != nil {
+		t.Fatalf("kernel-fault userfaultfd required: %v", err)
+	}
+	closed := false
+	closeFD := func() {
+		if !closed {
+			unix.Close(fd)
+			closed = true
+		}
+	}
+	defer closeFD()
+	if _, err := ioctlUffdAPI(fd, uffdFeatureEventUnmap); err != nil {
+		t.Fatal(err)
+	}
+	va := uint64(uintptr(unsafe.Pointer(&mem[0])))
+	if err := ioctlUffdRegister(fd, va, PageSize); err != nil {
+		t.Fatal(err)
+	}
+
+	source := newRecordingSnapshot(PageSize, sparse.Data, 0x77)
+	entered, release := make(chan struct{}), make(chan struct{})
+	var attempts atomic.Int32
+	source.readHook = func(ctx context.Context, _ uint64, _ []byte) error {
+		if attempts.Add(1) == 1 {
+			return io.ErrClosedPipe
+		}
+		close(entered)
+		select {
+		case <-release:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	h := newUnitHandlerWithoutMap(t, PageSize, source)
+	defer h.cancel()
+	if err := h.addrMap.RegisterVMA(ProcessCH, va, PageSize, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.addrMap.bindInitial(fd); err != nil {
+		t.Fatal(err)
+	}
+	h.ops = realUffdOps
+
+	readEvent := func(want uint8) uffdMsg {
+		t.Helper()
+		var raw [32]byte
+		deadline := time.Now().Add(time.Second)
+		for {
+			h.installMu.Lock()
+			n, err := unix.Read(fd, raw[:])
+			msg := *(*uffdMsg)(unsafe.Pointer(&raw[0]))
+			if n == len(raw) && (msg.Event == uffdEventRemove || msg.Event == uffdEventUnmap) {
+				h.dispatchRelease(&msg, fd)
+			}
+			h.installMu.Unlock()
+			if n == len(raw) {
+				if msg.Event != want {
+					t.Fatalf("event=%x, want=%x", msg.Event, want)
+				}
+				return msg
+			}
+			if err != unix.EAGAIN || time.Now().After(deadline) {
+				t.Fatalf("event=%x n=%d err=%v", want, n, err)
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+	type result struct {
+		n   int
+		err error
+	}
+	gup := make(chan result, 1)
+	go func() {
+		var dst [PageSize]byte
+		n, err := unix.ProcessVMReadv(unix.Getpid(), []unix.Iovec{{Base: &dst[0], Len: PageSize}}, []unix.RemoteIovec{{Base: uintptr(va), Len: PageSize}}, 0)
+		gup <- result{n, err}
+	}()
+	joined := false
+	var unmapped chan error
+	unmapJoined := false
+	defer func() {
+		// Last-resort failure cleanup must not count as the successful wake.
+		closeFD()
+		if !joined {
+			select {
+			case <-gup:
+			case <-time.After(time.Second):
+				t.Error("GUP did not join after UFFD close")
+			}
+		}
+		if unmapped != nil && !unmapJoined {
+			select {
+			case err := <-unmapped:
+				if err == nil {
+					mapped = false
+				} else {
+					t.Errorf("unmap cleanup: %v", err)
+				}
+			case <-time.After(time.Second):
+				t.Error("UNMAP did not join after UFFD close")
+			}
+		}
+	}()
+	msg := readEvent(uffdEventPagefault)
+	pf := (*uffdMsgPagefault)(unsafe.Pointer(&msg.Arg[0]))
+	if pf.Address & ^uint64(PageSize-1) != va {
+		t.Fatalf("fault address=%x, want=%x", pf.Address, va)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		h.handleFault(faultEvent{address: pf.Address, flags: pf.Flags, uffdFD: fd}, make([]byte, PageSize))
+	}()
+	defer func() { h.cancel(); receiveSignal(t, done) }()
+	receiveSignal(t, entered)
+	unmapped = make(chan error, 1)
+	go func() { unmapped <- unix.Munmap(mem) }()
+	readEvent(uffdEventUnmap)
+	err = <-unmapped
+	unmapJoined = true
+	if err != nil {
+		t.Fatal(err)
+	}
+	mapped = false
+	select {
+	case got := <-gup:
+		joined = true
+		if got.n > 0 || !errors.Is(got.err, unix.EFAULT) {
+			t.Errorf("unmapped GUP n=%d err=%v", got.n, got.err)
+		}
+	case <-time.After(time.Second):
+		t.Error("UNMAP left the original kernel fault asleep while UFFD remains open")
+	}
+	close(release)
+	receiveSignal(t, done)
+	if h.stats.copies.Load() != 0 || h.stats.zeropages.Load() != 0 || attempts.Load() != 2 {
+		t.Fatalf("stale read published or recovery replayed: attempts=%d stats=%v", attempts.Load(), h.Stats())
 	}
 }
