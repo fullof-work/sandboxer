@@ -96,3 +96,35 @@ func TestDirtyMemoryMapsSplitGPAWithUnalignedWordOffsets(t *testing.T) {
 		t.Fatal("lost region offsets")
 	}
 }
+
+func TestDirtyMemoryHTTPBudgets(t *testing.T) {
+	const body = `{"version":1,"page_shift":12,"regions":[{"slot":0,"gpa":0,"size":4096,"file_offset":0,"bitmap":[0]}]}`
+	const bodyLimit = 21 + (1 << 20)
+	const header = "HTTP/1.1 200 OK\r\nConnection: close\r\nX-Pad: "
+	const end = "\r\n\r\n"
+	wire := func(headerSize int, b string) string {
+		return header + strings.Repeat("a", headerSize-len(header)-len(end)) + end + b
+	}
+	padded := body + strings.Repeat(" ", bodyLimit-len(body))
+	for _, tc := range []struct {
+		name, response string
+		valid          bool
+	}{
+		{"exact-header-and-body", wire(dirtyHeaderBudget, padded), true},
+		{"connection-close", wire(len(header)+len(end), body), true},
+		{"header-plus-one", wire(dirtyHeaderBudget+1, body), false},
+		{"body-plus-one", wire(dirtyHeaderBudget, padded+" "), false},
+		{"hidden-second-json", wire(bodyLimit+dirtyHeaderBudget-len(body), body+"{}"), false},
+		{"trailing-json", wire(len(header)+len(end), body+"{}"), false},
+		{"trailing-invalid", wire(len(header)+len(end), body+"x"), false},
+		{"truncated-length", fmt.Sprintf("HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n%s", len(body)+1, body), false},
+		{"chunked", fmt.Sprintf("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n%x\r\n%s\r\n0\r\n\r\n", len(body), body), true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := (Client{Sock: dirtyServer(t, tc.response), RespDeadline: 5 * time.Second}).DirtyMemory(context.Background(), 4096)
+			if (err == nil) != tc.valid {
+				t.Fatalf("valid=%v: %v", tc.valid, err)
+			}
+		})
+	}
+}

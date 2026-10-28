@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -64,7 +65,7 @@ func (c Client) DirtyMemory(ctx context.Context, memorySize uint64) (*DirtyMemor
 	if err = req.Write(conn); err != nil {
 		return nil, fmt.Errorf("dirty memory request: %w", err)
 	}
-	response, err := http.ReadResponse(bufio.NewReaderSize(io.LimitReader(conn, limit+(64<<10)), 4096), req)
+	response, err := readDirtyResponse(conn, req, limit)
 	if err != nil {
 		return nil, fmt.Errorf("dirty memory response: %w", err)
 	}
@@ -98,6 +99,63 @@ func (c Client) DirtyMemory(ctx context.Context, memorySize uint64) (*DirtyMemor
 		return nil, err
 	}
 	return &result, nil
+}
+
+const dirtyHeaderBudget = 64 << 10
+
+// A limit is not a transport EOF. Probe one byte only when the budget is
+// exhausted so an exactly bounded connection-delimited response still works.
+type dirtyWireReader struct {
+	r         io.Reader
+	remaining int64
+}
+
+func (r *dirtyWireReader) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if r.remaining == 0 {
+		var extra [1]byte
+		n, err := r.r.Read(extra[:])
+		if n != 0 {
+			return 0, fmt.Errorf("dirty memory: wire exceeds budget")
+		}
+		return 0, err
+	}
+	if int64(len(p)) > r.remaining {
+		p = p[:r.remaining]
+	}
+	n, err := r.r.Read(p)
+	r.remaining -= int64(n)
+	return n, err
+}
+
+func readDirtyResponse(conn io.Reader, req *http.Request, bodyBudget int64) (*http.Response, error) {
+	reader := bufio.NewReaderSize(&dirtyWireReader{r: conn, remaining: bodyBudget + dirtyHeaderBudget}, 4096)
+	// Bound headers independently, including the status line and final CRLF.
+	// ReadSlice also bounds an unterminated line; retain body bytes prefetched
+	// by this reader and replay only the validated header to net/http.
+	var header []byte
+	lineBytes := 0
+	for {
+		line, err := reader.ReadSlice('\n')
+		if len(line) > dirtyHeaderBudget-len(header) {
+			return nil, fmt.Errorf("dirty memory: headers exceed budget")
+		}
+		header = append(header, line...)
+		lineBytes += len(line)
+		if errors.Is(err, bufio.ErrBufferFull) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		if lineBytes == 2 && len(line) == 2 && line[0] == '\r' {
+			break
+		}
+		lineBytes = 0
+	}
+	return http.ReadResponse(bufio.NewReader(io.MultiReader(bytes.NewReader(header), reader)), req)
 }
 
 func (d *DirtyMemory) validate(memorySize uint64) error {

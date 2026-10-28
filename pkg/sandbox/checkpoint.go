@@ -154,6 +154,7 @@ type memoryHistory struct {
 	memory                                *checkpointStream
 	historical                            fetch.Stream
 	fullMemory                            sparse.Source
+	proofCandidates                       sparse.Source // bitmap-only union, diagnostics only; never used to trim
 	base                                  string
 	configJSON, stateJSON, snapshotConfig []byte
 }
@@ -202,6 +203,8 @@ func prepareMemoryHistory(ctx context.Context, opts RunOptions, merge bool, size
 	h.refs = append([]string(nil), all[len(prefix):]...)
 	var layers []fetch.Stream
 	var candidates []fetch.Stream
+	var diagnostic []fetch.Stream
+	unproved := false
 	var top *snapshotfile.Root
 	defer func() {
 		if retErr != nil {
@@ -228,14 +231,18 @@ func prepareMemoryHistory(ctx context.Context, opts RunOptions, merge bool, size
 		if err != nil {
 			return nil, err
 		}
-		candidate := sparse.Source(root.Memory)
-		if root.MemoryDirty != nil && memoryParentViewEqual(cfg.FromRefs, all[i+1:]) {
-			candidate, err = snapshot.DirtyMemory(root.Memory, root.MemoryDirty)
-			if err != nil {
-				return nil, err
+		hinted, err := snapshot.DirtyMemory(root.Memory, root.MemoryDirty)
+		if err != nil {
+			return nil, err
+		}
+		diagnostic = append(diagnostic, &checkpointSourceStream{Source: hinted, close: func() error { return nil }})
+		candidate := hinted
+		if root.MemoryDirty != nil && !memoryParentViewEqual(cfg.FromRefs, all[i+1:]) {
+			candidate = root.Memory
+			unproved = true
+			if opts.memoryLogf != nil {
+				opts.memoryLogf("dirty memory fallback: parent view unproved for history layer %s; retaining all explicit content", raw)
 			}
-		} else if root.MemoryDirty != nil && opts.memoryLogf != nil {
-			opts.memoryLogf("dirty memory fallback: parent view unproved for history layer %s; retaining all explicit content", raw)
 		}
 		candidates = append(candidates, &checkpointSourceStream{Source: candidate, close: func() error { return nil }})
 		if !merge && len(prefix) == 1 && root.MemoryDirty == nil {
@@ -259,6 +266,9 @@ func prepareMemoryHistory(ctx context.Context, opts RunOptions, merge bool, size
 		return nil, err
 	}
 	h.fullMemory = full
+	if unproved {
+		h.proofCandidates = fetch.NewLayered(diagnostic...)
+	}
 	h.memory = &checkpointStream{Stream: &checkpointSourceStream{Source: selected, close: full.Close}}
 	if merge {
 		h.base = prefix[0]

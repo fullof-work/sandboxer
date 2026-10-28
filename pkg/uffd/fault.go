@@ -63,14 +63,18 @@ type urgentOutcome struct {
 	tailEligible bool
 }
 
-func (h *Handler) handleFault(ev faultEvent, pageBuf []byte) {
+func (h *Handler) handleFault(ev faultEvent, pageBuf []byte) (retryWP bool) {
 	inflight := h.stats.inflight.Add(1)
 	recordAtomicMax(&h.stats.inflightHWM, uint64(inflight))
 	defer h.stats.inflight.Add(-1)
 
 	memfdOffset, ok := h.addrMap.Locate(ev.address)
 	if !ok {
-		h.invalidateCapture(fmt.Errorf("uffd: fault registration missing at 0x%x", ev.address))
+		err := fmt.Errorf("uffd: fault registration missing at 0x%x", ev.address)
+		h.invalidateCapture(err)
+		if ev.flags&uffdPagefaultFlagWP != 0 {
+			h.failRead(err)
+		}
 		h.logf("uffd: handleFault unknown va 0x%x", ev.address)
 		h.stats.errors.Add(1)
 		h.wake(ev.uffdFD, ev.address&^(PageSize-1), PageSize)
@@ -82,6 +86,9 @@ func (h *Handler) handleFault(ev faultEvent, pageBuf []byte) {
 
 	if ev.flags&uffdPagefaultFlagWP != 0 {
 		if err := h.handleWP(ev.uffdFD, pageVA, pageOffset); err != nil {
+			if errors.Is(err, unix.EAGAIN) {
+				return true
+			}
 			h.failRead(err)
 		}
 		return
@@ -106,6 +113,7 @@ func (h *Handler) handleFault(ev faultEvent, pageBuf []byte) {
 			h.stats.errors.Add(1)
 		}
 	}
+	return
 }
 
 func (h *Handler) handleAbsentFault(uffdFD int, pageVA, pageOffset, pageIdx uint64, pageBuf []byte) {

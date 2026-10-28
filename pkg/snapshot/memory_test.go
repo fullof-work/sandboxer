@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"strings"
 	"testing"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
@@ -160,7 +162,7 @@ func TestMemoryBudgetIncludesSentinelAndFallsBackWithoutDataRead(t *testing.T) {
 	if _, _, err = tarstream.WriteTo(ctx, io.Discard, "snapshot", source); err == nil {
 		t.Fatal("real writer accepted over-limit map")
 	}
-	built, stats, err := BuildCaptureSource(ctx, NewFileSink(t.TempDir(), "sid", nil, false, nil), alternating, nil, []byte("{}"), []byte("{}"), []byte("{}"), dense, dense, nil)
+	built, stats, err := BuildCaptureSource(ctx, NewFileSink(t.TempDir(), "sid", nil, false, nil), alternating, nil, []byte("{}"), []byte("{}"), []byte("{}"), dense, dense, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -171,11 +173,11 @@ func TestMemoryBudgetIncludesSentinelAndFallsBackWithoutDataRead(t *testing.T) {
 		t.Fatal("dense plus sentinel", err)
 	}
 	// A P which is itself too fragmented must fail; it cannot fill external holes.
-	if _, _, err = BuildCaptureSource(ctx, NewFileSink(t.TempDir(), "sid", nil, false, nil), alternating, nil, []byte("{}"), []byte("{}"), []byte("{}"), alternating, alternating, nil); err == nil {
+	if _, _, err = BuildCaptureSource(ctx, NewFileSink(t.TempDir(), "sid", nil, false, nil), alternating, nil, []byte("{}"), []byte("{}"), []byte("{}"), alternating, alternating, nil, nil); err == nil {
 		t.Fatal("expanded P to evade budget")
 	}
 	// No tarstream cap is imposed on Bundle/ingest planning.
-	if _, stats, err = BuildCaptureSource(ctx, nil, alternating, nil, []byte("{}"), []byte("{}"), []byte("{}"), dense, dense, nil); err != nil || stats.Fallback != "" {
+	if _, stats, err = BuildCaptureSource(ctx, nil, alternating, nil, []byte("{}"), []byte("{}"), []byte("{}"), dense, dense, nil, nil); err != nil || stats.Fallback != "" {
 		t.Fatal("non-file carrier inherited tarstream budget", err)
 	}
 }
@@ -192,8 +194,53 @@ func TestCaptureMayDropOnlyNewBitmapOnTailOverflow(t *testing.T) {
 	if _, err := snapshotfile.BuildSourceWithDirty(dense, config, state, []byte("{}"), dirty); !errors.Is(err, snapshotfile.ErrTailBudget) {
 		t.Fatal("ordinary reconstruction dropped bitmap", err)
 	}
-	_, stats, err := BuildCaptureSource(context.Background(), nil, dense, dirty, config, state, []byte("{}"), dense, dense, nil)
+	_, stats, err := BuildCaptureSource(context.Background(), nil, dense, dirty, config, state, []byte("{}"), dense, dense, nil, nil)
 	if err != nil || stats.BitmapBytes != 0 || stats.Fallback == "" {
 		t.Fatalf("new capture tail fallback: %+v %v", stats, err)
+	}
+}
+
+func TestParentProofRetentionCountsFinalValuesAndCurrentOverlap(t *testing.T) {
+	ctx := context.Background()
+	// Both unproved histories contribute overlapping full coverage. The newer
+	// Zero overrides older Data; the diagnostic union contains only page zero.
+	old := pageMemory([]sparse.RunKind{sparse.Data, sparse.Data, sparse.Data, sparse.Hole}, []byte{7, 7, 7, 0})
+	newest := pageMemory([]sparse.RunKind{sparse.Data, sparse.Zero, sparse.Hole, sparse.Hole}, []byte{9, 0, 0, 0})
+	full := fetch.NewLayered(memoryBorrow{newest}, memoryBorrow{old})
+	bits, _ := snapshotfile.EncodeDirty(old.Size(), []byte{1})
+	a, _ := DirtyMemory(old, bits)
+	b, _ := DirtyMemory(newest, bits)
+	diagnostic := fetch.NewLayered(memoryBorrow{a}, memoryBorrow{b})
+	for _, role := range []string{"false-H", "true-self", "false-self"} {
+		t.Run(role, func(t *testing.T) {
+			var effective sparse.Source = full
+			var hints sparse.Source = diagnostic
+			wantData, wantZero := uint64(4096), uint64(4096)
+			current := pageMemory([]sparse.RunKind{sparse.Hole, sparse.Data, sparse.Hole, sparse.Hole}, []byte{0, 5, 0, 0})
+			if role == "true-self" {
+				effective = fetch.NewLayered(memoryBorrow{current}, memoryBorrow{full})
+				hints = fetch.NewLayered(memoryBorrow{current}, memoryBorrow{diagnostic})
+				wantZero = 0
+			} else if role == "false-self" {
+				effective = current
+				hints = nil
+				wantData = 0
+				wantZero = 0
+			}
+			var logs []string
+			_, stats, err := BuildCaptureSource(ctx, nil, effective, nil, []byte("{}"), []byte("{}"), []byte("{}"), effective, effective, hints, func(f string, args ...any) { logs = append(logs, fmt.Sprintf(f, args...)) })
+			if err != nil {
+				t.Fatal(err)
+			}
+			if stats.ParentProofExtraDataBytes != wantData || stats.ParentProofExtraZeroBytes != wantZero || stats.ExtraDataBytes != 0 {
+				t.Fatalf("costs %+v", stats)
+			}
+			if (stats.ParentProofFallback != "") != (role != "false-self") {
+				t.Fatal("lost proof reason", stats)
+			}
+			if len(logs) != 1 || !strings.Contains(logs[0], "carrier_extra_data=0") || !strings.Contains(logs[0], fmt.Sprintf("proof_extra_data=%d proof_extra_zero=%d", wantData, wantZero)) {
+				t.Fatal(logs)
+			}
+		})
 	}
 }

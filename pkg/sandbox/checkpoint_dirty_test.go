@@ -78,6 +78,20 @@ func TestDirtyHistorySingleMultipleAndUnprovedParents(t *testing.T) {
 						}
 					}
 				}
+				_, stats, err := snapshot.BuildCaptureSource(ctx, nil, h.memory, nil, []byte("{}"), []byte("{}"), []byte("{}"), h.fullMemory, h.fullMemory, h.proofCandidates, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				wantExtra := uint64(0)
+				if !proved {
+					wantExtra = 2 * 4096
+					if multi {
+						wantExtra = 4096
+					}
+				}
+				if stats.ParentProofExtraDataBytes != wantExtra || stats.ParentProofExtraZeroBytes != 0 || (stats.ParentProofFallback != "") != !proved || stats.ExtraDataBytes != 0 {
+					t.Fatalf("multi=%t proved=%t merge=%t proof costs: %+v", multi, proved, merge, stats)
+				}
 				if err := h.Close(); err != nil {
 					t.Fatal(err)
 				}

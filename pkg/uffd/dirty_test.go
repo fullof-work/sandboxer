@@ -2,6 +2,7 @@ package uffd
 
 import (
 	"context"
+	"errors"
 	"runtime"
 	"testing"
 
@@ -115,7 +116,9 @@ func TestCaptureRejectsUnexplainedLoadedHole(t *testing.T) {
 }
 
 func TestWPRetryReleasesInstallGateAndRetainsDirty(t *testing.T) {
- if runtime.GOARCH != "amd64" { t.Skip("x86 WP retry path") }
+	if runtime.GOARCH != "amd64" {
+		t.Skip("x86 WP retry path")
+	}
 	h, _, _ := realShmemHandler(t, 1, ZeroSource{}, true)
 	h.installMu.Lock()
 	fd := h.uffds[0].Fd()
@@ -142,13 +145,14 @@ func TestWPRetryReleasesInstallGateAndRetainsDirty(t *testing.T) {
 		return nil
 	}
 	h.installMu.Unlock()
-	done := make(chan error, 1)
-	go func() { done <- h.handleWP(int(fd), va, 0) }()
+	if err := h.handleWP(int(fd), va, 0); !errors.Is(err, unix.EAGAIN) {
+		t.Fatalf("first attempt: %v", err)
+	}
 	<-first
 	h.installMu.Lock()
 	h.handleRemoveLocked(va, va+PageSize, int(fd))
 	h.installMu.Unlock()
-	if err := <-done; err != nil {
+	if err := h.handleWP(int(fd), va, 0); err != nil {
 		t.Fatal(err)
 	}
 	if attempts < 2 || !h.cfg.Dirty.Contains(0) || !h.released.Contains(0) {

@@ -18,11 +18,14 @@ const memoryExtentBudget = uint64(1 << 20) // includes the GNU trailing sentinel
 var errMemoryBudget = errors.New("snapshot memory carrier budget")
 
 type MemoryStorage struct {
-	DataBytes      uint64
-	BitmapBytes    uint64
-	ZIPBytes       uint64
-	ExtraDataBytes uint64
-	Fallback       string
+	DataBytes                 uint64
+	BitmapBytes               uint64
+	ZIPBytes                  uint64
+	ExtraDataBytes            uint64
+	Fallback                  string
+	ParentProofFallback       string
+	ParentProofExtraDataBytes uint64
+	ParentProofExtraZeroBytes uint64
 }
 
 func memoryDataBytes(ctx context.Context, source sparse.Source) (uint64, error) {
@@ -186,8 +189,16 @@ func DataCoverage(source sparse.Source) sparse.Source {
 
 // BuildCaptureSource is exclusively for new capture artifacts. Equivalent
 // publication continues using BuildSourceWithDirty and never drops metadata.
-func BuildCaptureSource(ctx context.Context, sink ArtifactSink, mem sparse.Source, dirty, config, state, cfg []byte, coverage, values sparse.Source, logf func(string, ...any)) (sparse.Source, MemoryStorage, error) {
+func BuildCaptureSource(ctx context.Context, sink ArtifactSink, mem sparse.Source, dirty, config, state, cfg []byte, coverage, values, proofCandidates sparse.Source, logf func(string, ...any)) (sparse.Source, MemoryStorage, error) {
 	var stats MemoryStorage
+	if proofCandidates != nil {
+		stats.ParentProofFallback = "parent view unproved; retaining all explicit content"
+		var err error
+		stats.ParentProofExtraDataBytes, stats.ParentProofExtraZeroBytes, err = memoryProofRetention(ctx, mem, proofCandidates)
+		if err != nil {
+			return nil, stats, err
+		}
+	}
 	original, err := memoryDataBytes(ctx, mem)
 	if err != nil {
 		return nil, stats, err
@@ -239,7 +250,47 @@ func BuildCaptureSource(ctx context.Context, sink ArtifactSink, mem sparse.Sourc
 	}
 	stats.ExtraDataBytes = stats.DataBytes - original
 	if logf != nil {
-		logf("snapshot memory: data=%d bitmap=%d zip=%d extra_data=%d fallback=%q", stats.DataBytes, stats.BitmapBytes, stats.ZIPBytes, stats.ExtraDataBytes, stats.Fallback)
+		logf("snapshot memory: data=%d bitmap=%d zip=%d parent_proof=%q proof_extra_data=%d proof_extra_zero=%d carrier_extra_data=%d fallback=%q", stats.DataBytes, stats.BitmapBytes, stats.ZIPBytes, stats.ParentProofFallback, stats.ParentProofExtraDataBytes, stats.ParentProofExtraZeroBytes, stats.ExtraDataBytes, stats.Fallback)
 	}
 	return source, stats, nil
+}
+
+// Count the effective selection minus the diagnostic bitmap-only union using
+// the final values in V (and current C for true self). Overlapping candidates
+// count once. These are logical Data/Zero bytes, not additional physical ZIP or
+// carrier costs, and this counterfactual never authorizes dropping unproved data.
+func memoryProofRetention(ctx context.Context, effective, candidates sparse.Source) (data, zero uint64, err error) {
+	if effective.Size() != candidates.Size() {
+		return 0, 0, fmt.Errorf("memory proof diagnostic size mismatch")
+	}
+	for off := uint64(0); off < effective.Size(); {
+		if err = ctx.Err(); err != nil {
+			return
+		}
+		var actual, hint sparse.Run
+		actual, err = effective.RunAt(off, effective.Size()-off)
+		if err != nil {
+			return
+		}
+		if err = validMemoryRun(actual, off, effective.Size()); err != nil {
+			return
+		}
+		hint, err = candidates.RunAt(off, actual.End()-off)
+		if err != nil {
+			return
+		}
+		if err = validMemoryRun(hint, off, actual.End()); err != nil {
+			return
+		}
+		if hint.Kind() == sparse.Hole {
+			switch actual.Kind() {
+			case sparse.Data:
+				data += hint.End() - off
+			case sparse.Zero:
+				zero += hint.End() - off
+			}
+		}
+		off = hint.End()
+	}
+	return
 }

@@ -1811,7 +1811,7 @@ func handleSnapshotRequest(
 	cfg := opts.Cfg
 	var historicalRef string
 	if history.historical != nil {
-		historicalSource, _, buildErr := snapshot.BuildCaptureSource(ctx, sink, history.memory, nil, history.configJSON, history.stateJSON, history.snapshotConfig, history.fullMemory, history.fullMemory, logf)
+		historicalSource, _, buildErr := snapshot.BuildCaptureSource(ctx, sink, history.memory, nil, history.configJSON, history.stateJSON, history.snapshotConfig, history.fullMemory, history.fullMemory, history.proofCandidates, logf)
 		if buildErr != nil {
 			return ctl.Response{}, buildErr
 		}
@@ -2068,10 +2068,12 @@ func handleSnapshotRequest(
 		MergeBaseOpener:       mergeBaseOpener,
 		MemoryMergeBaseOpener: memoryMergeBaseOpener,
 		MemoryFallbackBase:    history.fullMemory,
+		MemoryProofCandidates: history.proofCandidates,
 	}
 	src.ParentSandboxRef = captureParentSandboxRef
 	if !mergeMemory {
 		src.MemoryFallbackBase = nil
+		src.MemoryProofCandidates = nil
 	}
 	if mergeMemory {
 		src.MergeBaseSnapshot = memoryMergeBase

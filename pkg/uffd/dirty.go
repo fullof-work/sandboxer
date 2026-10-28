@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
-	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -108,43 +107,29 @@ func (h *Handler) zeroCleanLocked(fd int, dst, length uint64) (int64, error, boo
 	}
 	return n, err, true
 }
+
+// handleWP makes one attempt. EAGAIN must return to the worker: retaining a
+// worker here can fill its queue and stop the reader before a pending REMOVE.
 func (h *Handler) handleWP(fd int, va, off uint64) error {
-	for {
-		err := func() error {
-			h.installMu.Lock()
-			defer h.installMu.Unlock()
-			if err := h.ctx.Err(); err != nil {
-				return err
-			}
-			if !h.writeProtect[fd] || !h.addrMap.owns(fd, va, off, PageSize) {
-				return fmt.Errorf("uffd: WP fault outside protected registration")
-			}
-			if h.cfg.Dirty == nil || h.ops.writeProtect == nil {
-				return fmt.Errorf("uffd: WP tracker unavailable")
-			}
-			if err := h.cfg.Dirty.Mark(off, PageSize); err != nil {
-				return err
-			}
-			// D precedes every unprotect attempt, including transient/permanent failure.
-			return h.ops.writeProtect(fd, va, PageSize, false)
-		}()
-		if errors.Is(err, unix.EAGAIN) {
-			// mmap_changing can remain set until the reader acknowledges REMOVE.
-			// Retry outside installMu so that event publication cannot deadlock.
-			timer := time.NewTimer(time.Millisecond)
-			select {
-			case <-h.ctx.Done():
-				timer.Stop()
-				return h.ctx.Err()
-			case <-timer.C:
-			}
-			continue
-		}
-		if err != nil {
-			return fmt.Errorf("uffd: unprotect: %w", err)
-		}
-		return nil
+	h.installMu.Lock()
+	defer h.installMu.Unlock()
+	if err := h.ctx.Err(); err != nil {
+		return err
 	}
+	if !h.writeProtect[fd] || !h.addrMap.owns(fd, va, off, PageSize) {
+		return fmt.Errorf("uffd: WP fault outside protected registration")
+	}
+	if h.cfg.Dirty == nil || h.ops.writeProtect == nil {
+		return fmt.Errorf("uffd: WP tracker unavailable")
+	}
+	if err := h.cfg.Dirty.Mark(off, PageSize); err != nil {
+		return err
+	}
+	// D precedes every unprotect attempt, including transient/permanent failure.
+	if err := h.ops.writeProtect(fd, va, PageSize, false); err != nil {
+		return fmt.Errorf("uffd: unprotect: %w", err)
+	}
+	return nil
 }
 
 // A queued MISSING event can be stale after another installer populated the

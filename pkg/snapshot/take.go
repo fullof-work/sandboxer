@@ -41,13 +41,15 @@ type Sources struct {
 	MemoryWorkingSet bool
 	// MemoryFallbackBase is the full owned history, before dirty trimming.
 	MemoryFallbackBase sparse.Source
-	CheckpointID       string
-	Context            context.Context
-	SandboxID          string // <sid> for output filename / symlink
-	APISock            string // CH api socket
-	MemfdFD            int    // memfd backing the zone (read-only here; CH is paused)
-	MemfdSize          int64  // ramSize
-	StagingDir         string // CH /vm.snapshot dest for config.json/state.json (caller creates+removes)
+	// MemoryProofCandidates is a diagnostic bitmap-only history union, never an output selection.
+	MemoryProofCandidates sparse.Source
+	CheckpointID          string
+	Context               context.Context
+	SandboxID             string // <sid> for output filename / symlink
+	APISock               string // CH api socket
+	MemfdFD               int    // memfd backing the zone (read-only here; CH is paused)
+	MemfdSize             int64  // ramSize
+	StagingDir            string // CH /vm.snapshot dest for config.json/state.json (caller creates+removes)
 
 	// Diffs are the logical disks' writable diffs to capture, in order: Diffs[0]
 	// is the root, Diffs[1:] are the boot.disks[] data disks (boot.disks[]
@@ -322,7 +324,11 @@ func Take(s Sources, sink ArtifactSink, resumeAfter bool) (_ *Outputs, retErr er
 			retErr = errors.Join(retErr, closeMemoryBase())
 		}
 	}()
+	var proofCandidates sparse.Source
 	if s.MergeBaseSnapshot != "" {
+		if s.MemoryProofCandidates != nil {
+			proofCandidates = fetch.NewLayered(memoryBorrow{memorySource}, memoryBorrow{s.MemoryProofCandidates})
+		}
 		base, err := openMergeBaseStream(ctx, s.MergeBaseSnapshot, s.LocalCodec, s.LocalRequired, s.MemoryMergeBaseOpener)
 		if err != nil {
 			return nil, fmt.Errorf("merge memory base: %w", err)
@@ -336,7 +342,7 @@ func Take(s Sources, sink ArtifactSink, resumeAfter bool) (_ *Outputs, retErr er
 		// Both C and H are dirty relative to the remaining external suffix.
 		dirty = nil
 	}
-	snapshotSource, storage, err := BuildCaptureSource(ctx, sink, memorySource, dirty, configJSON, stateJSON, snapshotCfg, fallbackCoverage, fallbackValues, logf)
+	snapshotSource, storage, err := BuildCaptureSource(ctx, sink, memorySource, dirty, configJSON, stateJSON, snapshotCfg, fallbackCoverage, fallbackValues, proofCandidates, logf)
 	if err != nil {
 		return nil, fmt.Errorf("build Snapshot S: %w", err)
 	}

@@ -1,6 +1,7 @@
 package uffd
 
 import (
+	"container/list"
 	"context"
 	"errors"
 	"fmt"
@@ -831,12 +832,49 @@ func (h *Handler) runWorker(idx int) {
 	// single Handler-wide tailBuf under tailBusy reservation.
 	pageBuf := make([]byte, PageSize)
 	q := h.queue[idx]
+	// Retries are deduplicated by registered page, bounded by RAM pages, and
+	// rotated in small batches. Neither the reader nor a worker waits for a
+	// pending REMOVE to clear mmap_changing. Close joins this worker before
+	// closing any descriptor, just as it does for ordinary fault processing.
+	type wpKey struct {
+		fd int
+		va uint64
+	}
+	pending := list.New()
+	byPage := make(map[wpKey]*list.Element)
+	keyFor := func(ev faultEvent) wpKey { return wpKey{ev.uffdFD, ev.address &^ (PageSize - 1)} }
+	process := func(ev faultEvent) {
+		key := keyFor(ev)
+		retry := h.handleFault(ev, pageBuf)
+		if old := byPage[key]; old != nil {
+			pending.Remove(old)
+			delete(byPage, key)
+		}
+		if retry {
+			if len(byPage) >= h.cfg.Size/PageSize {
+				h.failRead(fmt.Errorf("uffd: WP retry pages exceed RAM registration"))
+				return
+			}
+			byPage[key] = pending.PushBack(ev)
+		}
+	}
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
 	for {
+		var retryC <-chan time.Time
+		if pending.Len() != 0 {
+			retryC = ticker.C
+		}
+
 		select {
 		case <-h.stop:
 			return
 		case <-h.ctx.Done():
 			return
+		case <-retryC:
+			for n := min(pending.Len(), 32); n > 0 && h.ctx.Err() == nil; n-- {
+				process(pending.Front().Value.(faultEvent))
+			}
 		case ev, ok := <-q:
 			if !ok || h.ctx.Err() != nil {
 				return
@@ -850,7 +888,7 @@ func (h *Handler) runWorker(idx int) {
 				ev.mandatory.done <- h.loadPage(ev.mandatory.ctx, ev.mandatory.offset, pageBuf)
 				h.stats.inflight.Add(-1)
 			} else {
-				h.handleFault(ev, pageBuf)
+				process(ev)
 			}
 		}
 	}
