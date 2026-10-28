@@ -184,6 +184,12 @@ ROOT=$("$BIN/manifest-ctl" store --manifest-config "$WORK/manifest.yaml" --no-pr
 [ "${#ROOT}" -eq 64 ] || e2e_fail "root manifest key is not 64 hex characters"
 
 mkdir "$WORK/data"
+# Keep initial executable bytes out of the ext4-superblock chunk used by Host
+# preflight; the blocked read must begin after Guest launch_ack.
+python3 - "$WORK/data/000-pad" <<'PYPAD'
+import pathlib,sys
+pathlib.Path(sys.argv[1]).write_bytes(b'P'*(256<<10))
+PYPAD
 cp "$LAUNCH_RECOVERY_BIN" "$WORK/data/entry"
 chmod 0755 "$WORK/data/entry"
 python3 - "$WORK/data/payload" <<'PY'
@@ -205,9 +211,11 @@ PAYLOAD_BLOCK=$(debugfs -R 'blocks /payload' "$WORK/data.raw" 2>/dev/null | awk 
 [ -n "$ENTRY_BLOCK" ] && [ -n "$PAYLOAD_BLOCK" ] || e2e_fail "missing physical file blocks"
 APP_KEYS=$("$LAUNCH_RECOVERY_BIN" keys "$WORK/data.manifest" "$WORK/data.img" "$((ENTRY_BLOCK*4096))" 4096)
 READ_KEYS=$("$LAUNCH_RECOVERY_BIN" keys "$WORK/data.manifest" "$WORK/data.img" "$((PAYLOAD_BLOCK*4096))" 4096)
-python3 - "$APP_KEYS" "$READ_KEYS" <<'PY'
+META_KEYS=$("$LAUNCH_RECOVERY_BIN" keys "$WORK/data.manifest" "$WORK/data.img" 1024 4096)
+python3 - "$APP_KEYS" "$READ_KEYS" "$META_KEYS" <<'PY' 
 import sys
 assert not set(sys.argv[1].split(',')) & set(sys.argv[2].split(',')), 'startup/read fault chunks overlap'
+assert not set(sys.argv[1].split(',')) & set(sys.argv[3].split(',')), 'startup fault overlaps Host ext4 preflight'
 PY
 truncate -s 256M "$WORK/seed.diff"
 mkfs.ext4 -q -F -O ^has_journal "$WORK/seed.diff"
