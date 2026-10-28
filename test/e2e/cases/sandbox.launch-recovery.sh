@@ -235,7 +235,12 @@ vm_identity() {
     python3 - "$RUN_PID" <<'PYVM'
 import pathlib,sys
 parent=int(sys.argv[1])
-children=pathlib.Path(f"/proc/{parent}/task/{parent}/children").read_text().split()
+# Linux lists children under the spawning OS thread, which need not be
+# the Go process's main thread.
+children=set()
+for task in pathlib.Path(f"/proc/{parent}/task").iterdir():
+    try: children.update((task/"children").read_text().split())
+    except FileNotFoundError: pass
 matches=[]
 for child in children:
     p=pathlib.Path("/proc")/child
