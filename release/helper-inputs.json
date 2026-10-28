@@ -43,6 +43,27 @@
         "sandbox.cgroup.sh",
         "snapshot.restore.sh"
       ]
+    },
+    {
+      "name": "dirty-memory-guest",
+      "env": "DIRTY_MEMORY_GUEST_BIN",
+      "cases": [
+        "snapshot.dirty-memory.sh"
+      ]
+    },
+    {
+      "name": "memorycompare",
+      "env": "MEMORY_COMPARE_BIN",
+      "cases": [
+        "snapshot.dirty-memory.sh"
+      ]
+    },
+    {
+      "name": "memorybaseline",
+      "env": "MEMORY_BASELINE_BIN",
+      "cases": [
+        "snapshot.dirty-memory.sh"
+      ]
     }
   ]
 }
