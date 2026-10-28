@@ -12,6 +12,14 @@ import (
 	"time"
 )
 
+func publish(path string, data []byte) error {
+	temporary := fmt.Sprintf("%s.%d.pending", path, os.Getpid())
+	if err := os.WriteFile(temporary, data, 0600); err != nil {
+		return err
+	}
+	return os.Rename(temporary, path)
+}
+
 func main() {
 	if len(os.Args) < 2 {
 		panic("expected serve, mutate, read, or check")
@@ -26,7 +34,7 @@ func main() {
 		report := func() {
 			sum := sha256.Sum256(pages)
 			b, _ := json.Marshal(map[string]any{"sha256": hex.EncodeToString(sum[:]), "bytes": len(pages)})
-			if err := os.WriteFile(response, b, 0600); err != nil {
+			if err := publish(response, b); err != nil {
 				panic(err)
 			}
 		}
@@ -51,7 +59,7 @@ func main() {
 						pages[i] = byte(i*19 + 53)
 					}
 				default:
-					panic("unknown command")
+					panic(fmt.Sprintf("unknown command %q", b))
 				}
 				if err := os.Remove(command); err != nil {
 					panic(err)
@@ -64,7 +72,7 @@ func main() {
 	}
 	if os.Args[1] != "check" {
 		_ = os.Remove(response)
-		if err := os.WriteFile(command, []byte(os.Args[1]), 0600); err != nil {
+		if err := publish(command, []byte(os.Args[1])); err != nil {
 			panic(err)
 		}
 	}
