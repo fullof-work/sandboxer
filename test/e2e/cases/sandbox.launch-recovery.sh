@@ -323,4 +323,4 @@ assert {'stall','half','offline','disk-read'} <= {r['mode'] for r in rows}
 assert any(r.get('event')=='connect-failure' for r in rows)
 PY
 cp "$WORK/faults.jsonl" "$WORK/launch.stats.json" "$OUT/"
-e2e_pass "same Launch and VM recovered post-ACK exec and ordinary mandatory reads"
+echo "PASS sandbox.launch-recovery.sh: same Launch and VM recovered post-ACK exec and ordinary mandatory reads"
