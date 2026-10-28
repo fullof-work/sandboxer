@@ -321,6 +321,7 @@ func handleReverseConnShutdown(c *vsockConn, sup *supervisorState, bridge *conso
 	switch req.Type {
 	case proto.TypeShutdown:
 		if err := proto.WriteMessage(c, &proto.Message{Type: proto.TypeAck}); err == nil {
+			initialLaunch.exited(0)
 			shutdown()
 		}
 		return false
@@ -335,7 +336,7 @@ func handleReverseConnShutdown(c *vsockConn, sup *supervisorState, bridge *conso
 		if err := c.SetLinger(muxCloseLingerSec); err != nil {
 			logf("reverse-channel: ping SO_LINGER: %v (continuing)", err)
 		}
-		if err := proto.WriteMessage(c, &proto.Message{Type: proto.TypePong, ID: req.ID, TSendNs: req.TSendNs}); err != nil {
+		if err := proto.WriteMessage(c, &proto.Message{Type: proto.TypePong, ID: req.ID, TSendNs: req.TSendNs, InitialLaunchState: initialLaunch.snapshot()}); err != nil {
 			logf("reverse-channel: write pong: %v", err)
 		}
 		return false
@@ -608,8 +609,8 @@ func quiesceExecAndMemoryReports(execReg *execRegistry, reports *memReportStream
 
 // notifyAppStarted dials the host launch UDS and sends a short-conn
 // app_started notification. Best-effort: errors are logged but not fatal to
-// the guest. The host emits no readiness fallback; an observer waiting for
-// ready instead fails closed through its own timeout and teardown policy.
+// the guest. The same token-bound initial fact remains available in Pong
+// when this notification or its ACK is lost.
 func notifyAppStarted(pid int) error {
 	conn, err := dialVsock(proto.VsockHostCID, proto.LaunchPort)
 	if err != nil {
@@ -617,7 +618,7 @@ func notifyAppStarted(pid int) error {
 	}
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(proto.DeadlineAppNotify))
-	if err := proto.WriteMessage(conn, &proto.Message{Type: proto.TypeAppStarted, PID: pid}); err != nil {
+	if err := proto.WriteMessage(conn, &proto.Message{Type: proto.TypeAppStarted, PID: pid, InitialLaunchState: initialLaunch.snapshot()}); err != nil {
 		return fmt.Errorf("write: %w", err)
 	}
 	resp, err := proto.ReadMessage(conn)
@@ -692,6 +693,7 @@ func exchangeMemReport(conn interface {
 // signal (code is then 128+sig per the shell convention). Best-effort —
 // the guest reboots regardless of outcome (docs/sandbox-init.md §3.3).
 func notifyAppExited(code, sig int) {
+	initialLaunch.exited(code)
 	conn, err := dialVsock(proto.VsockHostCID, proto.LaunchPort)
 	if err != nil {
 		logf("app_exited notify: dial: %v (continuing reboot)", err)
@@ -699,7 +701,7 @@ func notifyAppExited(code, sig int) {
 	}
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(proto.DeadlineAppNotify))
-	if err := proto.WriteMessage(conn, &proto.Message{Type: proto.TypeAppExited, Code: code, TermSignal: sig}); err != nil {
+	if err := proto.WriteMessage(conn, &proto.Message{Type: proto.TypeAppExited, Code: code, TermSignal: sig, InitialLaunchState: initialLaunch.snapshot()}); err != nil {
 		logf("app_exited notify: write: %v", err)
 		return
 	}

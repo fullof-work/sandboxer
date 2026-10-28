@@ -69,6 +69,10 @@ type LaunchServer struct {
 	// succeeded. Optional; nil → just ack.
 	OnAppStarted func(pid int)
 
+	// OnInitialLaunchState publishes a lightweight token-bound fact. It must
+	// not perform user callbacks or wait on capture/transport work.
+	OnInitialLaunchState func(proto.InitialLaunchState)
+
 	// OnAppExited fires when the guest reports its user app has
 	// exited. Optional; nil → just ack.
 	OnAppExited func(code int)
@@ -98,6 +102,7 @@ type LaunchServer struct {
 	helloOnce      sync.Once
 	helloClaim     atomic.Bool
 	helloSent      atomic.Bool
+	initialStateV1 atomic.Bool
 	muxReady       chan struct{}
 	runtimeReady   chan struct{}
 	runtimeOnce    sync.Once
@@ -185,10 +190,18 @@ func (s *LaunchServer) Serve(ctx context.Context) error {
 		s.connsWG.Add(1)
 		s.connsMu.Unlock()
 		go func() {
-			defer s.connsWG.Done()
-			defer func() { s.connsMu.Lock(); delete(s.conns, conn); s.connsMu.Unlock() }()
-			if keep := s.handleConn(conn); !keep {
+			var afterClose func()
+			if keep := s.handleConnAfter(conn, &afterClose); !keep {
 				_ = conn.Close()
+			}
+			s.connsMu.Lock()
+			delete(s.conns, conn)
+			s.connsMu.Unlock()
+			s.connsWG.Done()
+			// User callbacks can capture or Close the Runtime. The short
+			// connection and Serve join must no longer depend on their return.
+			if afterClose != nil {
+				afterClose()
 			}
 		}()
 	}
@@ -197,6 +210,12 @@ func (s *LaunchServer) Serve(ctx context.Context) error {
 // RuntimeReady closes when the guest has completed base initialization and
 // sent hello. In deferred mode this is deliberately before a LaunchSpec exists.
 func (s *LaunchServer) RuntimeReady() <-chan struct{} { return s.runtimeReady }
+
+// InitialLaunchStateSupported is fixed by the accepted runtime-ready hello.
+func (s *LaunchServer) InitialLaunchStateSupported() bool { return s.initialStateV1.Load() }
+
+// MUXReady closes after the final launch ACK and the MUX handoff.
+func (s *LaunchServer) MUXReady() <-chan struct{} { return s.muxReady }
 
 // HelloDone closes after the LaunchSpec has actually been written. It retains
 // the historical cold-start meaning and is therefore later than RuntimeReady
@@ -235,7 +254,19 @@ func (s *LaunchServer) LaunchAckDone() <-chan struct{} { return s.launchAckDone 
 
 // handleConn services one connection. It returns true iff it handed the
 // connection off (to OnMUXReady) and the caller must NOT close it.
-func (s *LaunchServer) handleConn(conn net.Conn) (handedOff bool) {
+func (s *LaunchServer) handleConn(conn net.Conn) bool {
+	var afterClose func()
+	keep := s.handleConnAfter(conn, &afterClose)
+	if !keep {
+		_ = conn.Close()
+	}
+	if afterClose != nil {
+		afterClose()
+	}
+	return keep
+}
+
+func (s *LaunchServer) handleConnAfter(conn net.Conn, afterClose *func()) (handedOff bool) {
 	// Deadline for the first read (hello / app notification). AppNotifyDeadline
 	// = 0 → no forced timeout (don't drop a guest that's briefly blocked on a
 	// slow page-in before it sends); a positive value catches a guest that
@@ -261,6 +292,14 @@ func (s *LaunchServer) handleConn(conn net.Conn) (handedOff bool) {
 			}
 			return false
 		}
+		if s.DeferLaunch && !msg.InitialLaunchStateV1 {
+			err := errors.New("guest incompatible: initial_launch_state_v1 is required for Launch")
+			_ = proto.WriteMessage(conn, &proto.Message{Type: proto.TypeError, Msg: err.Error()})
+			if s.OnLaunchFailure != nil {
+				s.OnLaunchFailure(err)
+			}
+			return false
+		}
 		if !s.helloClaim.CompareAndSwap(false, true) {
 			_ = proto.WriteMessage(conn, &proto.Message{Type: proto.TypeError, Msg: "hello already in progress"})
 			return false
@@ -272,6 +311,7 @@ func (s *LaunchServer) handleConn(conn net.Conn) (handedOff bool) {
 				s.OnLaunchFailure(errors.New("guest launch handshake failed"))
 			}
 		}()
+		s.initialStateV1.Store(msg.InitialLaunchStateV1)
 		s.runtimeOnce.Do(func() { close(s.runtimeReady) })
 		if s.helloSent.Load() {
 			s.Logf("launch: duplicate hello rejected")
@@ -416,18 +456,34 @@ func (s *LaunchServer) handleConn(conn net.Conn) (handedOff bool) {
 			s.Logf("launch: write app_started ack: %v", err)
 			return false
 		}
-		if s.OnAppStarted != nil {
-			s.OnAppStarted(msg.PID)
-		}
-		if s.appStartedDone != nil {
-			s.appStartedOnce.Do(func() { close(s.appStartedDone) })
+		*afterClose = func() {
+			if msg.InitialLaunchState != nil && s.OnInitialLaunchState != nil {
+				s.OnInitialLaunchState(*msg.InitialLaunchState)
+			}
+			if s.OnAppStarted != nil {
+				s.OnAppStarted(msg.PID)
+			}
+			if s.appStartedDone != nil {
+				s.appStartedOnce.Do(func() { close(s.appStartedDone) })
+			}
 		}
 		return false
 
 	case proto.TypeAppExited:
 		s.Logf("launch: app_exited code=%d term_signal=%d", msg.Code, msg.TermSignal)
-		if s.OnAppExited != nil {
-			s.OnAppExited(msg.Code)
+		if msg.InitialLaunchState != nil && s.OnInitialLaunchState != nil {
+			fact := *msg.InitialLaunchState
+			if fact.State != proto.InitialLaunchExited && fact.State != proto.InitialLaunchFailed {
+				// Keep the token: obsolete events remain ignorable; a current
+				// contradictory exit fact must fail instead of committing.
+				fact.State = "invalid_app_exited"
+			}
+			s.OnInitialLaunchState(fact)
+		}
+		*afterClose = func() {
+			if s.OnAppExited != nil {
+				s.OnAppExited(msg.Code)
+			}
 		}
 		_ = proto.WriteMessage(conn, &proto.Message{Type: proto.TypeAck})
 		return false

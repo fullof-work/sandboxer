@@ -535,7 +535,7 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 		Logf:              logf,
 		OnAppStarted: func(pid int) {
 			logf("guest reports user app pid=%d", pid)
-			if p.ReadyOnAppStarted {
+			if p.ReadyOnAppStarted && (p.owner == nil || p.owner.deviceSet == nil) {
 				notifyReady()
 			}
 		},
@@ -568,6 +568,8 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 		},
 	}
 	if r := p.owner; r != nil && r.deviceSet != nil {
+		r.notifyInitialReady = notifyReady
+		launch.OnInitialLaunchState = r.observeInitialLaunch
 		launch.OnLaunchFailure = func(err error) {
 			r.mu.Lock()
 			if r.launchFailure == nil {
@@ -609,6 +611,10 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 		Cfg:    guestlink.PingerConfig{FatalThreshold: p.PingFatalThreshold, Timeout: pingTO},
 		Stats:  &guestlink.PingStats{},
 		Logf:   logf,
+	}
+
+	if r := p.owner; r != nil && r.deviceSet != nil {
+		pinger.OnInitialLaunchState = r.observeInitialLaunch
 	}
 
 	if p.SnapCfg != nil && p.SnapCfg.Usage.Enabled {

@@ -3,6 +3,8 @@
 import json
 import pathlib
 import signal
+import select
+import time
 import socket
 import struct
 import sys
@@ -35,13 +37,26 @@ def record(mode, request):
     with lock, open(evidence, "a", encoding="utf8") as out:
         out.write(json.dumps({"mode": mode, "opcode": request[4],
                               "namespace": request[5],
-                              "key": request[7:39].hex()}) + "\n")
+                              "key": request[7:39].hex(), "monotonic_ns": time.monotonic_ns()}) + "\n")
 
 
 def record_connect_failure(mode):
     with lock, open(evidence, "a", encoding="utf8") as out:
         out.write(json.dumps({"mode": mode, "event": "connect-failure",
                               "opcode": -1, "namespace": -1, "key": ""}) + "\n")
+
+
+def await_release(client, mode):
+    # A timed-out client is joined promptly, even while the outage continues;
+    # the test proxy must not accumulate one blocked thread per retry.
+    while not stop.is_set():
+        current = pathlib.Path(control).read_text().strip().partition(":")[0]
+        if current != mode:
+            return current == "healthy"
+        ready, _, _ = select.select([client], [], [], .02)
+        if ready and not client.recv(1, socket.MSG_PEEK):
+            return False
+    return False
 
 
 def serve(client):
@@ -61,12 +76,24 @@ def serve(client):
             request = frame(client)
             mode, _, keys = pathlib.Path(control).read_text().strip().partition(":")
             chunk = request[4] == 1 and request[5] == 1
-            selected = mode not in ("cow", "disk-read") or request[7:39].hex() in keys.split(",")
+            selected = mode not in ("cow", "disk-read", "stall", "half") or request[7:39].hex() in keys.split(",")
             if chunk and selected and mode in ("offline", "cow", "disk-read"):
                 record(mode, request)
                 return  # one transport failure; caller must retain its request
+            if chunk and selected and mode == "stall":
+                record(mode, request)
+                if not await_release(client, mode):
+                    return
             backend.sendall(request)
             response = frame(backend)
+            if chunk and selected and mode == "half":
+                split = max(4, len(response) // 2)
+                client.sendall(response[:split])
+                record(mode, request)
+                if not await_release(client, mode):
+                    return
+                client.sendall(response[split:])
+                continue
             if chunk and mode == "corrupt" and response[4] == 0:
                 error_length = struct.unpack("<H", response[6:8])[0]
                 response[8 + error_length] ^= 0x80

@@ -60,6 +60,9 @@ type Pinger struct {
 	Cfg    PingerConfig
 	Stats  *PingStats
 	Logf   func(string, ...any)
+	// OnInitialLaunchState only publishes a small fact after verified Pong and
+	// peer EOF. It must never run user callbacks or block Pause/Stop.
+	OnInitialLaunchState func(proto.InitialLaunchState)
 
 	mu       sync.Mutex
 	running  atomic.Bool
@@ -285,6 +288,9 @@ func (p *Pinger) tick(parent context.Context, timeout time.Duration) {
 	p.Stats.Success.Add(1)
 	p.Stats.observeRTT(time.Since(tSend))
 	p.consecutiveFails.Store(0)
+	if resp.InitialLaunchState != nil && p.OnInitialLaunchState != nil {
+		p.OnInitialLaunchState(*resp.InitialLaunchState)
+	}
 }
 
 // recordFailure bumps the consecutive-failure counter and fires OnFatal

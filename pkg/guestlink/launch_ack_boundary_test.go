@@ -30,7 +30,7 @@ func TestLaunchServerAppStartedAtACKPublication(t *testing.T) {
 				OnAppStarted: func(int) { started.Add(1) },
 			}
 			close(srv.launchReady)
-			request := append(encodeLaunchMessage(t, &proto.Message{Type: proto.TypeHello, Phase: "runtime_ready"}), encodeLaunchMessage(t, &proto.Message{Type: proto.TypeLaunchAck})...)
+			request := append(encodeLaunchMessage(t, &proto.Message{Type: proto.TypeHello, Phase: "runtime_ready", InitialLaunchStateV1: true}), encodeLaunchMessage(t, &proto.Message{Type: proto.TypeLaunchAck})...)
 			expected := append(encodeLaunchMessage(t, &proto.Message{Type: proto.TypeLaunch, Launch: spec}), encodeLaunchMessage(t, &proto.Message{Type: proto.TypeAck})...)
 			wireACK, releaseWrite, helloDone := make(chan struct{}), make(chan struct{}), make(chan struct{})
 			var once sync.Once
@@ -108,5 +108,30 @@ func TestLaunchServerAppStartedBeforeLaunchStillRejected(t *testing.T) {
 	}
 	if response.Type != proto.TypeError || response.Msg != "workload has not launched" {
 		t.Fatalf("early notification accepted: %+v", response)
+	}
+}
+
+func TestLaunchServerExitFactPrecedesACKAndRejectsContradiction(t *testing.T) {
+	for _, state := range []string{proto.InitialLaunchExited, proto.InitialLaunchFailed, proto.InitialLaunchStarted, proto.InitialLaunchPending, "unknown"} {
+		t.Run(state, func(t *testing.T) {
+			var observed *proto.InitialLaunchState
+			srv := &LaunchServer{Logf: t.Logf, OnInitialLaunchState: func(s proto.InitialLaunchState) { observed = &s }}
+			conn := &scriptedLaunchConn{read: bytes.NewReader(encodeLaunchMessage(t, &proto.Message{Type: proto.TypeAppExited,
+				InitialLaunchState: &proto.InitialLaunchState{Token: "same-token", State: state, PID: 42}}))}
+			conn.write = func(b []byte) (int, error) {
+				if observed == nil {
+					t.Error("exit ACK preceded terminal publication")
+				}
+				return conn.written.Write(b)
+			}
+			srv.handleConn(conn)
+			want := state
+			if state != proto.InitialLaunchExited && state != proto.InitialLaunchFailed {
+				want = "invalid_app_exited"
+			}
+			if observed == nil || observed.Token != "same-token" || observed.State != want {
+				t.Fatalf("fact=%+v want=%s", observed, want)
+			}
+		})
 	}
 }

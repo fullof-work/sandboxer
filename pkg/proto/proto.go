@@ -91,6 +91,10 @@ var HostConnectLine = []byte(fmt.Sprintf("CONNECT %d\n", LaunchPort))
 // netlink-based applyNetwork pass. nil → no network configuration.
 // Stdio carries the app stdio mode the host wants (see StdioSpec).
 type LaunchSpec struct {
+	// InitialLaunchToken binds the one initial launch to its Guest facts. It is
+	// host operation identity, never portable artifact policy.
+	InitialLaunchToken string `json:"initial_launch_token,omitempty"`
+
 	Exec    string            `json:"exec"`
 	Args    []string          `json:"args,omitempty"`
 	Env     map[string]string `json:"env,omitempty"`
@@ -316,7 +320,29 @@ const (
 
 // Message is the typed envelope for management-connection messages.
 // Only fields relevant to Type are populated.
+// InitialLaunchState is the narrow initial_launch_state_v1 snapshot. It
+// describes the initial startup boundary, not the current primary PID or a
+// restore/attach running flag. Normal primary restarts retain Started.
+type InitialLaunchState struct {
+	Token string `json:"token"`
+	State string `json:"state"`
+	PID   int    `json:"pid,omitempty"`
+	Code  int    `json:"code,omitempty"`
+	Error string `json:"error,omitempty"`
+}
+
+const (
+	InitialLaunchPending = "pending"
+	InitialLaunchStarted = "started"
+	InitialLaunchFailed  = "failed"
+	InitialLaunchExited  = "exited"
+)
+
 type Message struct {
+	// InitialLaunchStateV1 is advertised in hello before Launch apply.
+	InitialLaunchStateV1 bool                `json:"initial_launch_state_v1,omitempty"`
+	InitialLaunchState   *InitialLaunchState `json:"initial_launch_state,omitempty"`
+
 	Type          string         `json:"type"`
 	UsageRequest  *UsageRequest  `json:"usage_request,omitempty"`
 	UsageResponse *UsageResponse `json:"usage_response,omitempty"`

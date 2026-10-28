@@ -1423,6 +1423,18 @@ func TestAsyncTemplateConcurrentFreshOpenClaimsDestination(t *testing.T) {
 	}
 }
 
+// gatedMaterialRun establishes a test-owned barrier before template copying
+// takes frontend stripes. It does not change the production materializer.
+type gatedMaterialRun struct {
+	diffTemplateSource
+	gate *workerGate
+}
+
+func (s *gatedMaterialRun) RunAt(off, limit uint64) (sparse.Run, error) {
+	s.gate.wait()
+	return s.diffTemplateSource.RunAt(off, limit)
+}
+
 func TestAsyncTemplateReadyDoesNotWaitForDirtyCacheDrain(t *testing.T) {
 	const size = 64 * cowBlockSize
 	dir := t.TempDir()
@@ -1435,19 +1447,31 @@ func TestAsyncTemplateReadyDoesNotWaitForDirtyCacheDrain(t *testing.T) {
 		gate.wait()
 		return nil
 	}})
-	cow, err := OpenDisk(finalPath, nil, DiffInit{TemplatePath: templatePath}, WithCache(cache))
+	// OpenDisk may legally publish the small template before our first write.
+	// Construct the same fresh disk with a test-only source barrier, so dirty
+	// writeback is definitely pending when template materialization completes.
+	fresh, err := createFreshDiffFile(finalPath, DiffInit{TemplatePath: templatePath}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	materialGate := newWorkerGate()
+	fresh.template = &gatedMaterialRun{diffTemplateSource: fresh.template, gate: materialGate}
+	cow, err := attachDisk(fresh.diff, fresh, make([]uint64, (size/cowBlockSize+63)/64), nil, diskOptions{cache: cache})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() {
+		materialGate.open()
 		gate.open()
 		_ = cow.Close()
 	}()
+	awaitSignal(t, materialGate.entered)
 
 	if _, err := cow.WriteAt(bytes.Repeat([]byte{0xa3}, cowBlockSize), 0); err != nil {
 		t.Fatal(err)
 	}
 	awaitSignal(t, gate.entered)
+	materialGate.open()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

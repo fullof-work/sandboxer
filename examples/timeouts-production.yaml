@@ -51,6 +51,6 @@ timeouts:
   # mem_report while a slow page-in still blocks the vCPU.
   app_notify: 200ms
 
-  # SDK post-ACK process bootstrap + app_started receipt; independent of
+  # Opt-in SDK post-ACK overall deadline (default/0 = none); independent of
   # app_notify. Default 2s; explicit values must be positive.
   app_start: 2s

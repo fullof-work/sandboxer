@@ -1729,7 +1729,8 @@ through the bound backends.
 `Launch` accepts only one workload. Pure input/state validation may reject
 without consuming the opportunity. Once `launching` begins, failure or
 cancellation terminates the runtime; another workload cannot replace it. The
-acknowledged `app_started` transition commits launch success against Close,
+token-bound initial started fact, after the ACK/MUX barriers, commits launch
+success against Close,
 cancellation and CH exit. This retains existing startup readiness: it does not
 prove target execve success or application health. Waiting for assignment after
 `runtime_ready` is outside the launch execution timeout. Base runtimes retain
@@ -1737,13 +1738,49 @@ resource reservations, controller heartbeat and resource stats, but do not
 report workload ready or Settled before launch.
 
 The SDK cold-launch path waits for `launch_ack` under `launch.start_timeout`
-and the operation context. After ACK, `timeouts.app_start` bounds guest process
-bootstrap and receipt of `app_started` (default `2s`; explicit values must be
-positive). It is independent of `timeouts.app_notify`, the socket read deadline
-for one message. A missing event or canceled operation closes the runtime.
+and the operation context. Post-ACK `timeouts.app_start` is an optional overall
+deadline: omitted/empty/`0` adds none; positive opts into a bound; negative/invalid
+is a configuration error. Only positive values create a timer.
+`DefaultAppStartDeadline` remains a deprecated zero constant and must not be
+passed unconditionally to NewTimer. Socket `timeouts.app_notify` and other phase
+policies retain their own semantics.
 
-A readiness callback that remains blocked after launch has committed does not
-turn that success into an application-start timeout.
+Host supplies a unique initial Launch token. Guest records pending, started,
+failed or exited at the actual startup/termination boundary. The fast app_started
+notification and existing Pinger's verified Pong publish the same fact to one
+confirmation entry. PID presence, reachability and restore's fixed running field
+are insufficient. Success requires ACK and MUX; failed/terminal facts also end
+pre-ACK waiting. Old tokens are ignored, invalid states fail, and late started
+cannot overwrite a terminal error.
+
+Commit checks owner/operation cancellation, Runtime state, permanent read errors
+and the current fact under the existing readiness/Runtime lock order. It signals
+internal completion before the user callback. Blocked callbacks cannot strand
+Launch, Pinger Pause/Stop or management-connection join. Pinger only publishes a
+bounded fact; callbacks run outside its tick and after notification connection
+close. Success and timeout/cancel/exit retain one linearized result.
+
+New Launch requires `initial_launch_state_v1` in runtime-ready hello before
+LaunchSpec/apply. Build sandbox-init and runtime Bundle together, including any
+prewarmed Guest intended for a new Launch. Missing capability fails explicitly
+without a two-second fallback. Old Hosts ignore additive Guest fields. Ordinary
+restore of an existing application retains restore/attach semantics and does not
+consume an old token for a new Launch. Host upgrade cannot replace init inside
+an existing snapshot. Primary restart retains the completed initial fact and
+existing supervision/notifications.
+
+The supported prewarm boundary is a live `runtime_ready` instance followed by
+Launch. The current SDK rejects Snapshot/Export before running, and a Guest
+without a workload rejects restore/attach/quiesce. Persisted prewarm-memory
+restore followed by a new Launch is not an implemented API. If such a state is
+provided by another lifecycle, the new Launch still requires the compatible
+Guest capability; this does not make an old snapshot's init upgradeable.
+
+Default PingFatalThreshold remains zero. Indefinite recovery can retain resources
+until cancellation/Close, permanent failure or real VM exit. Positive AppStart or
+explicit PingFatal selects bounded termination and cannot simultaneously promise
+unlimited recovery. Portable artifacts exclude host policy; Builder retains its
+outer work deadline.
 
 Operation contexts bound startup, launch, restore, live operations and individual
 waits. Canceling a successfully completed startup/launch context cannot kill the
@@ -2385,7 +2422,7 @@ A tail issues a single multipage `UFFDIO_COPY` or `UFFDIO_ZEROPAGE` for its cont
 
 `EVENT_REMOVE` makes discarded ranges missing again. Conditional tail-state updates must not overwrite concurrently produced `Released` state. Context cancellation stops workers and closes the owned descriptors/streams.
 
-UFFD directly retries required `Run.ReadAt` operations. The urgent page and any Chunk window containing it are required. A pure speculative tail makes one best-effort attempt. The existing `ChunkRun` capability, buffers, tail reservation and ioctl partial-progress/EEXIST/EAGAIN convergence remain in use. All vhost GPA/UVA accesses first wait for confirmed population through the owning CH UFFD; memory preparation failures terminate the request before used-ring publication. CPU urgent, mandatory backend and speculative tail installations share a gate with kernel REMOVE/UNMAP event read and state publication. A delayed source read is revalidated under that gate; observed release discards historical bytes and does not schedule a stale tail. See [cloud-hypervisor.md §3.3](cloud-hypervisor.md#33-0003--external-uffd-handler-via-in-process-create--scm_rights) for registration, cancellation, ownership limits and the real shared-memfd/O_DIRECT regressions.
+UFFD directly retries required `Run.ReadAt` operations. The urgent page and any Chunk window containing it are required. A pure speculative tail makes one best-effort attempt. The existing `ChunkRun` capability, buffers, tail reservation and ioctl partial-progress/EEXIST/EAGAIN convergence remain in use. All vhost GPA/UVA accesses first wait for confirmed population through the owning CH UFFD; memory preparation failures terminate the request before used-ring publication. CPU urgent, mandatory backend and speculative tail installations share a gate with kernel REMOVE/UNMAP event read and state publication. A delayed source read is revalidated under that gate; observed release discards historical bytes and does not schedule a stale tail. UNMAP also wakes pending faults on the original UFFD range so kernel GUP/KVM waiters recheck the removed VMA and exit; it never installs replacement bytes or detaches resources before the runner stops. See [cloud-hypervisor.md §3.3](cloud-hypervisor.md#33-0003--external-uffd-handler-via-in-process-create--scm_rights) for registration, cancellation, ownership limits and the real shared-memfd/O_DIRECT regressions.
 
 The shared [source read recovery policy](#read-recovery) retains the operation context and first terminal cause.
 
@@ -2829,6 +2866,27 @@ The original error is latched and the owner notified before cleanup I/O. While r
 ## 12. Validation, errors, and security
 
 ### 12.0 Runtime SDK lifecycle validation
+
+The prepared [launch recovery case](../test/e2e/cases/sandbox.launch-recovery.sh)
+blocks selected, observed Cache requests after ACK, crosses the former two-second
+window, injects partial responses and SIGKILL/connection refusal, and checks the
+same VM plus exact ordinary-read bytes after recovery. It uses ordinary Store
+and Cache services, independent of service drain or retained listeners.
+The [cgroup case](../test/e2e/cases/sandbox.cgroup.sh) checks the initial fact
+before and after a real primary restart; [restore](../test/e2e/cases/snapshot.restore.sh)
+checks the original token/state across an ordinary snapshot restore.
+The opt-in [SDK KVM test](../pkg/runtime/kvm_test.go) checks live runtime_ready,
+rejected prewarm capture/reattach, then a successful initial Launch. Record actual
+Host/init revisions and Bundle digests for old/new version tests; a local run is
+separate from trusted CI and from published artifact rollout.
+
+The initial-state regressions in [runtime_initial_launch_test.go](../pkg/sandbox/runtime_initial_launch_test.go)
+hold a real child after ACK across the old two-second window, drop app_started,
+and confirm the same Launch through Pong. They cover old tokens, terminal and
+protocol errors, and concurrent confirmations. Guest/Pinger tests verify coherent
+snapshots and EOF/Pause/Stop barriers. These are protocol/subprocess evidence,
+not real Guest kernel or trusted CI acceptance.
+
 
 Run `go test ./...` and `go test -race ./...`. The SDK regressions in
 [`runtime_sdk_test.go`](../pkg/sandbox/runtime_sdk_test.go) use real child processes

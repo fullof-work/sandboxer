@@ -2,6 +2,7 @@ package sandbox
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -154,6 +155,11 @@ type Runtime struct {
 	opsWG                              sync.WaitGroup
 	launchContext                      context.Context
 	launchSucceeded                    bool
+	initialLaunchToken                 string
+	initialLaunchState                 proto.InitialLaunchState
+	initialLaunchChanged               chan struct{}
+	launchDone                         chan struct{}
+	notifyInitialReady                 func()
 	launchFailure                      error
 	workMu                             sync.Mutex // joins launch preparation before releasing artifact resources
 	state                              runtimeState
@@ -554,6 +560,14 @@ func (r *Runtime) Launch(ctx context.Context, spec LaunchSpec) error {
 		r.mu.Unlock()
 		return fmt.Errorf("launch invalid in state %s", state)
 	}
+	if r.launch == nil || !r.launch.InitialLaunchStateSupported() {
+		r.mu.Unlock()
+		return errors.New("guest incompatible: initial_launch_state_v1 is required for Launch")
+	}
+	r.initialLaunchToken = rand.Text()
+	r.initialLaunchState = proto.InitialLaunchState{Token: r.initialLaunchToken, State: proto.InitialLaunchPending}
+	r.initialLaunchChanged = make(chan struct{}, 1)
+	r.launchDone = make(chan struct{})
 	r.state = runtimeLaunching
 	r.workMu.Lock()
 	r.mu.Unlock()
@@ -866,6 +880,7 @@ func (r *Runtime) Launch(ctx context.Context, spec LaunchSpec) error {
 		return fail(err)
 	}
 	_, netSpec := cfg.Network.Effective("", r.metaIP)
+	ls.InitialLaunchToken = r.initialLaunchToken
 	ls.Network = netSpec
 	ls.Mounts = effectiveMounts(cfg.Mounts, imageCfg.Volumes)
 	ls.Files = cfg.ProtoFiles()
@@ -895,44 +910,74 @@ func (r *Runtime) Launch(ctx context.Context, spec LaunchSpec) error {
 	}
 	workHeld = false
 	r.workMu.Unlock()
-	// Applying the workload (including guest init) is governed by
-	// launch.start_timeout and the operation context, not the short
-	// app_started notification budget. Start that budget only after ACK.
-	select {
-	case <-r.launch.LaunchAckDone():
-	case <-ctx.Done():
-		return fail(errors.Join(errors.New("runtime launch interrupted before launch_ack"), ctx.Err()))
-	case <-r.exitDone:
-		return fail(errors.New("runtime exited before launch_ack"))
-	}
-	// ACK precedes process/cgroup/namespace bootstrap in the guest. Bound that
-	// lifecycle phase independently of the per-message app-notify socket I/O.
-	// app_started is best-effort, so a lost notification still fails closed.
-	appWait := cfg.AppStartDeadline()
-	appTimer := time.NewTimer(appWait)
-	defer appTimer.Stop()
-	var appTimeout error
-	select {
-	case <-r.launch.AppStartedDone():
-	case <-appTimer.C:
-		// commitLaunch runs before the user readiness callback, which may
-		// still be blocking AppStartedDone. Preserve that committed success
-		// just as the operation-cancellation and runtime-exit paths do.
-		appTimeout = fmt.Errorf("runtime launch app_started notification timed out after %s", appWait)
-	case <-ctx.Done():
-	case <-r.exitDone:
+	// Facts may precede ACK/MUX, but success cannot. A failed Guest fact must
+	// also terminate the pre-ACK wait. Only a positive post-ACK budget owns a
+	// timer; the default remains tied to this operation and Runtime owner.
+	ackC, muxC := r.launch.LaunchAckDone(), r.launch.MUXReady()
+	acked, muxed, confirming := false, false, false
+	var timer *time.Timer
+	var timeoutC <-chan time.Time
+	defer func() {
+		if timer != nil {
+			timer.Stop()
+		}
+	}()
+	var waitErr error
+wait:
+	for {
+		r.mu.Lock()
+		succeeded, failure := r.launchSucceeded, r.launchFailure
+		started := r.initialLaunchState.State == proto.InitialLaunchStarted
+		r.mu.Unlock()
+		if succeeded {
+			launched = true
+			return nil
+		}
+		if failure != nil {
+			waitErr = failure
+			break
+		}
+		if acked && muxed && started && !confirming {
+			confirming = true
+			// notifyReady retains the read-fatal gate and lock order. Its user
+			// callback can block independently of commitLaunch/launchDone.
+			go r.notifyInitialReady()
+		}
+		select {
+		case <-ackC:
+			acked, ackC = true, nil
+			if d := cfg.AppStartDeadline(); d > 0 {
+				timer = time.NewTimer(d)
+				timeoutC = timer.C
+			}
+		case <-muxC:
+			muxed, muxC = true, nil
+		case <-r.initialLaunchChanged:
+		case <-r.launchDone:
+		case <-timeoutC:
+			waitErr = fmt.Errorf("runtime initial launch timed out after %s", cfg.AppStartDeadline())
+			break wait
+		case <-ctx.Done():
+			waitErr = errors.Join(errors.New("runtime launch interrupted"), ctx.Err())
+			break wait
+		case <-r.exitDone:
+			waitErr = errors.Join(errors.New("runtime exited during launch"), r.exit.Err)
+			break wait
+		}
 	}
 	r.mu.Lock()
 	succeeded := r.launchSucceeded
+	if !succeeded && r.launchFailure == nil {
+		// Timer/cancel/exit and success share one linearization lock. Freeze
+		// failure before Close so a queued readiness worker cannot commit.
+		r.launchFailure = waitErr
+	}
 	r.mu.Unlock()
 	if succeeded {
 		launched = true
 		return nil
 	}
-	if appTimeout != nil {
-		return fail(appTimeout)
-	}
-	return fail(errors.Join(errors.New("runtime launch did not complete"), ctx.Err()))
+	return fail(waitErr)
 
 }
 func openLaunchFile(ctx context.Context, s LaunchSpec, path string, ref manifest.Ref, locations config.RefLocations) (fetch.Stream, error) {
@@ -1467,12 +1512,57 @@ func (r *Runtime) commitLaunch() bool {
 	if r.launchSucceeded {
 		return true
 	}
-	if r.state != runtimeLaunching || r.launchContext == nil || r.launchContext.Err() != nil {
+	if r.state != runtimeLaunching || r.launchContext == nil || r.launchContext.Err() != nil ||
+		r.lifeCtx.Err() != nil || r.launchFailure != nil ||
+		r.initialLaunchState.Token != r.initialLaunchToken || r.initialLaunchToken == "" ||
+		r.initialLaunchState.State != proto.InitialLaunchStarted {
+		return false
+	}
+	select {
+	case <-r.launch.LaunchAckDone():
+	default:
+		return false
+	}
+	select {
+	case <-r.launch.MUXReady():
+	default:
 		return false
 	}
 	r.launchSucceeded = true
 	r.state = runtimeRunning
+	close(r.launchDone)
 	return true
+}
+
+// observeInitialLaunch is shared by app_started and verified Pong. The bounded
+// channel only wakes the Launch owner; the authoritative snapshot is under mu.
+// Terminal/protocol failure wins over any later started observation until commit.
+func (r *Runtime) observeInitialLaunch(fact proto.InitialLaunchState) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.state != runtimeLaunching || fact.Token != r.initialLaunchToken || fact.Token == "" || r.launchFailure != nil {
+		return
+	}
+	switch fact.State {
+	case proto.InitialLaunchPending:
+		return
+	case proto.InitialLaunchStarted:
+		if fact.PID <= 0 {
+			r.launchFailure = errors.New("guest initial launch has invalid started PID")
+		} else {
+			r.initialLaunchState = fact
+		}
+	case proto.InitialLaunchFailed:
+		r.launchFailure = fmt.Errorf("guest initial launch failed: %s", fact.Error)
+	case proto.InitialLaunchExited:
+		r.launchFailure = fmt.Errorf("guest terminated during initial launch: code %d", fact.Code)
+	default:
+		r.launchFailure = fmt.Errorf("guest initial launch has invalid state %q", fact.State)
+	}
+	select {
+	case r.initialLaunchChanged <- struct{}{}:
+	default:
+	}
 }
 
 type runtimeConsoleWriter struct {

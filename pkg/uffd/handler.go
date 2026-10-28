@@ -573,6 +573,14 @@ func (h *Handler) dispatchRelease(msg *uffdMsg, fd int) {
 	h.handleRemoveLocked(rm.Start, rm.End, fd)
 	if msg.Event == uffdEventUnmap {
 		h.addrMap.invalidate(fd, rm.Start, rm.End)
+		// Reading UNMAP lets the unmapping thread resume, but does not wake
+		// page faults whose events we already consumed. An in-flight worker
+		// must not install into the invalid VMA; wake its original waiters
+		// here so kernel GUP (including KVM async faults) can recheck the VMA
+		// and finish. REMOVE keeps the mapping and retains its zero-fill path.
+		if rm.End > rm.Start && rm.Start%PageSize == 0 && rm.End%PageSize == 0 {
+			h.wake(fd, rm.Start, rm.End-rm.Start)
+		}
 	}
 	h.stats.removeEvents.Add(1)
 }

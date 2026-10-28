@@ -165,6 +165,45 @@ mount follows Launch's all-device publication. The host starts pings at
 app_started does not prove execve success or application health. Existing memory
 snapshots use restore/attach, not this cold handshake.
 
+**Initial Launch confirmation:** runtime-ready hello advertises
+`initial_launch_state_v1`. A new Host checks this capability before applying
+Launch; rebuild both sandbox-init and its sandbox-runtime Bundle when upgrading
+the Guest baseline. A Host upgrade cannot replace init in an existing snapshot.
+An ordinary restore attaches to its existing application; a restored prewarm
+runtime that will accept a new Launch must already contain a compatible init.
+
+The supported prewarm boundary is a live `runtime_ready` instance followed by
+Launch. The current SDK rejects Snapshot/Export before running, and a Guest
+without a workload rejects restore/attach/quiesce. Persisted prewarm-memory
+restore followed by a new Launch is not an implemented API. If such a state is
+provided by another lifecycle, the new Launch still requires the compatible
+Guest capability; this does not make an old snapshot's init upgradeable.
+
+The Host supplies a unique `initial_launch_token` in LaunchSpec. Guest records
+a mutex-protected snapshot for that token: `pending` before workload preparation,
+`started` at the existing initial primary publication boundary, `failed` on a
+hard startup error, or terminal `exited` when termination is accepted. The
+snapshot includes the initial PID or failure/exit details. PID presence and a
+reachable Ping are not startup evidence. Normal primary restart preserves the
+completed initial state and the existing supervision semantics.
+
+The existing `app_started` fast notification and Ping/Pong both carry
+`initial_launch_state`; `app_exited` carries the terminal snapshot. The Host
+uses one confirmation gate for these facts, checking the current token,
+ACK/MUX barriers, cancellation, permanent errors and VM exit. Pending, obsolete
+tokens and repeated facts cannot commit. The existing Pinger publishes only
+lightweight facts; no additional Guest sender or polling loop is introduced.
+Management connections reach EOF and leave the connection join before user
+callbacks. Successful commit signals the Launch waiter before callbacks run.
+
+`timeouts.app_start` is Host policy: omitted, empty or zero means no extra
+post-ACK deadline; a positive duration opts into an overall post-ACK deadline.
+Negative/invalid values are errors. This does not change `launch.start_timeout`,
+`app_notify` exchange limits, cancellation, fatal startup errors or VM exit.
+`PingFatalThreshold` remains zero by default; explicitly enabling a positive
+threshold may terminate a runtime while a dependency is still recovering.
+Portable E/S artifacts do not carry this Host policy.
+
 **Volume sources and relocation:** an `empty` volume's source is
 `/overlay/upper/volumes/<i>` on raw ext4, separate from `upperdir/` but on the
 same vdb and in the same disk capture. Its bind is installed under sysroot.

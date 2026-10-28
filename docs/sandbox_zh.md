@@ -1522,18 +1522,44 @@ Launch 先准备并验证全部 backend，再以一个原子发布点绑定整�
 绑定后的 backend 保留 COW writeback fatal hook、context-aware I/O、统计和 snapshot view。
 
 `Launch` 只接受一个工作负载。纯输入/状态校验失败可不消耗机会；进入 `launching`
-后失败或取消会终止 Runtime，不能替换为另一个工作负载。已确认的 `app_started`
-转换与 Close、取消和 CH exit 一起确定唯一 launch 成功结果。它保留既有启动就绪语义，
+后失败或取消会终止 Runtime，不能替换为另一个工作负载。绑定本次 token 的初始 started 事实通过 ACK/MUX 屏障后，
+与 Close、取消和 CH exit 一起确定唯一 launch 成功结果。它保留既有启动就绪语义，
 不证明目标 execve 成功或应用健康。`runtime_ready` 后等待分配工作负载的时间不计入
 launch 执行超时。基础 Runtime 保持资源 reservation、controller heartbeat 和资源统计，
 但不会在 launch 前报告工作负载 ready 或 Settled。
 
-SDK 冷启动在 `launch.start_timeout` 和操作 context 的约束下等待 `launch_ack`。
-ACK 后由 `timeouts.app_start` 限制 Guest 进程引导及 `app_started` 通知到达的时间，
-默认 `2s`，显式值必须为正数。它与单条消息的 socket 读取期限
-`timeouts.app_notify` 独立；通知丢失或操作取消仍会关闭 runtime。
+SDK 冷启动在 `launch.start_timeout` 与操作 context 下等待 `launch_ack`。
+ACK 后 `timeouts.app_start` 是可选整体期限：省略、空值或 `0` 不增加期限；
+正时长选择有界等待；负数/非法值为配置错误。仅正数创建 timer。
+`DefaultAppStartDeadline` 保留为已弃用零常量，不可无条件传给 NewTimer。
+Socket `timeouts.app_notify` 和其他阶段策略保持各自语义。
 
-启动已经提交成功后，readiness 回调阻塞不会再将该成功转为应用启动超时。
+Host 提供唯一初始 Launch token。Guest 在真实启动/终止边界记录 pending、started、
+failed 或 exited。快速 app_started 和既有 Pinger 的已校验 Pong 将同一事实送到
+统一确认入口。PID 存在、Ping 可达或 restore 的固定 running 字段都不充分。
+成功要求 ACK 和 MUX；failed/terminal 也可结束 ACK 前等待。旧 token 被忽略，
+非法状态失败，迟到 started 不能覆盖确定终止错误。
+
+Commit 按既有 readiness/Runtime 锁顺序检查 owner/operation 取消、Runtime 状态、
+永久读取错误与当前事实；在用户回调前发布内部完成信号。回调阻塞不影响 Launch、
+Pinger Pause/Stop 或管理连接 join。Pinger 仅发布有界事实，回调在 tick 外、通知
+连接关闭后执行。成功与期限/取消/退出保留唯一线性化结果。
+
+新 Launch 在 LaunchSpec/apply 前要求 runtime-ready hello 的
+`initial_launch_state_v1`。需一起构建 sandbox-init 和 runtime Bundle；用于新
+Launch 的预热 Guest 同样升级。缺能力明确失败，不回退两秒策略。旧 Host 忽略
+Guest 新字段。已有应用的普通 restore 保留 restore/attach 语义，不消费旧 token
+作为新 Launch 事实。Host 升级无法替换 snapshot 中的 init。Primary restart 保持
+已完成初始事实及原监督/通知语义。
+
+当前支持的预热边界是仍存活的 `runtime_ready` 实例随后执行 Launch。SDK 在
+running 前拒绝 Snapshot/Export；尚无工作负载的 Guest 拒绝 restore/attach/quiesce。
+“保存预热内存、恢复后再 Launch”不是已实现的 API。若其他生命周期提供这种状态，
+新 Launch 仍须满足 Guest 能力要求；这不代表可以升级旧 snapshot 内的 init。
+
+默认 PingFatalThreshold 仍为零。无限恢复可能持续持有资源，直到取消/Close、
+永久错误或真实 VM 退出。正数 AppStart 或显式 PingFatal 选择有界终止，不能同时
+保证无限恢复。Portable 制品不含宿主策略，Builder 保留外层 work deadline。
 
 Operation context 限定 startup、launch、restore、live operation 和单次 wait。
 成功返回后取消 startup/launch context，不会杀死 Runtime 或使后续 lazy read 失效。
@@ -2170,7 +2196,7 @@ Tail对其连续有效范围只发出一次multi-page `UFFDIO_COPY`或
 `EVENT_REMOVE`使已丢弃范围重新成为missing,tail提交使用条件状态更新,不能覆盖并发
 产生的`Released`. Context cancellation停止worker并关闭fd/stream owner.
 
-UFFD 直接重试必需的 `Run.ReadAt`. urgent 页及包含它的 Chunk window 属于必需读取. 纯 speculative tail 只执行一次最佳努力尝试. 保留现有 `ChunkRun` 能力、buffer、tail 预留和 ioctl 部分进展/EEXIST/EAGAIN 收敛. 所有 vhost GPA/UVA 访问首先通过所属 CH UFFD 等待确认填充；内存准备失败在发布 used-ring 完成记录前终止请求。CPU urgent、后端 mandatory 和 speculative tail 安装与内核 REMOVE/UNMAP 事件读取及状态发布共用同一把锁。延迟读取的来源数据在锁内重新校验；观察到释放后丢弃历史字节，不再安排过期 tail。注册、取消、所有权边界与真实共享 memfd/O_DIRECT 回归见 [cloud-hypervisor_zh.md §3.3](cloud-hypervisor_zh.md#33-0003--external-uffd-handler-via-in-process-create--scm_rights)。
+UFFD 直接重试必需的 `Run.ReadAt`. urgent 页及包含它的 Chunk window 属于必需读取. 纯 speculative tail 只执行一次最佳努力尝试. 保留现有 `ChunkRun` 能力、buffer、tail 预留和 ioctl 部分进展/EEXIST/EAGAIN 收敛. 所有 vhost GPA/UVA 访问首先通过所属 CH UFFD 等待确认填充；内存准备失败在发布 used-ring 完成记录前终止请求。CPU urgent、后端 mandatory 和 speculative tail 安装与内核 REMOVE/UNMAP 事件读取及状态发布共用同一把锁。延迟读取的来源数据在锁内重新校验；观察到释放后丢弃历史字节，不再安排过期 tail。UNMAP 还会唤醒原 UFFD 范围上的等待者，使内核 GUP/KVM 缺页请求重新检查已删除的 VMA 并退出；它不会安装替代字节，也不会在 runner 停止前 detach 资源。注册、取消、所有权边界与真实共享 memfd/O_DIRECT 回归见 [cloud-hypervisor_zh.md §3.3](cloud-hypervisor_zh.md#33-0003--external-uffd-handler-via-in-process-create--scm_rights)。
 
 共享[源读取恢复策略](#read-recovery)保留操作 context 和首个终态原因。
 
@@ -2524,10 +2550,27 @@ Close 幂等，排空及关闭错误沿 run/restore 传播。销毁也必须等�
 
 ### 12.0 Runtime SDK 生命周期验证
 
+已准备的 [启动恢复用例](../test/e2e/cases/sandbox.launch-recovery.sh) 在 ACK 后阻断
+精确且已观测的 Cache 请求，跨越原两秒窗口，注入半响应、SIGKILL 和连接拒绝，
+恢复后核对同一 VM 及普通必要读取的完整字节。测试使用普通 Store/Cache，不依赖
+服务排空或保留 listener。[cgroup 用例](../test/e2e/cases/sandbox.cgroup.sh) 在真实
+primary restart 前后比较初始事实；[restore 用例](../test/e2e/cases/snapshot.restore.sh)
+比较普通快照恢复前后的原 token/状态。[可选 SDK KVM 测试](../pkg/runtime/kvm_test.go)
+覆盖 live runtime_ready、预热 capture/reattach 的拒绝及之后的正常初始 Launch。
+新旧版本测试须记录实际 Host/init revision 和 Bundle 摘要；本地执行、正式受信 CI
+及已发布制品生效是不同证据。
+
 执行 `go test ./...` 和 `go test -race ./...`。
 [`runtime_sdk_test.go`](../pkg/sandbox/runtime_sdk_test.go) 使用真实子进程和 Unix socket
 验证资源所有权、base/launch 屏障、取消、并发 Close、保留的 Wait 结果、launch/stdio
 失败、后续 artifact read 及磁盘 payload 边界。
+
+[runtime_initial_launch_test.go](../pkg/sandbox/runtime_initial_launch_test.go)
+将真实子进程停在 ACK 后跨越旧两秒窗口，丢弃 app_started，再由 Pong 完成同一次
+Launch；同时覆盖旧 token、确定终止/协议错误和并发确认。Guest/Pinger 测试验证
+一致快照及 EOF/Pause/Stop 屏障。这些是协议/子进程证据，不等于真实 Guest 内核
+或受信 CI 验收。
+
 [`runtime_app_start_test.go`](../pkg/sandbox/runtime_app_start_test.go) 验证 ACK 后的延迟
 通知与 socket 期限相互独立，并覆盖应用启动预算、操作取消及失败 launch 的清理。
 这些测试不启动 Guest kernel。

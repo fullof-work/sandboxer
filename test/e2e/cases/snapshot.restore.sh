@@ -12,6 +12,7 @@ source "$SANDBOXER_LIB/tarstream.sh"
 : "${WORK:?WORK is required}"
 : "${OUT:?OUT is required}"
 : "${E2E_IMAGE:?E2E_IMAGE is required}"
+: "${LAUNCH_RECOVERY_BIN:?prepared initial-state probe required}"
 
 require_root
 require_kvm
@@ -148,6 +149,7 @@ r = json.load(open(sys.argv[1]))
 assert r['phase'] == 'armed' and r['cold_control_mismatches'] == 0 and r['regions'] == 32, r
 PY_DIO
 
+"$LAUNCH_RECOVERY_BIN" pong "$WORK/runtime/$SID1/vsock.sock" >"$OUT/initial-before.json"
 "$BIN/sandbox-ctl" snapshot --sandbox-id "$SID1" --output "$WORK/snapshot" --run-root "$WORK/runtime" \
     >"$OUT/snapshot.log" 2>&1
 wait "$SBPID1" || true
@@ -210,6 +212,14 @@ assert config["pmem"][0]["file"] == sys.argv[2], config["pmem"]
 PY
 sha256sum --check --status "$WORK/source.sha256" || e2e_fail "restore modified source snapshot artifacts"
 sha256sum --check --status "$WORK/host-inputs.sha256" || e2e_fail "restore modified host inputs"
+
+"$LAUNCH_RECOVERY_BIN" pong "$WORK/runtime/$SID2/vsock.sock" >"$OUT/initial-after.json"
+python3 - "$OUT/initial-before.json" "$OUT/initial-after.json" <<'PY_INITIAL'
+import json,sys
+before,after=[json.load(open(p)) for p in sys.argv[1:]]
+assert before and before["token"] and before["state"]=="started", before
+assert after==before,(before,after)
+PY_INITIAL
 
 # A separate native exec triggers the retained primary only after restore.
 "$BIN/sandbox-ctl" exec --sandbox-id "$SID2" --run-root "$WORK/runtime" -- touch /tmp/dio-trigger
