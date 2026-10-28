@@ -399,6 +399,12 @@ UNMAP、registration 缺口、事件流损坏、Loaded 无 release 却变 Hole �
 报错。D/R 不因捕获成功、失败或 merge_ref 切换清空；生命周期和 exec/stdio 屏障
 仍沿用既有流程。S 编码及历史裁剪见 [sandbox.md 中文版](sandbox_zh.md#snapshot-format)。
 
+0016 允许 HTTP 线程以只读、close-on-exec 标志打开并读取文件。释放较大的
+dirty-memory 响应可能触发 glibc arena 裁剪，其延迟初始化的 overcommit 检查会读取
+`/proc/sys/vm/overcommit_memory`；缺少这些规则时，6 GiB 捕获可能在交付响应前
+因 SIGSYS 终止 CH。可写、创建和截断模式仍被拦截；子进程测试验证实际安装的过滤器，
+既有 6 GiB Demo 覆盖完整捕获路径。
+
 ## 4. 构建工作流
 
 `sandboxer/native-deps` 从固定 v51.1 tarball 构建,应用

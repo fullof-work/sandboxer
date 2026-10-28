@@ -482,6 +482,13 @@ Loaded page becoming Hole without release fail capture. Success, failure and
 merge_ref switches never reset D/R; existing lifecycle and exec/stdio barriers
 remain in force. See [Snapshot S and history](sandbox.md#snapshot-format).
 
+Patch 0016 permits the HTTP thread to perform read-only, close-on-exec opens and reads.
+Freeing a large dirty-memory response can trigger glibc arena trimming, whose lazy
+overcommit check reads `/proc/sys/vm/overcommit_memory`. Without these rules a 6 GiB
+capture can terminate CH with SIGSYS before the response is delivered. Writable,
+creating and truncating opens remain trapped; a child-process test exercises the
+installed filter, and the existing 6 GiB Demo covers the full capture path.
+
 ## 4. Build workflow
 
 `sandboxer/native-deps` builds the artifact from the pinned v51.1 tarball,
