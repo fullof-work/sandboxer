@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -28,6 +29,8 @@ func TestInitialLaunchPongCompensatesLostNotificationACKAndPreservesPauseEOF(t *
 	}
 	base := filepath.Join(t.TempDir(), "vsock")
 	written, allowEOF := make(chan struct{}), make(chan struct{})
+	var closeOnce sync.Once
+	releaseEOF := func() { closeOnce.Do(func() { close(allowEOF) }) }
 	proxy := newFakeCHProxy(t, base, func(c net.Conn) {
 		req, err := proto.ReadMessage(c)
 		if err != nil {
@@ -40,6 +43,7 @@ func TestInitialLaunchPongCompensatesLostNotificationACKAndPreservesPauseEOF(t *
 		<-allowEOF
 	})
 	defer proxy.close()
+	defer releaseEOF()
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	p := &Pinger{Client: &HostClient{BasePath: base}, Cfg: PingerConfig{Interval: time.Hour, Timeout: 2 * time.Second},
@@ -53,8 +57,14 @@ func TestInitialLaunchPongCompensatesLostNotificationACKAndPreservesPauseEOF(t *
 	default:
 	}
 	paused := make(chan error, 1)
-	go func() { paused <- p.PauseContext(ctx) }()
-	close(allowEOF)
+	drain := &pingDrainObservedContext{Context: ctx, observed: make(chan struct{})}
+	go func() { paused <- p.PauseContext(drain) }()
+	select {
+	case <-drain.observed:
+	case <-ctx.Done():
+		t.Fatal("Pause did not enter the in-flight probe barrier")
+	}
+	releaseEOF()
 	select {
 	case err := <-paused:
 		if err != nil {
