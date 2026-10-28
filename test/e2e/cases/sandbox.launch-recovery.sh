@@ -198,8 +198,8 @@ mkfs.ext4 -q -F -O ^has_journal -b 4096 -d "$WORK/data" "$WORK/data.raw"
 DATA=$("$BIN/manifest-ctl" store --manifest-config "$WORK/manifest.yaml" --no-progress "$WORK/data.img")
 "$BIN/manifest-ctl" get-manifest --manifest-config "$WORK/manifest.yaml" "$DATA" >"$WORK/data.manifest"
 # debugfs resolves actual inode blocks; the fixture uses the canonical carrier
-# parser and manifest table to select physical requests, without decrypting
-# arbitrary cached chunks or guessing offsets from a tar header.
+# parser to validate logical geometry and the manifest table to select requests.
+# Manifest offsets address decoded disk bytes, not tarstream carrier positions.
 ENTRY_BLOCK=$(debugfs -R 'blocks /entry' "$WORK/data.raw" 2>/dev/null | awk '{print $1}')
 PAYLOAD_BLOCK=$(debugfs -R 'blocks /payload' "$WORK/data.raw" 2>/dev/null | awk '{print $257}')
 [ -n "$ENTRY_BLOCK" ] && [ -n "$PAYLOAD_BLOCK" ] || e2e_fail "missing physical file blocks"

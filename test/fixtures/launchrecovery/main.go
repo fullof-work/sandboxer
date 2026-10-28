@@ -1,13 +1,12 @@
 // launchrecovery is a prepared test fixture, never a product control hook.
-// "keys" maps a logical disk read through the canonical carrier parser to its
-// physical manifest chunks; "guest" performs independently gated real reads.
+// "keys" selects Manifest chunks for an inode logical disk range after
+// validating the carrier geometry; "guest" performs gated real reads.
 package main
 
 import (
 	"bytes"
 	"context"
 	"fmt"
-	"io"
 	"os"
 	"strconv"
 	"strings"
@@ -17,19 +16,6 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 )
 
-type extent struct{ start, end int64 }
-type trackingReader struct {
-	io.ReaderAt
-	reads []extent
-	armed bool
-}
-
-func (r *trackingReader) ReadAt(b []byte, off int64) (int, error) {
-	if r.armed {
-		r.reads = append(r.reads, extent{off, off + int64(len(b))})
-	}
-	return r.ReaderAt.ReadAt(b, off)
-}
 func keys(args []string) error {
 	if len(args) != 4 {
 		return fmt.Errorf("keys MANIFEST CARRIER OFFSET LENGTH")
@@ -59,12 +45,13 @@ func keys(args []string) error {
 	if err != nil {
 		return err
 	}
-	r := &trackingReader{ReaderAt: f}
-	src, _, err := tarstream.SourceAt(r, st.Size(), "")
+	src, _, err := tarstream.SourceAt(f, st.Size(), "")
 	if err != nil {
 		return err
 	}
-	r.armed = true
+	if src.Size() != m.ImageSize {
+		return fmt.Errorf("carrier and manifest logical sizes differ")
+	}
 	if _, err = src.ReadAt(context.Background(), make([]byte, int(length)), uint64(off)); err != nil {
 		return err
 	}
@@ -73,11 +60,10 @@ func keys(args []string) error {
 		if chunk.IsZero {
 			continue
 		}
-		for _, x := range r.reads {
-			if int64(chunk.Offset) < x.end && int64(chunk.Offset)+int64(chunk.Size) > x.start {
-				selected = append(selected, fmt.Sprintf("%x", chunk.CiphertextHash))
-				break
-			}
+		// manifest-ctl ingests the decoded sparse source. Its entry offsets
+		// address disk bytes, never physical tarstream carrier positions.
+		if chunk.Offset < uint64(off+length) && chunk.Offset+uint64(chunk.Size) > uint64(off) {
+			selected = append(selected, fmt.Sprintf("%x", chunk.CiphertextHash))
 		}
 	}
 	if len(selected) == 0 {
