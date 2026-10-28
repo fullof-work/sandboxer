@@ -1,12 +1,17 @@
 package uffd
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"runtime"
 	"testing"
 
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
+	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
+	"github.com/kuasar-sandbox/sandboxer/pkg/snapshot"
+	"github.com/kuasar-sandbox/sandboxer/pkg/snapshotfile"
 	"golang.org/x/sys/unix"
 )
 
@@ -41,6 +46,10 @@ func TestRealWriteProtectCleanFillDirtyWriteAndReleaseCapture(t *testing.T) {
 	if v.Dirty[0]&1 == 0 {
 		t.Fatal("WP branch lost write")
 	}
+	// Prove this nonzero parent page is still unmaterialized before release.
+	if v.Materialized[3]&1 != 0 {
+		t.Fatal("release fixture page was already materialized")
+	}
 	// Real release ordering, including an already sparse parent page.
 	if err := unix.Madvise(cpu[24*PageSize:25*PageSize], unix.MADV_DONTNEED); err != nil {
 		t.Fatal(err)
@@ -56,10 +65,49 @@ func TestRealWriteProtectCleanFillDirtyWriteAndReleaseCapture(t *testing.T) {
 	if v.Released[3]&1 == 0 || v.Materialized[3]&1 != 0 {
 		t.Fatalf("released hole: %+v", v)
 	}
+	// Feed this exact real R/M/D through C/W and the real S carrier, before
+	// refilling the released page. No CPU writer has touched page 24.
+	for _, working := range []bool{false, true} {
+		selected, dirty, err := snapshot.CaptureMemory(bytes.NewReader(backend), v, working)
+		if err != nil {
+			t.Fatal(err)
+		}
+		run, err := selected.RunAt(24*PageSize, PageSize)
+		if err != nil || run.Kind() != sparse.Zero {
+			t.Fatalf("necessary released Zero lost: %v %v", run, err)
+		}
+		source, err := snapshotfile.BuildSourceWithDirty(selected, []byte(`{}`), []byte(`{}`), []byte(`{"version":1}`), dirty)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var carrier bytes.Buffer
+		if _, _, err = tarstream.WriteTo(context.Background(), &carrier, "snapshot", source); err != nil {
+			t.Fatal(err)
+		}
+		encoded, _, err := tarstream.SourceAt(bytes.NewReader(carrier.Bytes()), int64(carrier.Len()), "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		root, err := snapshotfile.Open(context.Background(), captureTestStream{encoded})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer root.Close()
+		base := bytes.Repeat([]byte{0x37}, 32*PageSize)
+		parent, _ := sparse.NewSource(bytes.NewReader(base), uint64(len(base)), nil)
+		full := fetch.NewLayered(root.Memory, captureTestStream{parent})
+		want := append([]byte(nil), base...)
+		want[0] = 0x71
+		clear(want[24*PageSize : 25*PageSize])
+		got := make([]byte, len(want))
+		if _, err = full.ReadAt(context.Background(), got, 0); err != nil || !bytes.Equal(got, want) {
+			t.Fatalf("real release carrier working=%t content mismatch: %v", working, err)
+		}
+	}
 	if err := h.EnsureLoaded(context.Background(), 24*PageSize, PageSize); err != nil {
 		t.Fatal(err)
 	}
-	if backend[24*PageSize] != 0 {
+	if !bytes.Equal(backend[24*PageSize:25*PageSize], make([]byte, PageSize)) {
 		t.Fatal("released parent refilled stale bytes")
 	}
 	cpu[24*PageSize] = 0x5d
@@ -163,3 +211,7 @@ func TestWPRetryReleasesInstallGateAndRetainsDirty(t *testing.T) {
 		t.Fatal("failed unprotect lost D", err)
 	}
 }
+
+type captureTestStream struct{ sparse.Source }
+
+func (captureTestStream) Close() error { return nil }

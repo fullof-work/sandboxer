@@ -35,9 +35,9 @@ The platform has four requirements beyond the pinned upstream VMM behavior:
 The pinned upstream interface does not directly provide this combination. The
 second requirement is particularly important: the platform needs to own fault
 handling and delivery, not just supply data to an upstream external-listener
-model. This memory model also requires avoiding an `EVENT_REMOVE` storm when
-balloon release encounters ranges that have never been resident (patch 0004,
-§3.4).
+model. This memory model requires logical release notification even for ranges that
+have never been resident: an unmaterialized page may inherit nonzero parent
+content. Only unnecessary inode punching is skipped (§3.4).
 
 ### 1.2 Patch scope summary
 
@@ -286,8 +286,10 @@ even for an entirely sparse interval: an unmaterialized restore hole may still
 inherit nonzero parent content, so logical release must notify the handler.
 
 The current order is **chVA MADV_DONTNEED → SEEK_DATA → necessary PUNCH_HOLE**.
-Reading REMOVE publishes R before acknowledging the release. The probe avoids
-an unnecessary inode punch; it cannot suppress the logical release event.
+The handler reads REMOVE and publishes R/Released while holding installMu.
+The kernel acknowledgement may precede user-space publication, but installation
+and CaptureView cannot pass that publication boundary. The probe avoids an
+unnecessary inode punch; it cannot suppress the logical release event.
 MADV or punch failures fail the operation, preserving any accumulated R/D.
 SEEK_DATA returning ENXIO means no Data remains; other SEEK errors conservatively
 proceed with PUNCH_HOLE. The
@@ -568,7 +570,7 @@ behavior, including the patches:
 | `fd=` plus `uffd_socket=` | Not available | Create uffd, send it with metadata, and wait for ACK |
 | `/vm.snapshot` of a user-managed zone | Not applicable | Omit the zone from memory-ranges and skip the RAM dump |
 | `/vm.restore` of a user-managed zone | Not applicable | Skip fill; the mapping faults into the external handler when configured |
-| Balloon release of a hole-only file-backed run | Ordinary release path | Skip `PUNCH_HOLE` and `madvise`; resident runs retain ordinary release |
+| Balloon release of a hole-only file-backed run | Ordinary release path | Always `MADV_DONTNEED`, then probe; skip only unnecessary `PUNCH_HOLE` |
 | Balloon `deflate_on_oom=on` | Supported in v51.1 | Supported |
 | `vm.resize` `desired_balloon` | Supported | Used by the sandbox-local BalloonController |
 | virtio-mem `vm.resize` | Supported | Supported |
@@ -581,8 +583,9 @@ mmu_notifier/EPT and IPI-shootdown pressure and interfere with guest vsock progr
 The rationale and replacement feedback loop are described in the
 [guest kernel specification §5.5](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/vmlinux.md#55-why-free_page_reporting-is-not-negotiated-and-the-role-of-virtio_mem). The sandbox-local BalloonController instead pushes inflate targets through
 `/vm.resize`, with at most one 64 MiB steady-shrink step for each fresh report.
-Patch 0004 skips empty ranges covered by the cold-start target; runtime reclaim
-of resident pages still performs the complete release operations.
+The current release path performs `MADV_DONTNEED` even for empty ranges covered
+by the cold-start target, then uses SEEK_DATA to avoid an unnecessary inode punch.
+Resident ranges also retain the required PUNCH_HOLE.
 `deflate_on_oom` is native to upstream v51.1 and needs no additional patch.
 
 ## 7. Known limitations

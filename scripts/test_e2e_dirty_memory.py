@@ -14,7 +14,7 @@ spec.loader.exec_module(evidence)
 
 class EvidenceTest(unittest.TestCase):
     def test_associations_fail_closed(self):
-        for change in ("valid", "empty", "missing", "extra", "sparse", "wrong-pid", "wrong-round", "stale-run", "wrong-hash", "wrong-identity", "thin-false", "missing-bitmap"):
+        for change in ("valid", "empty", "missing", "extra", "sparse", "wrong-pid", "wrong-round", "stale-run", "wrong-hash", "wrong-identity", "thin-false", "missing-bitmap", "true-extra-layer", "true-unexpected-bitmap"):
             with self.subTest(change=change), tempfile.TemporaryDirectory() as directory:
                 out = Path(directory)
                 ram = out / "ram"
@@ -28,13 +28,16 @@ class EvidenceTest(unittest.TestCase):
                     observations.append(dict(run_id="fresh", pid=42, sequence=seq, bytes=256 << 20, path=str(path), sha256=f"hash-{seq}"))
                 for seq, name in enumerate(("h", "c2"), 1):
                     captures.append(dict(run_id="fresh", pid=42, capture_sequence=seq, resume_sequence=seq+1, size=256 << 20, holes=[]))
-                    top = dict(Data=256 << 20, Zero=0, DirtyPresent=True, Identity=f"digest:{name}")
-                    compared = dict(complete_comparison="equal", logical_bytes=256 << 20, sha256=f"hash-{seq+1}", layers=[top, copy.copy(top)])
+                    top = dict(Data=256 << 20, Zero=0, DirtyPresent=name == "h", Identity=f"digest:{name}")
+                    compared = dict(complete_comparison="equal", logical_bytes=256 << 20, sha256=f"hash-{seq+1}", layers=[top, copy.copy(top)] if name == "h" else [top])
                     if name == "h":
                         if change == "wrong-hash": compared["sha256"] = "wrong"
                         if change == "thin-false": top["Data"] -= 4096
                         if change == "missing-bitmap": top["DirtyPresent"] = False
                         if change == "wrong-identity": top["Identity"] = "digest:wrong"
+                    if name == "c2":
+                        if change == "true-extra-layer": compared["layers"].append(copy.copy(top))
+                        if change == "true-unexpected-bitmap": top["DirtyPresent"] = True
                     (out / (name + "-comparison.json")).write_text(json.dumps(compared))
                     (out / (name + ".json")).write_text(json.dumps(dict(snapshotRef=f"file://{name}@digest:{name}")))
                 (out / "w2-comparison.json").write_text(json.dumps(dict(layers=[dict(Data=256 << 20, Zero=0)])))
@@ -51,6 +54,21 @@ class EvidenceTest(unittest.TestCase):
                     self.assertEqual(evidence.validate(ram,out)["captures"],2)
                 else:
                     with self.assertRaises(AssertionError): evidence.validate(ram,out)
+
+    def test_loss_requires_new_bits_and_exact_geometry(self):
+        def report(word):
+            return dict(version=1,page_shift=12,regions=[dict(slot=0,gpa=0,size=4096*4,file_offset=0,bitmap=[word])])
+        self.assertEqual(evidence.validate_loss(report(1),report(5),report(7))['newly_consumed_lost_pages'],1)
+        for a,b,c in [(1,1,1),(1,5,1),(5,1,7)]:
+            with self.assertRaises(AssertionError): evidence.validate_loss(report(a),report(b),report(c))
+        for mutation in ('length','geometry','duplicate','slot','tail'):
+            bad=report(7)
+            if mutation=='length': bad['regions'][0]['bitmap']=[]
+            if mutation=='geometry': bad['regions'][0]['gpa']=4096
+            if mutation=='duplicate': bad['regions']*=2
+            if mutation=='slot': bad['regions'][0]['slot']=1
+            if mutation=='tail': bad['regions'][0]['bitmap']=[16]
+            with self.assertRaises(AssertionError): evidence.validate_loss(report(1),report(5),bad)
 
 
 if __name__ == "__main__":

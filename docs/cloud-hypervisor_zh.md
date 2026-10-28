@@ -30,8 +30,8 @@
 
 这些组合能力在所固定的 upstream CH 版本中未直接提供。第二条尤其本质——upstream uffd handler 模型
 是 CH 调外部 socket,handler 提供数据,但平台需要 handler 接管 fault 投递
-路由,upstream 的 listener 模型不够。此外这一模型带来一条派生修复:balloon
-释放路径对从未驻留的空洞 run 不能合成 `EVENT_REMOVE` 风暴(patch 0004,§3.4)。
+路由,upstream 的 listener 模型不够。此外，从未驻留的空洞 run 可能继承父层
+非零内容，balloon 仍须发送逻辑释放通知，只能跳过无效的 inode punch（§3.4）。
 
 ### 1.2 patch 范围(总结)
 
@@ -245,10 +245,11 @@ seccomp 放行。0013 保留探测，但不再跳过空洞区间的 chVA `MADV_D
 restore 的未物化 Hole 可能仍继承父层非零内容，逻辑释放必须先通知 handler。
 
 当前 release 顺序为 **chVA MADV_DONTNEED → SEEK_DATA → 必要的 PUNCH_HOLE**。
-即使整个区间已稀疏，也先等待 REMOVE 被读取并发布 R。探测只能避免 inode 的
-无效 punch，不能省掉逻辑释放事件。MADV 或 punch 失败走错误路径；SEEK_DATA 返回 ENXIO 表示没有 Data，其他 SEEK 错误则保守继续 PUNCH_HOLE。已累计 R/D
+即使整个区间已稀疏，也先执行 MADV。handler 持有 installMu 读取 REMOVE
+并发布 R/Released；内核 ACK 可以早于用户态发布，但填充和 CaptureView
+不能越过这个发布边界。探测只能避免 inode 的无效 punch，不能省掉逻辑释放事件。MADV 或 punch 失败走错误路径；SEEK_DATA 返回 ENXIO 表示没有 Data，其他 SEEK 错误则保守继续 PUNCH_HOLE。已累计 R/D
 不回退。handler 在 installMu 下同时读取事件、记录 R/D 和发布 Released 状态，
-从而让事件 ACK、后台填充和 CaptureView 使用同一个顺序边界。
+从而让后台填充和 CaptureView 在事件读取与状态发布之间无法进入。
 
 ### 3.5 0005 — 持久化 vsock host local-port 游标
 
@@ -479,7 +480,7 @@ host → guest 方向需要在第一笔写入发 ASCII `CONNECT <port>\n`,CH 回
 | 命令行写 `fd=` + `uffd_socket=` | ✗ | ✓(创建 uffd + sendmsg + 等 ack)|
 | `/vm.snapshot` 对 user_managed zone | (不适用) | 跳过 dump,memory-ranges 表无此 zone |
 | `/vm.restore` 对 user_managed zone | (不适用) | 跳过 fill;配置 uffd 时由映射缺页触发外部 handler |
-| balloon release 对 file-backed region 的空洞 run | 原 release 路径 | 跳过 `PUNCH_HOLE`+`madvise`;驻留 run 保留原 release |
+| balloon release 对 file-backed region 的空洞 run | 原 release 路径 | 先 `MADV_DONTNEED` 再探测；只跳过无效的 `PUNCH_HOLE` |
 | balloon `deflate_on_oom=on` | ✓(v51.1 已就绪) | ✓ |
 | `vm.resize` `desired_balloon` | ✓ | ✓(sandbox-local BalloonController 调用)|
 | virtio-mem `vm.resize` | ✓ | ✓ |
@@ -492,8 +493,8 @@ host → guest 方向需要在第一笔写入发 ASCII `CONNECT <port>\n`,CH 回
 [Guest Kernel §5.5](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/vmlinux_zh.md#55-为什么不启用-free_page_reporting以及-virtio_mem-的角色))。改由 sandbox-local BalloonController
 经 `/vm.resize` 推 inflate target;steady shrink 每份 fresh report 最多一个
 64MiB step。冷启动命令行 target
-覆盖的稀疏区间由 patch 0004(§3.4)跳过,不产生 `madvise` 广播与
-`EVENT_REMOVE`;运行时回收已驻留页仍走完整 release 路径。
+覆盖的稀疏区间也先执行 `MADV_DONTNEED`，再由 SEEK_DATA 探测避免无效 inode
+punch；已驻留区间仍执行必要的 PUNCH_HOLE（§3.4）。
 `deflate_on_oom` 是 upstream v51.1 原生,无需新 patch。
 
 ## 7. 已知限制

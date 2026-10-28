@@ -47,6 +47,11 @@ func main() {
 					for i := 0; i < len(pages); i += 1024 * 1024 {
 						pages[i] ^= 0x79
 					}
+				case "mutate-fresh":
+					// These pages were initialized before restore B and only read since.
+					for i := 4096; i < len(pages); i += 1024 * 1024 {
+						pages[i] ^= 0x53
+					}
 				case "read":
 					_ = sha256.Sum256(pages)
 				case "release":

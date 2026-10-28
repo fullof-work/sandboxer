@@ -3,7 +3,7 @@
 # Compare every RAM byte at real capture/restore barriers, and same-state sizes.
 set -euo pipefail
 source "${E2E_LIB:?}/common.sh"
-SANDBOXER_LIB="$E2E_LIB/sandboxer"
+export SANDBOXER_LIB="$E2E_LIB/sandboxer"
 source "$SANDBOXER_LIB/tarstream.sh"
 : "${WORK:?}" "${OUT:?}" "${DIRTY_MEMORY_GUEST_BIN:?}" "${MEMORY_COMPARE_BIN:?}" "${MEMORY_BASELINE_BIN:?}"
 require_root
@@ -23,6 +23,7 @@ SID="dirty-$BASHPID"
 CP="$WORK/base/$SID/checkpoint"
 mkdir -p "$CP"
 PID=''
+declare -A CAPTURE_RAM
 cleanup(){ local status=$?;if [ -n "$PID" ];then kill -TERM "$PID" 2>/dev/null || true;wait "$PID" || true;fi;exit "$status"; }
 trap cleanup EXIT
 stop_vm(){ kill -TERM "$PID";wait "$PID";PID=''; }
@@ -40,8 +41,9 @@ capture(){
  local mode=$1 name=$2
  "$BIN/sandbox-ctl" snapshot --sandbox-id "$SID" --run-root "$WORK/runtime" --output "$CP" --resume --merge-ref="$mode" --json >"$OUT/$name.json"
  "$MEMORY_COMPARE_BIN" "$CP/$(ref_path "$OUT/$name.json")" "$(ram_path -1)" >"$OUT/$name-comparison.json"
+ CAPTURE_RAM["$CP/$(ref_path "$OUT/$name.json")"]=$(ram_path -1)
 }
-restore(){
+launch_restore(){
  local source=$1 name=$2
  export DIRTY_OBSERVATIONS="$OUT/ram-$name"
  cat >"$WORK/$name.yaml" <<CFG
@@ -54,7 +56,34 @@ CFG
  "$BIN/sandbox-ctl" run --restore "$source" --config "$WORK/$name.yaml" --sandbox-id "$SID" --ch-binary "$WORK/ch-observer" --run-root "$WORK/runtime" --base-root "$WORK/base" >"$OUT/$name.log" 2>&1 &
  PID=$!
  wait_guest || { tail -80 "$OUT/$name.log";e2e_fail 'restore failed'; }
- "$MEMORY_COMPARE_BIN" "$source" "$(ram_path 0)" >"$OUT/$name-comparison.json"
+}
+restore(){
+ local source=$1 name=$2 baseline_ram=''
+ if [ "${DIRTY_MEMORY_RESTORE_BASELINE:-0}" = 1 ];then
+  # Both independent restores use identical CH config/state and logical RAM.
+  # Host device reconstruction may write RAM; compare every byte after it in
+  # both paths, with no masks/transforms. Captures always compare source bytes.
+  local baseline="$CP/$name-full-baseline.snapshot"
+  "$MEMORY_BASELINE_BIN" dense "$source" "${CAPTURE_RAM[$source]}" "$baseline" >"$OUT/$name-baseline-size.json"
+  "$MEMORY_COMPARE_BIN" "$baseline" "${CAPTURE_RAM[$source]}" >"$OUT/$name-baseline-input.json"
+  launch_restore "$baseline" "$name-baseline"
+  baseline_ram=$(ram_path 0)
+  stop_vm
+ fi
+ launch_restore "$source" "$name"
+ if [ -n "$baseline_ram" ];then
+  cmp "$baseline_ram" "$(ram_path 0)"
+  python3 - "$baseline_ram" "$(ram_path 0)" "$source" >"$OUT/$name-comparison.json" <<'PYRESTORE'
+import hashlib,json,pathlib,sys
+paths=list(map(pathlib.Path,sys.argv[1:3]));sizes=[p.stat().st_size for p in paths]
+assert sizes==[256<<20,256<<20],sizes
+hashes=[hashlib.file_digest(p.open('rb'),'sha256').hexdigest() for p in paths]
+assert hashes[0]==hashes[1]
+print(json.dumps(dict(complete_comparison='equal-independent-restores',logical_bytes=sizes[0],sha256=hashes[0],baseline_ram=str(paths[0]),dirty_ram=str(paths[1]),source=sys.argv[3])))
+PYRESTORE
+ else
+  "$MEMORY_COMPARE_BIN" "$source" "$(ram_path 0)" >"$OUT/$name-comparison.json"
+ fi
 }
 # x86 KVM restores rewrite the wall-clock MSR's 12-byte guest structure before
 # resume. Disable kvmclock in this fixture to compare ALL bytes without masks.
@@ -103,7 +132,7 @@ cp "$OUT/legacy-H.snapshot" "$OUT/$H_ID.snapshot"
 "$MEMORY_BASELINE_BIN" dense "$CP/$(ref_path "$OUT/c2.json")" "$C_RAM" "$OUT/legacy-C.snapshot" >"$OUT/legacy-C-size.json"
 "$MEMORY_COMPARE_BIN" "$OUT/legacy-C.snapshot" "$C_RAM" >"$OUT/legacy-C-comparison.json"
 # Consume real KVM/CH logs, then lose the response and recover the failed capture.
-guest mutate >"$OUT/loss-guest.json"
+guest mutate-fresh >"$OUT/loss-guest.json"
 touch "$DIRTY_OBSERVATIONS/drop-dirty-once"
 if "$BIN/sandbox-ctl" snapshot --sandbox-id "$SID" --run-root "$WORK/runtime" --output "$CP" --resume --json >"$OUT/lost-response.json" 2>"$OUT/lost-response.err";then e2e_fail 'expected response-loss capture failure';fi
 guest check >"$OUT/recovered-guest.json"
@@ -111,9 +140,11 @@ capture true recovered
 python3 - "$DIRTY_OBSERVATIONS" "$OUT" <<'PY'
 import json,pathlib,sys
 p=pathlib.Path(sys.argv[1]);out=pathlib.Path(sys.argv[2])
-lost=json.loads((p/'lost-dirty-response.json').read_text());current=json.loads((p/'capture-residency.jsonl').read_text().splitlines()[-1])['dirty'];regions={r['slot']:r for r in current['regions']}
-for r in lost['regions']:
- assert all(a&~b==0 for a,b in zip(r['bitmap'],regions[r['slot']]['bitmap']))
+sys.path.insert(0,str(pathlib.Path(__import__('os').environ['SANDBOXER_LIB'])))
+from dirty_memory_evidence import validate_loss
+reports=[json.loads(line)['dirty'] for line in (p/'capture-residency.jsonl').read_text().splitlines()]
+assert len(reports)==3, 'two successful captures then recovered capture expected'
+print(json.dumps(validate_loss(reports[-2],json.loads((p/'lost-dirty-response.json').read_text()),reports[-1])))
 for new,old in [('c2','legacy-C'),('h','legacy-W')]:
  a=json.loads((out/(new+'-comparison.json')).read_text());b=json.loads((out/(old+'-comparison.json')).read_text())
  assert a['sha256']==b['sha256']
