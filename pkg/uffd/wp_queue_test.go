@@ -14,7 +14,7 @@ import (
 // The injected ioctl models mmap_changing until the reader publishes REMOVE;
 // this is a deterministic queue regression, not a kernel-pressure simulation.
 func TestWPRetryDrainsQueueBeforeRelease(t *testing.T) {
-	for _, mode := range []string{"remove", "unmap", "cancel", "close"} {
+	for _, mode := range []string{"remove", "remove-missing", "unmap", "cancel", "close"} {
 		t.Run(mode, func(t *testing.T) {
 			var fds [2]int
 			if err := unix.Pipe2(fds[:], unix.O_NONBLOCK|unix.O_CLOEXEC); err != nil {
@@ -41,6 +41,16 @@ func TestWPRetryDrainsQueueBeforeRelease(t *testing.T) {
 				t.Fatal(err)
 			}
 			var attempts, successes atomic.Int64
+			successSeen := make(map[uint64]bool) // protected by installMu around the injected ioctl
+			copied := make(chan struct{}, 1)
+			h.ops.copyWP = func(int, uint64, []byte) (int64, error) {
+				select {
+				case copied <- struct{}{}:
+				default:
+				}
+				return 0, unix.EEXIST
+			}
+			h.ops.wake = func(int, uint64, uint64) error { return nil }
 			h.ops.writeProtect = func(_ int, va, _ uint64, _ bool) error {
 				attempts.Add(1)
 				if !h.cfg.Dirty.Contains(va - unitCHVA) {
@@ -49,7 +59,10 @@ func TestWPRetryDrainsQueueBeforeRelease(t *testing.T) {
 				if !h.released.Contains(0) {
 					return unix.EAGAIN
 				}
-				successes.Add(1)
+				if !successSeen[va] {
+					successSeen[va] = true
+					successes.Add(1)
+				}
 				return nil
 			}
 			h.Start()
@@ -83,7 +96,7 @@ func TestWPRetryDrainsQueueBeforeRelease(t *testing.T) {
 				}
 				count := 0
 				for page := uint64(0); count < 300; page++ {
-					if pageIdxHash(page)%MinWorkers != 0 {
+					if pageIdxHash(page)%MinWorkers != pageIdxHash(0)%MinWorkers {
 						continue
 					}
 					if err := send(uffdEventPagefault, uffdPagefaultFlagWP, unitCHVA+page*PageSize); err != nil {
@@ -99,7 +112,19 @@ func TestWPRetryDrainsQueueBeforeRelease(t *testing.T) {
 						return
 					}
 				}
-				if mode == "remove" || mode == "unmap" {
+				if mode == "remove-missing" {
+					if err := send(uffdEventPagefault, 0, unitCHVA); err != nil {
+						written <- err
+						return
+					}
+					select {
+					case <-copied:
+					case <-h.ctx.Done():
+						written <- h.ctx.Err()
+						return
+					}
+				}
+				if mode == "remove" || mode == "remove-missing" || mode == "unmap" {
 					event := byte(uffdEventRemove)
 					if mode == "unmap" {
 						event = uffdEventUnmap
@@ -119,7 +144,7 @@ func TestWPRetryDrainsQueueBeforeRelease(t *testing.T) {
 			}
 			deadline := time.After(3 * time.Second)
 			switch mode {
-			case "remove":
+			case "remove", "remove-missing":
 				for successes.Load() < 300 {
 					select {
 					case <-deadline:

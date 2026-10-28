@@ -844,6 +844,10 @@ func (h *Handler) runWorker(idx int) {
 	byPage := make(map[wpKey]*list.Element)
 	keyFor := func(ev faultEvent) wpKey { return wpKey{ev.uffdFD, ev.address &^ (PageSize - 1)} }
 	process := func(ev faultEvent) {
+		if ev.flags&uffdPagefaultFlagWP == 0 {
+			h.handleFault(ev, pageBuf)
+			return
+		}
 		key := keyFor(ev)
 		retry := h.handleFault(ev, pageBuf)
 		if old := byPage[key]; old != nil {
