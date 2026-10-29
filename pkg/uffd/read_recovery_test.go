@@ -342,11 +342,14 @@ func TestFullFaultQueueCancellationJoinsReaderAndWorkers(t *testing.T) {
 	if err := mapping.RegisterVMA(ProcessCH, unitCHVA, PageSize, 0); err != nil {
 		t.Fatal(err)
 	}
-	memfd, err := unix.Open("/dev/null", unix.O_RDWR, 0)
+	memfd, err := unix.MemfdCreate("cancel-ram", unix.MFD_CLOEXEC)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer unix.Close(memfd)
+	if err := unix.Ftruncate(memfd, PageSize); err != nil {
+		t.Fatal(err)
+	}
 	h, err := NewWithBackendUffd(fds[0], mapping, Config{MemfdFD: memfd, Size: PageSize, Source: source, NumWorkers: MinWorkers})
 	if err != nil {
 		t.Fatal(err)

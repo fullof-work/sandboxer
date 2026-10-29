@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"sync"
@@ -35,7 +36,8 @@ type VAReportServer struct {
 	// HandshakeDeadline bounds the read of one va_report message (CH→host
 	// uffd-fd handoff). 0 = no deadline: the host waits as long as CH needs
 	// to issue the handoff. Set positive to fail fast.
-	HandshakeDeadline time.Duration
+	HandshakeDeadline    time.Duration
+	RequireDirtyTracking bool
 
 	// OnReady is invoked synchronously on the FIRST va_report. The
 	// handler should adopt the uffd fd (the server passes ownership)
@@ -140,15 +142,19 @@ func (s *VAReportServer) Stop() {
 }
 
 type vaReportMsg struct {
-	Type    string `json:"type"`
-	ZoneID  string `json:"zone_id,omitempty"`
-	VAStart uint64 `json:"va_start"`
-	Size    uint64 `json:"size"`
+	Type       string  `json:"type"`
+	ZoneID     string  `json:"zone_id,omitempty"`
+	VAStart    uint64  `json:"va_start"`
+	Size       uint64  `json:"size"`
+	Version    uint32  `json:"version"`
+	PageShift  uint32  `json:"page_shift"`
+	FileOffset *uint64 `json:"file_offset"`
 }
 
 type ackMsg struct {
-	Type string `json:"type"`
-	Msg  string `json:"msg,omitempty"`
+	Type    string `json:"type"`
+	Msg     string `json:"msg,omitempty"`
+	Version uint32 `json:"version,omitempty"`
 }
 
 func (s *VAReportServer) handle(conn *net.UnixConn) {
@@ -184,9 +190,16 @@ func (s *VAReportServer) handle(conn *net.UnixConn) {
 		return
 	}
 
+	if s.RequireDirtyTracking && (req.Version != 1 || req.PageShift != 12 || req.FileOffset == nil) {
+		_ = writeLPJSON(conn, ackMsg{Type: "error", Msg: "dirty tracking protocol v1 required"})
+		return
+	}
 	s.mu.Lock()
 	regionIdx := s.regionsRegistered
 	memfdOffset := s.nextMemfdOffset
+	if req.FileOffset != nil {
+		memfdOffset = *req.FileOffset
+	}
 	if regionIdx > 0 && s.OnRegister == nil {
 		s.mu.Unlock()
 		s.Logf("vareport: extra report (zone=%s, region #%d) but OnRegister not set — single-region mode",
@@ -228,7 +241,7 @@ func (s *VAReportServer) handle(conn *net.UnixConn) {
 
 	s.Logf("vareport: accepted region #%d zone=%s va=0x%x size=%d memfd_off=0x%x uffd_fd=%d",
 		regionIdx, req.ZoneID, req.VAStart, req.Size, memfdOffset, uffdFD)
-	if err := writeLPJSON(conn, ackMsg{Type: "ack"}); err != nil {
+	if err := writeLPJSON(conn, ackMsg{Type: "ack", Version: req.Version}); err != nil {
 		s.Logf("vareport: write ack: %v", err)
 	}
 }
@@ -236,32 +249,38 @@ func (s *VAReportServer) handle(conn *net.UnixConn) {
 // readLPJSONWithFDs reads u32 LE length + JSON body, possibly with
 // SCM_RIGHTS-attached fds on the same recvmsg.
 func readLPJSONWithFDs(c *net.UnixConn) ([]byte, []int, error) {
-	// Read length prefix first (no FDs expected on this part).
+	var fds []int
+	oob := make([]byte, syscall.CmsgSpace(4*16))
+	readFull := func(dst []byte) error {
+		for len(dst) != 0 {
+			n, oobN, flags, _, err := c.ReadMsgUnix(dst, oob)
+			// Preserve ownership even on a short/truncated frame, so the caller
+			// closes every received descriptor on rejection.
+			fds = append(fds, parseFDsFromOOB(oob[:oobN])...)
+			if flags&(syscall.MSG_CTRUNC|syscall.MSG_TRUNC) != 0 || len(fds) > 16 {
+				return fmt.Errorf("truncated/oversized ancillary data")
+			}
+			if err != nil {
+				return err
+			}
+			if n == 0 {
+				return io.ErrUnexpectedEOF
+			}
+			dst = dst[n:]
+		}
+		return nil
+	}
 	var lenBuf [4]byte
-	oob := make([]byte, syscall.CmsgSpace(4*16)) // up to 16 fds
-	n, oobN, _, _, err := c.ReadMsgUnix(lenBuf[:], oob)
-	if err != nil {
-		return nil, nil, fmt.Errorf("read length+oob: %w", err)
+	if err := readFull(lenBuf[:]); err != nil {
+		return nil, fds, fmt.Errorf("read length+oob: %w", err)
 	}
-	if n != 4 {
-		return nil, nil, fmt.Errorf("short length read: %d", n)
-	}
-	fds := parseFDsFromOOB(oob[:oobN])
-
 	bodyLen := binary.LittleEndian.Uint32(lenBuf[:])
-	if bodyLen > 64*1024 {
-		return nil, fds, fmt.Errorf("oversized message: %d bytes", bodyLen)
+	if bodyLen == 0 || bodyLen > 64*1024 {
+		return nil, fds, fmt.Errorf("invalid message length: %d", bodyLen)
 	}
 	body := make([]byte, bodyLen)
-	off := 0
-	// In case fds came on the same recvmsg as the length but body is
-	// in separate recvmsg(s), read the body now (no more OOB expected).
-	for off < int(bodyLen) {
-		nn, err := c.Read(body[off:])
-		if err != nil {
-			return body[:off], fds, fmt.Errorf("read body: %w", err)
-		}
-		off += nn
+	if err := readFull(body); err != nil {
+		return nil, fds, fmt.Errorf("read body+oob: %w", err)
 	}
 	return body, fds, nil
 }

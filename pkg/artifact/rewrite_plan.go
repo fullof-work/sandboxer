@@ -196,7 +196,13 @@ func (p *Publisher) PublishWithOptions(ctx context.Context, input string, opts R
 	if err != nil {
 		return result, err
 	}
-	source, err := snapshotfile.BuildSource(memory.topSource(), sroot.ConfigJSON, sroot.StateJSON, tail)
+	// Reduction changes explicit content; an unverified rewrite can also change
+	// its baseline. Both conservatively label the rebuilt layer all dirty.
+	dirty := sroot.MemoryDirty
+	if memory.reduced || checked.SkipVerify {
+		dirty = nil
+	}
+	source, err := snapshotfile.BuildSourceWithDirty(memory.topSource(), sroot.ConfigJSON, sroot.StateJSON, tail, dirty)
 	if err != nil {
 		return result, err
 	}

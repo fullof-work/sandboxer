@@ -1,0 +1,647 @@
+From caffb52b9b59949b7f75b7a1526d11b2f23854f0 Mon Sep 17 00:00:00 2001
+From: Chen Xiaohui <graych@gmail.com>
+Date: Wed, 28 Oct 2026 23:18:48 +0800
+Subject: [PATCH] vmm: accumulate checkpoint dirty memory
+
+---
+ fuzz/fuzz_targets/http_api.rs      |   8 +-
+ net_util/src/queue_pair.rs         |   1 +
+ virtio-devices/src/balloon.rs      |  29 ++-----
+ virtio-devices/src/vsock/packet.rs |  17 +++-
+ vmm/src/api/http/http_endpoint.rs  |   7 +-
+ vmm/src/api/http/mod.rs            |  10 ++-
+ vmm/src/api/mod.rs                 |  34 ++++++++
+ vmm/src/dirty_memory.rs            |  92 +++++++++++++++++++++
+ vmm/src/lib.rs                     |  11 +++
+ vmm/src/memory_manager.rs          | 124 ++++++++++++++++++++++++-----
+ vmm/src/vm.rs                      |   8 ++
+ 11 files changed, 291 insertions(+), 50 deletions(-)
+ create mode 100644 vmm/src/dirty_memory.rs
+
+diff --git a/fuzz/fuzz_targets/http_api.rs b/fuzz/fuzz_targets/http_api.rs
+index ee9dd62..85e7184 100644
+--- a/fuzz/fuzz_targets/http_api.rs
++++ b/fuzz/fuzz_targets/http_api.rs
+@@ -5,11 +5,11 @@
+ #![no_main]
+ use std::os::unix::io::AsRawFd;
+ use std::path::PathBuf;
+-use std::sync::mpsc::{channel, Receiver};
+ use std::sync::LazyLock;
++use std::sync::mpsc::{Receiver, channel};
+ use std::thread;
+ 
+-use libfuzzer_sys::{fuzz_target, Corpus};
++use libfuzzer_sys::{Corpus, fuzz_target};
+ use micro_http::Request;
+ use vm_migration::MigratableError;
+ use vmm::api::http::*;
+@@ -270,6 +270,10 @@ impl RequestHandler for StubApiRequestHandler {
+         Ok(None)
+     }
+ 
++    fn vm_dirty_memory(&mut self) -> Result<Option<Vec<u8>>, VmError> {
++        Ok(None)
++    }
++
+     fn vm_counters(&mut self) -> Result<Option<Vec<u8>>, VmError> {
+         Ok(None)
+     }
+diff --git a/net_util/src/queue_pair.rs b/net_util/src/queue_pair.rs
+index 86a1c75..570410f 100644
+--- a/net_util/src/queue_pair.rs
++++ b/net_util/src/queue_pair.rs
+@@ -212,6 +212,7 @@ impl RxVirtio {
+                         .get_slice(desc_addr, desc.len() as usize)
+                         .map_err(NetQueuePairError::GuestMemory)?;
+                     assert!(buf.len() >= desc.len() as usize);
++                    buf.bitmap().mark_dirty(0, desc.len() as usize);
+                     let buf = buf.ptr_guard_mut();
+                     let iovec = libc::iovec {
+                         iov_base: buf.as_ptr() as *mut libc::c_void,
+diff --git a/virtio-devices/src/balloon.rs b/virtio-devices/src/balloon.rs
+index 3140e10..375754b 100644
+--- a/virtio-devices/src/balloon.rs
++++ b/virtio-devices/src/balloon.rs
+@@ -199,31 +199,16 @@ impl BalloonEpollHandler {
+         let region = memory.find_region(range_base).ok_or(Error::GuestMemory(
+             GuestMemoryError::InvalidGuestAddress(range_base),
+         ))?;
++        // Publish REMOVE even for an existing hole: it may inherit nonzero
++        // parent bytes. The external installer serializes event read/state
++        // publication with COPY; after ACK any earlier fill is caught by SEEK.
++        Self::advise_memory_range(memory, range_base, range_len, libc::MADV_DONTNEED)?;
+         if let Some(f_off) = region.file_offset() {
+             let fd = f_off.file().as_raw_fd();
+-            let foff =
+-                (range_base.0 - region.start_addr().0 + f_off.start()) as libc::off64_t;
++            let foff = (range_base.0 - region.start_addr().0 + f_off.start()) as libc::off64_t;
+             let end = foff + range_len as libc::off64_t;
+ 
+-            // The guest balloon hands back pages it never wrote: balloon
+-            // allocations carry no __GFP_ZERO, the platform guest kernel
+-            // has init_on_alloc off, and this fd-backed zone is never
+-            // prefaulted -- so such offsets are holes in the memfd.
+-            // PUNCH_HOLE / MADV_DONTNEED on a hole still synthesizes a
+-            // *synchronous* UFFD_EVENT_REMOVE on the uffd-registered chVA
+-            // (the kernel emits it for the whole range regardless of
+-            // residency, and MADV_DONTNEED blocks until the external
+-            // handler consumes it). At boot the entire ballooned region
+-            // is sparse, so this is a pure-overhead event storm that
+-            // stalls the handler and back-pressures this balloon thread.
+-            // Probe with SEEK_DATA: if [foff, end) holds no data there is
+-            // nothing to reclaim, so skip both the fallocate and the
+-            // MADV_DONTNEED -- the end state is identical. A range that
+-            // genuinely needs reclaiming always has data, so is never
+-            // skipped.
+-            // SAFETY: FFI call; fd is this zone's memfd, used only via
+-            // mmap + fallocate(explicit offset), so its file position is
+-            // never relied upon.
++            // SAFETY: the range was validated by get_slice in advise above.
+             let next_data = unsafe { libc::lseek64(fd, foff, libc::SEEK_DATA) };
+             if next_data < 0 {
+                 // ENXIO: no data at/after foff -- range is all hole. Any
+@@ -251,7 +236,7 @@ impl BalloonEpollHandler {
+             }
+         }
+ 
+-        Self::advise_memory_range(memory, range_base, range_len, libc::MADV_DONTNEED)
++        Ok(())
+     }
+ 
+     fn release_memory_range_4k(
+diff --git a/virtio-devices/src/vsock/packet.rs b/virtio-devices/src/vsock/packet.rs
+index 57218a5..c073bea 100644
+--- a/virtio-devices/src/vsock/packet.rs
++++ b/virtio-devices/src/vsock/packet.rs
+@@ -19,6 +19,7 @@ use std::ops::Deref;
+ 
+ use byteorder::{ByteOrder, LittleEndian};
+ use virtio_queue::DescriptorChain;
++use vm_memory::bitmap::Bitmap;
+ use vm_memory::{Address, Bytes, GuestAddress, GuestMemory};
+ use vm_virtio::{AccessPlatform, Translatable};
+ 
+@@ -311,7 +312,7 @@ impl VsockPacket {
+                 guest_hdr_addr,
+                 hdr,
+                 buf: Some(PacketBuffer::Borrowed {
+-                    ptr: get_host_address_range(
++                    ptr: dirty_host_address_range(
+                         desc_chain.memory(),
+                         buf_desc.addr().translate_gva(access_platform, buf_size),
+                         buf_size,
+@@ -326,7 +327,7 @@ impl VsockPacket {
+                 guest_hdr_addr,
+                 hdr,
+                 buf: Some(PacketBuffer::Borrowed {
+-                    ptr: get_host_address_range(
++                    ptr: dirty_host_address_range(
+                         desc_chain.memory(),
+                         head.addr()
+                             .checked_add(VSOCK_PKT_HDR_SIZE as u64)
+@@ -851,3 +852,15 @@ mod unit_tests {
+         }
+     }
+ }
++
++// Validate and mark before exposing a raw writable RX buffer, so a socket
++// partial read followed by an error cannot lose the changed guest bytes.
++fn dirty_host_address_range<M: GuestMemory + ?Sized>(
++    memory: &M,
++    addr: GuestAddress,
++    len: usize,
++) -> Option<*mut u8> {
++    let slice = memory.get_slice(addr, len).ok()?;
++    slice.bitmap().mark_dirty(0, len);
++    get_host_address_range(memory, addr, len)
++}
+diff --git a/vmm/src/api/http/http_endpoint.rs b/vmm/src/api/http/http_endpoint.rs
+index e463a20..a5a2ad0 100644
+--- a/vmm/src/api/http/http_endpoint.rs
++++ b/vmm/src/api/http/http_endpoint.rs
+@@ -46,9 +46,9 @@ use crate::api::http::http_endpoint::fds_helper::{attach_fds_to_cfg, attach_fds_
+ use crate::api::http::{EndpointHandler, HttpError, error_response};
+ use crate::api::{
+     AddDisk, ApiAction, ApiError, ApiRequest, NetConfig, VmAddDevice, VmAddFs, VmAddNet, VmAddPmem,
+-    VmAddUserDevice, VmAddVdpa, VmAddVsock, VmBoot, VmConfig, VmCounters, VmDelete, VmNmi, VmPause,
+-    VmPowerButton, VmReboot, VmReceiveMigration, VmRemoveDevice, VmResize, VmResizeDisk,
+-    VmResizeZone, VmRestore, VmResume, VmSendMigration, VmShutdown, VmSnapshot,
++    VmAddUserDevice, VmAddVdpa, VmAddVsock, VmBoot, VmConfig, VmCounters, VmDelete, VmDirtyMemory,
++    VmNmi, VmPause, VmPowerButton, VmReboot, VmReceiveMigration, VmRemoveDevice, VmResize,
++    VmResizeDisk, VmResizeZone, VmRestore, VmResume, VmSendMigration, VmShutdown, VmSnapshot,
+ };
+ use crate::config::RestoreConfig;
+ use crate::cpu::Error as CpuError;
+@@ -406,6 +406,7 @@ macro_rules! vm_action_put_handler_body {
+ }
+ 
+ vm_action_get_handler!(VmCounters);
++vm_action_get_handler!(VmDirtyMemory);
+ 
+ vm_action_put_handler!(VmBoot);
+ vm_action_put_handler!(VmDelete);
+diff --git a/vmm/src/api/http/mod.rs b/vmm/src/api/http/mod.rs
+index 2aa52e8..27823a4 100644
+--- a/vmm/src/api/http/mod.rs
++++ b/vmm/src/api/http/mod.rs
+@@ -29,9 +29,9 @@ use self::http_endpoint::{VmActionHandler, VmCreate, VmInfo, VmmPing, VmmShutdow
+ use crate::api::VmCoredump;
+ use crate::api::{
+     AddDisk, ApiError, ApiRequest, VmAddDevice, VmAddFs, VmAddNet, VmAddPmem, VmAddUserDevice,
+-    VmAddVdpa, VmAddVsock, VmBoot, VmCounters, VmDelete, VmNmi, VmPause, VmPowerButton, VmReboot,
+-    VmReceiveMigration, VmRemoveDevice, VmResize, VmResizeDisk, VmResizeZone, VmRestore, VmResume,
+-    VmSendMigration, VmShutdown, VmSnapshot,
++    VmAddVdpa, VmAddVsock, VmBoot, VmCounters, VmDelete, VmDirtyMemory, VmNmi, VmPause,
++    VmPowerButton, VmReboot, VmReceiveMigration, VmRemoveDevice, VmResize, VmResizeDisk,
++    VmResizeZone, VmRestore, VmResume, VmSendMigration, VmShutdown, VmSnapshot,
+ };
+ use crate::landlock::Landlock;
+ use crate::seccomp_filters::{Thread, get_seccomp_filter};
+@@ -227,6 +227,10 @@ pub static HTTP_ROUTES: LazyLock<HttpRoutes> = LazyLock::new(|| {
+         Box::new(VmActionHandler::new(&VmDelete)),
+     );
+     r.routes.insert(endpoint!("/vm.info"), Box::new(VmInfo {}));
++    r.routes.insert(
++        endpoint!("/vm.dirty-memory"),
++        Box::new(VmActionHandler::new(&VmDirtyMemory)),
++    );
+     r.routes.insert(
+         endpoint!("/vm.pause"),
+         Box::new(VmActionHandler::new(&VmPause)),
+diff --git a/vmm/src/api/mod.rs b/vmm/src/api/mod.rs
+index 12ca6b9..4e966fb 100644
+--- a/vmm/src/api/mod.rs
++++ b/vmm/src/api/mod.rs
+@@ -348,6 +348,7 @@ pub trait RequestHandler {
+ 
+     fn vm_add_vsock(&mut self, vsock_cfg: VsockConfig) -> Result<Option<Vec<u8>>, VmError>;
+ 
++    fn vm_dirty_memory(&mut self) -> Result<Option<Vec<u8>>, VmError>;
+     fn vm_counters(&mut self) -> Result<Option<Vec<u8>>, VmError>;
+ 
+     fn vm_power_button(&mut self) -> Result<(), VmError>;
+@@ -829,6 +830,39 @@ impl ApiAction for VmCounters {
+     }
+ }
+ 
++pub struct VmDirtyMemory;
++
++impl ApiAction for VmDirtyMemory {
++    type RequestBody = ();
++    type ResponseBody = Option<Body>;
++
++    fn request(&self, _: Self::RequestBody, response_sender: Sender<ApiResponse>) -> ApiRequest {
++        Box::new(move |vmm| {
++            info!("API request event: VmDirtyMemory");
++
++            let response = vmm
++                .vm_dirty_memory()
++                .map_err(ApiError::VmInfo)
++                .map(ApiResponsePayload::VmAction);
++
++            response_sender
++                .send(response)
++                .map_err(VmmError::ApiResponseSend)?;
++
++            Ok(false)
++        })
++    }
++
++    fn send(
++        &self,
++        api_evt: EventFd,
++        api_sender: Sender<ApiRequest>,
++        data: Self::RequestBody,
++    ) -> ApiResult<Self::ResponseBody> {
++        get_response_body(self, api_evt, api_sender, data)
++    }
++}
++
+ pub struct VmCreate;
+ 
+ impl ApiAction for VmCreate {
+diff --git a/vmm/src/dirty_memory.rs b/vmm/src/dirty_memory.rs
+new file mode 100644
+index 0000000..2a6c80d
+--- /dev/null
++++ b/vmm/src/dirty_memory.rs
+@@ -0,0 +1,92 @@
++// SPDX-License-Identifier: Apache-2.0
++// Cumulative checkpoint logs. A collection moves bits, never starts a new epoch.
++use serde::Serialize;
++
++#[derive(Clone, Serialize)]
++pub struct DirtyRegion {
++    pub slot: u32,
++    pub gpa: u64,
++    pub size: u64,
++    pub file_offset: u64,
++    pub bitmap: Vec<u64>,
++}
++
++impl DirtyRegion {
++    pub fn new(slot: u32, gpa: u64, size: u64, file_offset: u64) -> Result<Self, String> {
++        if size == 0
++            || (gpa | size | file_offset) & 4095 != 0
++            || gpa.checked_add(size).is_none()
++            || file_offset.checked_add(size).is_none()
++        {
++            return Err("unaligned or overflowing dirty region".into());
++        }
++        Ok(Self {
++            slot,
++            gpa,
++            size,
++            file_offset,
++            bitmap: vec![0; (size / 4096).div_ceil(64) as usize],
++        })
++    }
++
++    pub fn all_dirty(&mut self) {
++        self.bitmap.fill(u64::MAX);
++        let remainder = (self.size / 4096) % 64;
++        if remainder != 0 {
++            *self.bitmap.last_mut().unwrap() = (1u64 << remainder) - 1;
++        }
++    }
++
++    // A failing GET_DIRTY_LOG can already have cleared its slot before copyout
++    // fails. Preserve that slot conservatively before returning the error.
++    pub fn consume(&mut self, result: Result<Vec<u64>, String>) -> Result<(), String> {
++        let bits = match result {
++            Ok(bits) if bits.len() == self.bitmap.len() => bits,
++            Ok(_) => {
++                self.all_dirty();
++                return Err("dirty bitmap length mismatch".into());
++            }
++            Err(e) => {
++                self.all_dirty();
++                return Err(e);
++            }
++        };
++        for (saved, incoming) in self.bitmap.iter_mut().zip(bits) {
++            *saved |= incoming;
++        }
++        // Some backends pad the final word; the wire format never does.
++        let remainder = (self.size / 4096) % 64;
++        if remainder != 0 {
++            *self.bitmap.last_mut().unwrap() &= (1u64 << remainder) - 1;
++        }
++        Ok(())
++    }
++}
++
++#[derive(Serialize)]
++pub struct DirtyMemory {
++    pub version: u32,
++    pub page_shift: u32,
++    pub regions: Vec<DirtyRegion>,
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn consumed_prefix_failed_slot_and_lost_response_survive_retry() {
++        let mut a = DirtyRegion::new(2, 0, 65 * 4096, 0).unwrap();
++        let mut b = DirtyRegion::new(4, 1 << 32, 4096, 65 * 4096).unwrap();
++        a.consume(Ok(vec![4, 0])).unwrap();
++        assert!(b.consume(Err("copyout EFAULT after clear".into())).is_err());
++        a.consume(Ok(vec![0, 1])).unwrap();
++        b.consume(Ok(vec![0])).unwrap();
++        let lost_response = a.clone();
++        a.consume(Ok(vec![0, 0])).unwrap();
++        assert_eq!(a.bitmap, lost_response.bitmap);
++        assert_eq!(a.bitmap, vec![4, 1]);
++        assert_eq!(b.bitmap, vec![1]);
++        assert!(a.consume(Ok(vec![0])).is_err());
++        assert_eq!(a.bitmap, vec![u64::MAX, 1]);
++    }
++}
+diff --git a/vmm/src/lib.rs b/vmm/src/lib.rs
+index dcf6614..c0df903 100644
+--- a/vmm/src/lib.rs
++++ b/vmm/src/lib.rs
+@@ -73,6 +73,7 @@ mod coredump;
+ pub mod cpu;
+ pub mod device_manager;
+ pub mod device_tree;
++mod dirty_memory;
+ #[cfg(feature = "guest_debug")]
+ mod gdb;
+ #[cfg(feature = "igvm")]
+@@ -2230,6 +2231,16 @@ impl RequestHandler for Vmm {
+         }
+     }
+ 
++    fn vm_dirty_memory(&mut self) -> result::Result<Option<Vec<u8>>, VmError> {
++        if let Some(ref mut vm) = self.vm {
++            serde_json::to_vec(&vm.dirty_memory()?)
++                .map(Some)
++                .map_err(VmError::SerializeJson)
++        } else {
++            Err(VmError::VmNotRunning)
++        }
++    }
++
+     fn vm_counters(&mut self) -> result::Result<Option<Vec<u8>>, VmError> {
+         if let Some(ref mut vm) = self.vm {
+             let info = vm.counters().inspect_err(|e| {
+diff --git a/vmm/src/memory_manager.rs b/vmm/src/memory_manager.rs
+index 7c4528a..9d9c714 100644
+--- a/vmm/src/memory_manager.rs
++++ b/vmm/src/memory_manager.rs
+@@ -164,6 +164,8 @@ struct ArchMemRegion {
+ }
+ 
+ pub struct MemoryManager {
++    checkpoint_regions: Vec<crate::dirty_memory::DirtyRegion>,
++    checkpoint_logging: bool,
+     boot_guest_memory: GuestMemoryMmap,
+     guest_memory: GuestMemoryAtomic<GuestMemoryMmap>,
+     next_memory_slot: Arc<AtomicU32>,
+@@ -205,6 +207,8 @@ pub struct MemoryManager {
+ 
+ #[derive(Error, Debug)]
+ pub enum Error {
++    #[error("Checkpoint dirty memory: {0}")]
++    CheckpointDirty(String),
+     /// Failed to create shared file.
+     #[error("Failed to create shared file")]
+     SharedFileCreate(#[source] io::Error),
+@@ -583,9 +587,7 @@ impl MemoryManager {
+         // SAFETY: fd was inherited via cmd.ExtraFiles by the parent;
+         // CH owns each clone for its MmapRegion lifetime. Mutated below
+         // when iterating to a new zone.
+-        let mut zone_fd: Option<File> = zone
+-            .fd
+-            .map(|raw| unsafe { File::from_raw_fd(raw) });
++        let mut zone_fd: Option<File> = zone.fd.map(|raw| unsafe { File::from_raw_fd(raw) });
+ 
+         if !is_aligned(zone.size, zone_align_size) {
+             return Err(Error::MisalignedMemorySize);
+@@ -677,6 +679,7 @@ impl MemoryManager {
+                         region.len() as usize,
+                         socket,
+                         &zone.id,
++                        file_offset,
+                     )?;
+                 }
+ 
+@@ -722,9 +725,7 @@ impl MemoryManager {
+                     );
+                     // Pick up the new zone's inherited fd (if any). Keep
+                     // the same SAFETY invariant as the initial setup.
+-                    zone_fd = zone
+-                        .fd
+-                        .map(|raw| unsafe { File::from_raw_fd(raw) });
++                    zone_fd = zone.fd.map(|raw| unsafe { File::from_raw_fd(raw) });
+                 }
+ 
+                 if ram_region_consumed {
+@@ -757,9 +758,7 @@ impl MemoryManager {
+             if let Some(raw) = zone_config.fd {
+                 // SAFETY: fd was inherited via cmd.ExtraFiles by the
+                 // parent (sandbox-ctl) — same invariant as cold-start.
+-                zone_fds.insert(zone_config.id.as_str(), unsafe {
+-                    File::from_raw_fd(raw)
+-                });
++                zone_fds.insert(zone_config.id.as_str(), unsafe { File::from_raw_fd(raw) });
+             }
+         }
+ 
+@@ -779,12 +778,9 @@ impl MemoryManager {
+                     // CLI-provided zone.fd takes precedence over the
+                     // migration-receive HashMap. try_clone() per region
+                     // for the same shared-inode reason as cold-start.
+-                    let existing_memory_file = match zone_fds
+-                        .get(zone_config.id.as_str())
+-                    {
++                    let existing_memory_file = match zone_fds.get(zone_config.id.as_str()) {
+                         Some(f) => Some(f.try_clone().map_err(Error::MemfdClone)?),
+-                        None => existing_memory_files
+-                            .remove(&guest_ram_mapping.slot),
++                        None => existing_memory_files.remove(&guest_ram_mapping.slot),
+                     };
+                     let region = MemoryManager::create_ram_region(
+                         if guest_ram_mapping.virtio_mem {
+@@ -812,6 +808,7 @@ impl MemoryManager {
+                             region.len() as usize,
+                             socket,
+                             &zone_config.id,
++                            guest_ram_mapping.file_offset,
+                         )?;
+                     }
+                     memory_regions.push(Arc::clone(&region));
+@@ -1074,6 +1071,28 @@ impl MemoryManager {
+                 .ok_or(Error::MemoryRangeAllocation)?;
+         }
+ 
++        if self.memory_zones.values().any(|zone| zone.user_managed()) {
++            if unsafe { libc::sysconf(libc::_SC_PAGESIZE) } != 4096 {
++                return Err(Error::CheckpointDirty(
++                    "checkpoint logging requires 4 KiB host pages".into(),
++                ));
++            }
++            self.checkpoint_regions = self
++                .guest_ram_mappings
++                .iter()
++                .map(|r| {
++                    crate::dirty_memory::DirtyRegion::new(r.slot, r.gpa, r.size, r.file_offset)
++                })
++                .collect::<Result<Vec<_>, _>>()
++                .map_err(Error::CheckpointDirty)?;
++            // Preserve initialization writes before enabling KVM logging. Do not
++            // call the migration start hook, which resets the software bitmap.
++            self.collect_checkpoint_dirty(false)?;
++            self.vm
++                .start_dirty_log()
++                .map_err(|e| Error::CheckpointDirty(e.to_string()))?;
++            self.checkpoint_logging = true;
++        }
+         Ok(())
+     }
+ 
+@@ -1111,6 +1130,60 @@ impl MemoryManager {
+     }
+ 
+     #[allow(clippy::too_many_arguments)]
++    fn collect_checkpoint_dirty(&mut self, cpu: bool) -> Result<(), Error> {
++        if self.guest_ram_mappings.len() != self.checkpoint_regions.len() {
++            for r in &mut self.checkpoint_regions {
++                r.all_dirty();
++            }
++            return Err(Error::CheckpointDirty("RAM registration changed".into()));
++        }
++        for (r, saved) in self
++            .guest_ram_mappings
++            .iter()
++            .zip(&mut self.checkpoint_regions)
++        {
++            if (r.slot, r.gpa, r.size, r.file_offset)
++                != (saved.slot, saved.gpa, saved.size, saved.file_offset)
++            {
++                saved.all_dirty();
++                return Err(Error::CheckpointDirty("RAM mapping changed".into()));
++            }
++            // Each consumed source is transferred before the next source or
++            // slot. HTTP serialization and response delivery happen afterwards.
++            let memory = self.guest_memory.memory();
++            let software = memory
++                .find_region(GuestAddress(r.gpa))
++                .filter(|region| region.start_addr().raw_value() == r.gpa && region.len() == r.size)
++                .map(|region| (**region).bitmap().get_and_reset())
++                .ok_or_else(|| "software dirty region missing".to_string());
++            saved.consume(software).map_err(Error::CheckpointDirty)?;
++            if cpu {
++                saved
++                    .consume(
++                        self.vm
++                            .get_dirty_log(r.slot, r.gpa, r.size)
++                            .map_err(|e| e.to_string()),
++                    )
++                    .map_err(Error::CheckpointDirty)?;
++            }
++        }
++        Ok(())
++    }
++
++    pub fn checkpoint_dirty(&mut self) -> Result<crate::dirty_memory::DirtyMemory, Error> {
++        if !self.checkpoint_logging {
++            return Err(Error::CheckpointDirty(
++                "logging was not enabled at initialization".into(),
++            ));
++        }
++        self.collect_checkpoint_dirty(true)?;
++        Ok(crate::dirty_memory::DirtyMemory {
++            version: 1,
++            page_shift: 12,
++            regions: self.checkpoint_regions.clone(),
++        })
++    }
++
+     pub fn new(
+         vm: Arc<dyn hypervisor::Vm>,
+         config: &MemoryConfig,
+@@ -1326,6 +1399,8 @@ impl MemoryManager {
+ 
+         #[allow(unused_mut)]
+         let mut memory_manager = MemoryManager {
++            checkpoint_regions: Vec::new(),
++            checkpoint_logging: false,
+             boot_guest_memory,
+             guest_memory,
+             next_memory_slot: Arc::new(AtomicU32::new(next_memory_slot)),
+@@ -1455,6 +1530,7 @@ impl MemoryManager {
+         size: usize,
+         socket_path: &std::path::Path,
+         zone_id: &str,
++        file_offset: u64,
+     ) -> Result<(), Error> {
+         use std::io::IoSlice;
+         use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+@@ -1554,6 +1630,9 @@ impl MemoryManager {
+ 
+         let body = serde_json::to_vec(&serde_json::json!({
+             "type":     "va_report",
++            "version": 1,
++            "page_shift": 12,
++            "file_offset": file_offset,
+             "zone_id":  zone_id,
+             "va_start": addr,
+             "size":     size as u64,
+@@ -1602,7 +1681,9 @@ impl MemoryManager {
+         // Read ack (no fd attached on response).
+         use std::io::Read;
+         let mut len_buf = [0u8; 4];
+-        socket.read_exact(&mut len_buf).map_err(Error::UffdSocketIo)?;
++        socket
++            .read_exact(&mut len_buf)
++            .map_err(Error::UffdSocketIo)?;
+         let resp_len = u32::from_le_bytes(len_buf) as usize;
+         if resp_len > 64 * 1024 {
+             return Err(Error::UffdSocketBadResp(format!(
+@@ -1611,10 +1692,17 @@ impl MemoryManager {
+         }
+         let mut resp = vec![0u8; resp_len];
+         socket.read_exact(&mut resp).map_err(Error::UffdSocketIo)?;
+-        let parsed: serde_json::Value = serde_json::from_slice(&resp)
+-            .map_err(|e| Error::UffdSocketBadResp(e.to_string()))?;
++        let parsed: serde_json::Value =
++            serde_json::from_slice(&resp).map_err(|e| Error::UffdSocketBadResp(e.to_string()))?;
+         match parsed.get("type").and_then(|v| v.as_str()) {
+-            Some("ack") => {}
++            Some("ack") => {
++                if parsed.get("version").and_then(|v| v.as_u64()) != Some(1)
++                {
++                    return Err(Error::UffdSocketBadResp(
++                        "handler did not acknowledge memory registration".into(),
++                    ));
++                }
++            }
+             Some("error") => {
+                 let msg = parsed
+                     .get("msg")
+diff --git a/vmm/src/vm.rs b/vmm/src/vm.rs
+index c30ec98..235d278 100644
+--- a/vmm/src/vm.rs
++++ b/vmm/src/vm.rs
+@@ -2232,6 +2232,14 @@ impl Vm {
+         Ok(pci_device_info)
+     }
+ 
++    pub fn dirty_memory(&mut self) -> Result<crate::dirty_memory::DirtyMemory> {
++        self.memory_manager
++            .lock()
++            .unwrap()
++            .checkpoint_dirty()
++            .map_err(Error::MemoryManager)
++    }
++
+     pub fn counters(&self) -> Result<HashMap<String, HashMap<&'static str, Wrapping<u64>>>> {
+         Ok(self.device_manager.lock().unwrap().counters())
+     }
+-- 
+2.43.0
+

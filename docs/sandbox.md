@@ -1283,6 +1283,7 @@ Snapshot S layout:
   config.json
   state.json
   snapshot.cfg
+  memory.dirty  (optional)
 ]
 ```
 
@@ -1298,6 +1299,22 @@ from_refs:
 `sandbox_ref` points to the E produced at the same freeze point. `from_refs` is the top-to-bottom memory-parent chain. S does not duplicate capacity, runtime, root/data graphs, launch, mounts, files, init, or metadata.
 
 Snapshot ZIP and configuration are also strict, bounded, and canonical. `config.json` and `state.json` are each limited to 16 MiB, `snapshot.cfg` to 1 MiB, and `from_refs` to 64 entries. See [snapshotfile.go](../pkg/snapshotfile/snapshotfile.go) and [snapshot/config.go](../pkg/snapshot/config.go). Old disk-schema inputs return `unsupported snapshot format/version`; there is no dual-read, migration, or cold fallback.
+
+`memory.dirty` is optional; its absence means every explicit Data/Zero byte in
+this layer is dirty. A present all-zero bitmap means no dirty pages. Restore
+always reads the complete memory payload, including clean copies. The entry has
+16 little-endian header bytes (`uint32 version=1`, `uint32 page_shift=12`,
+`uint64 memory_size`) followed by one bit per 4 KiB page, low bit first. Unused
+bits must be zero; each set page must be completely covered by Data/Zero, even
+when coverage spans several runs. Legacy layers without the entry retain their
+byte geometry. The `snapshot.cfg` version remains 1.
+
+The aggregate ZIP tail, including all headers, directory and footer, is limited
+to 64 MiB. `ReadConfig` validates that geometry and the cfg CRC, reading only the
+16-byte dirty header; the complete reader also validates the bitmap CRC and
+coverage. Equivalent publish/copy/rebase preserves entry presence and body.
+Unverified rewrite or reduction uses conservative all-dirty metadata. Changing
+content or the bitmap creates a new identity.
 
 ## 4. Resource model
 
@@ -1923,14 +1940,40 @@ Snapshot/export dependency planning materializes only node-local dependencies th
 
 #### 6.1.2 Managed checkpoint history and selective cleanup
 
-`merge_ref=false` records the current resident working set separately. Starting with
-`S1 -> S0`, the next capture streams a new immutable historical Snapshot
-`S1′ = S1(memory) over S0(memory)` and writes `S2(current working set) -> S1′`.
-Further local captures repeat this composition: at most one owned local memory
-lower remains beneath the newest S. `merge_ref=true` absorbs the current resident
-memory and the entire eligible local prefix; switching false → true → false has
-the same bound. Restore still accepts old multi-layer inputs. Only the newest S
-supplies execution state and `sandbox_ref`; historical S contributes memory only.
+The running baseline B is fixed at cold start or restore. Dirty set D and
+released set R accumulate for that instance; successful/failed captures and mode
+switches never clear them. After pause, backend quiesce, CH state writes and final
+log collection, CaptureView fixes resident pages M under the UFFD installation
+gate. The change layer C contains Data at D∩M and Zero at R\M. The working set W
+contains all M as Data and R\M as Zero. Other dirty holes still inherit B.
+
+`merge_ref=true` (default) combines C with trimmed local history H.
+`merge_ref=false` emits W separately, labels its clean copies, and still trims
+history into H, including a single parent. History forms the union U of effective
+dirty candidates and selects final Data/Zero values from the original complete
+ordered view V. Clean labels are used only when the layer's complete declared
+parent identities equal its actual ordered suffix; otherwise that layer is
+conservatively all dirty. A sibling is not a proved ancestor. At most one owned
+local memory lower remains beneath the newest S; false → true → false keeps
+that bound. Only the newest S supplies execution state and `sandbox_ref`.
+
+Before writing a local tarstream, metadata-only planning enforces its 1 TiB
+payload bound, `1<<20` sparse extents including the sentinel, and a 256 MiB
+charged index-memory budget. Bundle/ingest retain their own carrier limits.
+Fragmentation fallback uses each artifact's untrimmed binary coverage P and
+full three-state truth F: emit Data from F inside P, retain required Zero or
+Hole outside P. For true self, P is current M plus full owned history; false H
+uses only full owned history, and false self only current M. External holes
+are never filled. Extra Data is all dirty; Zero-as-Data is confined to this
+fallback. A fallback still over budget fails. Only new capture may omit a
+bitmap whose addition alone exceeds the ZIP budget, reporting all explicit
+content dirty; ordinary publication cannot discard it. Logs report the reason,
+carrier extra Data, Data/bitmap/ZIP bytes and FileSink physical bytes. Parent-view
+proof fallback separately reports the extra logical Data and Zero relative to
+bitmap-only candidate coverage, using final V values and excluding overlap with
+current C. This diagnostic comparison never permits trimming an unproved layer.
+ZIP bytes already include the bitmap body; logical Zero is not physical storage.
+Size comparisons must include H and identity-deduplicated reachable local artifacts.
 
 The prefix belongs to the current sandbox's canonical `BaseDir/checkpoint`.
 Selection uses complete source bindings and physical Bundle membership before

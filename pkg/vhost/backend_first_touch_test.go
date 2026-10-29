@@ -14,6 +14,8 @@ import (
 	"unsafe"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
+	"github.com/kuasar-sandbox/sandboxer/pkg/memory"
+	"github.com/kuasar-sandbox/sandboxer/pkg/snapshot"
 	"github.com/kuasar-sandbox/sandboxer/pkg/uffd"
 	"golang.org/x/sys/unix"
 )
@@ -112,7 +114,11 @@ func TestRealMissingShmemRestoredUsedRingPreservesUntouchedBytes(t *testing.T) {
 			if err = amap.RegisterVMA(uffd.ProcessBackend, bva, size, 0); err != nil {
 				t.Fatal(err)
 			}
-			h, err := uffd.NewWithBackendUffd(fd, amap, uffd.Config{MemfdFD: memfd, BackendVA: uintptr(bva), Size: size, Source: source, NumWorkers: 2, Logf: t.Logf})
+			dirty, err := memory.NewDirty(size)
+			if err != nil {
+				t.Fatal(err)
+			}
+			h, err := uffd.NewWithBackendUffd(fd, amap, uffd.Config{Dirty: dirty, MemfdFD: memfd, BackendVA: uintptr(bva), Size: size, Source: source, NumWorkers: 2, Logf: t.Logf})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -135,6 +141,8 @@ func TestRealMissingShmemRestoredUsedRingPreservesUntouchedBytes(t *testing.T) {
 			}
 			server := &Server{}
 			server.SetMemoryLoader(h.EnsureLoaded)
+			var marked [][2]uint64
+			server.SetDirtyTracker(func(off, n uint64) error { marked = append(marked, [2]uint64{off, n}); return dirty.Mark(off, n) })
 			server.memTable.SetRegions(regs)
 			q := &virtq{num: 8, usedAddr: cva + 128}
 			if err = server.publishUsed(q, 3, 17); err != nil {
@@ -150,6 +158,21 @@ func TestRealMissingShmemRestoredUsedRingPreservesUntouchedBytes(t *testing.T) {
 			binary.LittleEndian.PutUint16(want[130:132], 8)
 			binary.LittleEndian.PutUint32(want[188:192], 3)
 			binary.LittleEndian.PutUint32(want[192:196], 17)
+			if len(marked) != 2 || marked[0] != [2]uint64{128, 4} || marked[1] != [2]uint64{188, 8} {
+				t.Fatalf("used ring writes not independently marked: %v", marked)
+			}
+			view, err := h.CaptureView()
+			if err != nil || view.Dirty[0]&1 == 0 {
+				t.Fatalf("Go used ring missing from D: %v %v", view, err)
+			}
+			selected, _, err := snapshot.CaptureMemory(bytes.NewReader(backend), view, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			captured := make([]byte, size)
+			if _, err = selected.ReadAt(context.Background(), captured, 0); err != nil || !bytes.Equal(captured, want) {
+				t.Fatalf("Go used ring capture differs: %v", err)
+			}
 			first := -1
 			changed := 0
 			for i, b := range cpu {

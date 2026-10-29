@@ -183,7 +183,7 @@ func (h *Handler) loadPage(ctx context.Context, off uint64, page []byte) error {
 		// COPY of a zero scratch page works on MISSING_SHMEM on the 5.10 floor;
 		// ZEROPAGE is not assumed to be available for shmem.
 		started := time.Now()
-		completed, copyErr := h.ops.copy(fd, va, page)
+		completed, copyErr := h.copyCleanLocked(fd, va, page)
 		h.stats.copies.Add(1)
 		h.stats.urgentCopyCalls.Add(1)
 		h.stats.urgentCopyNs.Add(uint64(time.Since(started).Nanoseconds()))
