@@ -1,33 +1,28 @@
-From 4e5fe2311174151a0b46e1ec68c466c8325e857c Mon Sep 17 00:00:00 2001
+From 3531455ec158b18ec425082d01eb54d526fb0d61 Mon Sep 17 00:00:00 2001
 From: Ruben Hakobyan <hruben@meta.com>
-Date: Thu, 21 May 2026 19:04:20 -0700
-Subject: [PATCH 10/10] hypervisor, vmm: Fix aarch64 SVE register save/restore
+Date: Thu, 21 May 2026 19:01:08 -0700
+Subject: [PATCH 09/11] hypervisor: preserve complete ARM CPU snapshot register
+ state
 
-When SVE is enabled, KVM replaces the FPSIMD V-registers with wider
-SVE Z-registers. Attempting to access the old FPSIMD offsets returns
-EINVAL.
+Backport ARM SVE register enumeration and pre-finalize restore ordering with their helper changes. Preserve FPSR/FPCR independently of the legacy vector path, including serialized native SVE and non-SVE roundtrip tests.
 
-Fix by classifying each register from KVM_GET_REG_LIST as core, system,
-or extended. Extended registers (currently SVE only) are saved as
-generic `ExtendedReg` entries split into `pre_finalize_regs` (registers
-like SVE VLS that must be written before `vcpu_finalize`) and
-`extended_regs`. FPSIMD registers are only accessed when SVE is absent.
-Unrecognized register families error immediately so future extensions
-like SME fail clearly rather than silently losing state.
+Upstream: https://github.com/cloud-hypervisor/cloud-hypervisor/pull/8268
+Upstream merged revision: 5c25d82f598433353fc96122afe15cf9bb0aa650
+Original backports: 083b41905ea59b335c4f211c4186312e30bbf022, e9d044730524d12e243737a1888767b3edf123c8, 4fc414cc8bc56a4c5275b3dd44610e5c75dfbbd1.
+The local FP control correction originated in 270badade6a55f5aeb569008f8fbb87f6ba52bd0 with author metadata Ubuntu <ubuntu@localhost.localdomain>; it is not attributed to the upstream author.
 
-The snapshot is deserialized before vCPU init to make pre-finalize
-register state available for the init -> VLS -> finalize ordering
-required by KVM.
-
+Reorganized from original patches 0008-0011.
 Signed-off-by: Ruben Hakobyan <hruben@meta.com>
+
+Also adapt upstream 48834e139e9d1882cdefb6cafa42155a13d173bc (Rob Bradford): require the VM KVM ArmSve capability before finalization, matching initialization. Pass the existing VM reference rather than importing the newer ownership refactor.
 ---
- hypervisor/src/arch/aarch64/mod.rs |   8 +++
- hypervisor/src/cpu.rs              |  20 ++++++
- hypervisor/src/kvm/aarch64/mod.rs  |  34 +++++++--
- hypervisor/src/kvm/mod.rs          | 109 +++++++++++++++++++++--------
- hypervisor/src/lib.rs              |  12 ++++
- vmm/src/cpu.rs                     |  17 ++++-
- 6 files changed, 160 insertions(+), 40 deletions(-)
+ hypervisor/src/arch/aarch64/mod.rs |   8 +
+ hypervisor/src/cpu.rs              |  20 +++
+ hypervisor/src/kvm/aarch64/mod.rs  |  34 +++-
+ hypervisor/src/kvm/mod.rs          | 251 +++++++++++++++++++++++------
+ hypervisor/src/lib.rs              |  12 ++
+ vmm/src/cpu.rs                     |  48 ++++--
+ 6 files changed, 306 insertions(+), 67 deletions(-)
 
 diff --git a/hypervisor/src/arch/aarch64/mod.rs b/hypervisor/src/arch/aarch64/mod.rs
 index 9d19f44..53ed17c 100644
@@ -157,7 +152,7 @@ index a94ed55..156d796 100644
 +    pub extended_regs: Vec<ExtendedReg>,
  }
 diff --git a/hypervisor/src/kvm/mod.rs b/hypervisor/src/kvm/mod.rs
-index e602728..221c609 100644
+index fd23796..d5ad053 100644
 --- a/hypervisor/src/kvm/mod.rs
 +++ b/hypervisor/src/kvm/mod.rs
 @@ -35,7 +35,10 @@ use vmm_sys_util::{ioctl::ioctl_with_ptr, ioctl_iow_nr};
@@ -187,23 +182,71 @@ index e602728..221c609 100644
  };
  #[cfg(target_arch = "riscv64")]
  use kvm_bindings::{KVM_REG_RISCV_CORE, kvm_riscv_core};
-@@ -1557,7 +1560,6 @@ impl cpu::Vcpu for KvmVcpu {
+@@ -1557,18 +1560,7 @@ impl cpu::Vcpu for KvmVcpu {
              off += std::mem::size_of::<u64>();
          }
  
--        self.get_fpsimd_regs(&mut state)?;
+-        // Now moving on to floating point registers which are stored in the user_fpsimd_state in the kernel:
+-        // https://elixir.bootlin.com/linux/v4.9.62/source/arch/arm64/include/uapi/asm/kvm.h#L53
+-        let mut off = offset_of!(kvm_regs, fp_regs.vregs);
+-        for i in 0..32 {
+-            let mut bytes = [0_u8; 16];
+-            self.fd
+-                .get_one_reg(arm64_core_reg_id!(KVM_REG_SIZE_U128, off), &mut bytes)
+-                .map_err(|e| cpu::HypervisorCpuError::GetAarchCoreRegister(e.into()))?;
+-            state.fp_regs.vregs[i] = u128::from_le_bytes(bytes);
+-            off += mem::size_of::<u128>();
+-        }
+-
++        // FPSR/FPCR remain core registers with SVE enabled.
+         // Floating-point Status Register
+         let off = offset_of!(kvm_regs, fp_regs.fpsr);
+         let mut bytes = [0_u8; 4];
+@@ -1584,6 +1576,7 @@ impl cpu::Vcpu for KvmVcpu {
+             .get_one_reg(arm64_core_reg_id!(KVM_REG_SIZE_U32, off), &mut bytes)
+             .map_err(|e| cpu::HypervisorCpuError::GetAarchCoreRegister(e.into()))?;
+         state.fp_regs.fpcr = u32::from_le_bytes(bytes);
++
          Ok(state.into())
      }
  
-@@ -1711,7 +1713,6 @@ impl cpu::Vcpu for KvmVcpu {
+@@ -1737,17 +1730,8 @@ impl cpu::Vcpu for KvmVcpu {
              off += std::mem::size_of::<u64>();
          }
  
--        self.set_fpsimd_regs(&kvm_regs_state)?;
+-        let mut off = offset_of!(kvm_regs, fp_regs.vregs);
+-        for i in 0..32 {
+-            self.fd
+-                .set_one_reg(
+-                    arm64_core_reg_id!(KVM_REG_SIZE_U128, off),
+-                    &kvm_regs_state.fp_regs.vregs[i].to_le_bytes(),
+-                )
+-                .map_err(|e| cpu::HypervisorCpuError::SetAarchCoreRegister(e.into()))?;
+-            off += mem::size_of::<u128>();
+-        }
+-
++        // FPSR/FPCR remain core registers with SVE enabled.
++        // Floating-point Status Register
+         let off = offset_of!(kvm_regs, fp_regs.fpsr);
+         self.fd
+             .set_one_reg(
+@@ -1756,6 +1740,7 @@ impl cpu::Vcpu for KvmVcpu {
+             )
+             .map_err(|e| cpu::HypervisorCpuError::SetAarchCoreRegister(e.into()))?;
+ 
++        // Floating-point Control Register
+         let off = offset_of!(kvm_regs, fp_regs.fpcr);
+         self.fd
+             .set_one_reg(
+@@ -1763,6 +1748,7 @@ impl cpu::Vcpu for KvmVcpu {
+                 &kvm_regs_state.fp_regs.fpcr.to_le_bytes(),
+             )
+             .map_err(|e| cpu::HypervisorCpuError::SetAarchCoreRegister(e.into()))?;
++
          Ok(())
      }
  
-@@ -2211,6 +2212,16 @@ impl cpu::Vcpu for KvmVcpu {
+@@ -2262,6 +2248,16 @@ impl cpu::Vcpu for KvmVcpu {
              .map_err(|e| cpu::HypervisorCpuError::VcpuFinalize(e.into()))
      }
  
@@ -220,7 +263,7 @@ index e602728..221c609 100644
      #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
      ///
      /// Gets a list of the guest registers that are supported for the
-@@ -2487,42 +2498,64 @@ impl cpu::Vcpu for KvmVcpu {
+@@ -2538,42 +2534,64 @@ impl cpu::Vcpu for KvmVcpu {
              mp_state: self.get_mp_state()?.into(),
              ..Default::default()
          };
@@ -308,7 +351,7 @@ index e602728..221c609 100644
  
          Ok(state.into())
      }
-@@ -2691,8 +2724,24 @@ impl cpu::Vcpu for KvmVcpu {
+@@ -2742,8 +2760,24 @@ impl cpu::Vcpu for KvmVcpu {
      #[cfg(target_arch = "aarch64")]
      fn set_state(&self, state: &CpuState) -> cpu::Result<()> {
          let state: VcpuKvmState = state.clone().into();
@@ -333,6 +376,135 @@ index e602728..221c609 100644
          // Set system registers
          for reg in &state.sys_regs {
              self.fd
+@@ -2961,6 +2995,42 @@ impl cpu::Vcpu for KvmVcpu {
+     }
+ }
+ 
++#[cfg(target_arch = "aarch64")]
++impl KvmVcpu {
++    fn get_fpsimd_regs(&self, regs: &mut kvm_regs) -> cpu::Result<()> {
++        // Floating point registers are stored in the user_fpsimd_state in the kernel:
++        // https://elixir.bootlin.com/linux/v4.9.62/source/arch/arm64/include/uapi/asm/kvm.h#L53
++        let mut off = offset_of!(kvm_regs, fp_regs.vregs);
++        for i in 0..32 {
++            let mut bytes = [0_u8; 16];
++            self.fd
++                .get_one_reg(arm64_core_reg_id!(KVM_REG_SIZE_U128, off), &mut bytes)
++                .map_err(|e| cpu::HypervisorCpuError::GetAarchCoreRegister(e.into()))?;
++            regs.fp_regs.vregs[i] = u128::from_le_bytes(bytes);
++            off += mem::size_of::<u128>();
++        }
++
++        Ok(())
++    }
++
++    fn set_fpsimd_regs(&self, regs: &kvm_regs) -> cpu::Result<()> {
++        // Floating point registers are stored in the user_fpsimd_state in the kernel:
++        // https://elixir.bootlin.com/linux/v4.9.62/source/arch/arm64/include/uapi/asm/kvm.h#L53
++        let mut off = offset_of!(kvm_regs, fp_regs.vregs);
++        for i in 0..32 {
++            self.fd
++                .set_one_reg(
++                    arm64_core_reg_id!(KVM_REG_SIZE_U128, off),
++                    &regs.fp_regs.vregs[i].to_le_bytes(),
++                )
++                .map_err(|e| cpu::HypervisorCpuError::SetAarchCoreRegister(e.into()))?;
++            off += mem::size_of::<u128>();
++        }
++
++        Ok(())
++    }
++}
++
+ impl KvmVcpu {
+     #[cfg(target_arch = "x86_64")]
+     ///
+@@ -3110,6 +3180,85 @@ impl KvmVcpu {
+ 
+ #[cfg(test)]
+ mod unit_tests {
++    // Requires a native ARM KVM host; hosted artifact-only ARM runners lack /dev/kvm.
++    #[test]
++    #[cfg(target_arch = "aarch64")]
++    #[ignore = "requires native ARM KVM with SVE"]
++    fn test_arm_sve_snapshot_register_roundtrip() {
++        arm_snapshot_register_roundtrip(true);
++    }
++
++    #[test]
++    #[cfg(target_arch = "aarch64")]
++    #[ignore = "requires native ARM KVM"]
++    fn test_arm_fpsimd_snapshot_register_roundtrip() {
++        arm_snapshot_register_roundtrip(false);
++    }
++
++    #[cfg(target_arch = "aarch64")]
++    fn arm_snapshot_register_roundtrip(sve: bool) {
++        use super::*;
++        use crate::cpu::Vcpu;
++        use kvm_bindings::{KVM_ARM_VCPU_PSCI_0_2, KVM_ARM_VCPU_SVE};
++
++        let kvm = kvm_ioctls::Kvm::new().unwrap();
++        let vm = kvm.create_vm().unwrap();
++        let make_vcpu = |id| {
++            let fd = vm.create_vcpu(id).unwrap();
++            let mut init = kvm_bindings::kvm_vcpu_init::default();
++            vm.get_preferred_target(&mut init).unwrap();
++            init.features[0] |= 1 << KVM_ARM_VCPU_PSCI_0_2;
++            if sve {
++                init.features[0] |= 1 << KVM_ARM_VCPU_SVE;
++            } else {
++                init.features[0] &= !(1 << KVM_ARM_VCPU_SVE);
++            }
++            fd.vcpu_init(&init).unwrap();
++            KvmVcpu { fd, vm_ops: None }
++        };
++        let source = make_vcpu(0);
++        if sve {
++            source.fd.vcpu_finalize(&(KVM_ARM_VCPU_SVE as i32)).unwrap();
++        }
++        let fpsr_off = offset_of!(kvm_regs, fp_regs.fpsr);
++        let fpcr_off = offset_of!(kvm_regs, fp_regs.fpcr);
++        let fpsr = arm64_core_reg_id!(KVM_REG_SIZE_U32, fpsr_off);
++        let fpcr = arm64_core_reg_id!(KVM_REG_SIZE_U32, fpcr_off);
++        source.fd.set_one_reg(fpsr, &0x08000001u32.to_le_bytes()).unwrap();
++        source.fd.set_one_reg(fpcr, &0x00400000u32.to_le_bytes()).unwrap();
++        let vector_id = if sve {
++            // KVM_REG_ARM64_SVE_ZREG(0, 0): one 2048-bit slice.
++            KVM_REG_ARM64 | kvm_bindings::KVM_REG_SIZE_U2048
++                | kvm_bindings::KVM_REG_ARM64_SVE as u64
++        } else {
++            let off = offset_of!(kvm_regs, fp_regs.vregs);
++            arm64_core_reg_id!(KVM_REG_SIZE_U128, off)
++        };
++        let mut vector = vec![0u8; if sve { 256 } else { 16 }];
++        vector[..16].fill(0x5a);
++        source.fd.set_one_reg(vector_id, &vector).unwrap();
++        let state = source.state().unwrap();
++        let captured: VcpuKvmState = state.clone().into();
++        assert_eq!(captured.core_regs.fp_regs.fpsr, 0x08000001);
++        assert_eq!(captured.core_regs.fp_regs.fpcr, 0x00400000);
++        assert_eq!(!captured.extended_regs.is_empty(), sve);
++        // Exercise the serialized snapshot boundary and pre-finalize restore order.
++        let state: CpuState = serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
++        let restored = make_vcpu(1);
++        restored.set_pre_finalize_regs(state.pre_finalize_regs()).unwrap();
++        if sve {
++            restored.fd.vcpu_finalize(&(KVM_ARM_VCPU_SVE as i32)).unwrap();
++        }
++        restored.set_state(&state).unwrap();
++        let mut actual = vec![0u8; vector.len()];
++        restored.fd.get_one_reg(vector_id, &mut actual).unwrap();
++        assert_eq!(actual, vector);
++        for (id, expected) in [(fpsr, 0x08000001u32), (fpcr, 0x00400000u32)] {
++            let mut actual = [0u8; 4];
++            restored.fd.get_one_reg(id, &mut actual).unwrap();
++            assert_eq!(u32::from_le_bytes(actual), expected);
++        }
++    }
+     #[test]
+     #[cfg(target_arch = "riscv64")]
+     fn test_get_and_set_regs() {
 diff --git a/hypervisor/src/lib.rs b/hypervisor/src/lib.rs
 index 3d919e4..5e91796 100644
 --- a/hypervisor/src/lib.rs
@@ -357,7 +529,7 @@ index 3d919e4..5e91796 100644
  #[cfg(target_arch = "x86_64")]
  pub enum ClockData {
 diff --git a/vmm/src/cpu.rs b/vmm/src/cpu.rs
-index bfe8f37..216589c 100644
+index a0d8b14..d604427 100644
 --- a/vmm/src/cpu.rs
 +++ b/vmm/src/cpu.rs
 @@ -215,6 +215,10 @@ pub enum Error {
@@ -371,29 +543,80 @@ index bfe8f37..216589c 100644
      #[cfg(target_arch = "aarch64")]
      #[error("Error initialising GICR base address")]
      VcpuSetGicrBaseAddr(#[source] hypervisor::HypervisorCpuError),
-@@ -1210,15 +1214,22 @@ impl CpuManager {
+@@ -530,6 +534,7 @@ impl Vcpu {
+         #[cfg(target_arch = "aarch64")]
+         {
+             self.init(vm)?;
++            self.finalize_sve(vm)?;
+             self.mpidr = arch::configure_vcpu(self.vcpu.as_ref(), self.id, boot_setup)
+                 .map_err(Error::VcpuConfiguration)?;
+         }
+@@ -568,13 +573,8 @@ impl Vcpu {
+     /// Initializes an aarch64 specific vcpu for booting Linux.
+     #[cfg(target_arch = "aarch64")]
+     pub fn init(&self, vm: &dyn hypervisor::Vm) -> Result<()> {
+-        use std::arch::is_aarch64_feature_detected;
+-        #[allow(clippy::nonminimal_bool)]
+-        let sve_supported =
+-            is_aarch64_feature_detected!("sve") || is_aarch64_feature_detected!("sve2");
+         let mut kvi = self.vcpu.create_vcpu_init();
+ 
+-        // This reads back the kernel's preferred target type.
+         vm.get_preferred_target(&mut kvi)
+             .map_err(Error::VcpuArmPreferredTarget)?;
+ 
+@@ -584,6 +584,27 @@ impl Vcpu {
+ 
+         self.vcpu.vcpu_init(&kvi).map_err(Error::VcpuArmInit)?;
+ 
++        Ok(())
++    }
++
++    /// Finalizes SVE on the vCPU if the host supports it.
++    /// Must be called after init() and before any register access.
++    #[cfg(target_arch = "aarch64")]
++    pub fn finalize_sve(&self, vm: &dyn hypervisor::Vm) -> Result<()> {
++        use std::arch::is_aarch64_feature_detected;
++        #[allow(clippy::nonminimal_bool)]
++        let sve_supported =
++            is_aarch64_feature_detected!("sve") || is_aarch64_feature_detected!("sve2");
++        // Match vcpu_set_processor_features: host HWCAP alone does not mean
++        // this KVM VM enabled SVE. Backport upstream 48834e139e9d without
++        // changing Vcpu ownership merely to retain the already-available VM.
++        #[cfg(feature = "kvm")]
++        let sve_supported = sve_supported
++            && vm.as_any()
++                .downcast_ref::<hypervisor::kvm::KvmVm>()
++                .is_none_or(|vm| vm.check_extension(hypervisor::kvm::Cap::ArmSve));
++        #[cfg(not(feature = "kvm"))]
++        let _ = vm;
+         if sve_supported {
+             let finalized_features = self.vcpu.vcpu_get_finalized_features();
+             self.vcpu
+@@ -1203,13 +1224,22 @@ impl CpuManager {
          )?;
  
          if let Some(snapshot) = snapshot {
-+            let state: CpuState = snapshot.to_state().map_err(|e| {
-+                Error::VcpuCreate(anyhow!("Could not get vCPU state from snapshot {e:?}"))
-+            })?;
+-            // AArch64 vCPUs should be initialized after created.
+-            #[cfg(target_arch = "aarch64")]
+-            vcpu.init(self.vm.as_ref())?;
+-
+             let state: CpuState = snapshot.to_state().map_err(|e| {
+                 Error::VcpuCreate(anyhow!("Could not get vCPU state from snapshot {e:?}"))
+             })?;
 +
-             #[cfg(target_arch = "aarch64")]
-             {
-                 vcpu.init(self.vm.as_ref())?;
++            #[cfg(target_arch = "aarch64")]
++            {
++                vcpu.init(self.vm.as_ref())?;
 +                let pre_finalize = state.pre_finalize_regs();
 +                if !pre_finalize.is_empty() {
 +                    vcpu.vcpu
 +                        .set_pre_finalize_regs(pre_finalize)
 +                        .map_err(Error::VcpuSetPreFinalizeRegs)?;
 +                }
-                 vcpu.finalize_sve()?;
-             }
- 
--            let state: CpuState = snapshot.to_state().map_err(|e| {
--                Error::VcpuCreate(anyhow!("Could not get vCPU state from snapshot {e:?}"))
--            })?;
++                vcpu.finalize_sve(self.vm.as_ref())?;
++            }
++
              vcpu.vcpu
                  .set_state(&state)
                  .map_err(|e| Error::VcpuCreate(anyhow!("Could not set the vCPU state {e:?}")))?;

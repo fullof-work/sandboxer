@@ -122,7 +122,7 @@ func prepareDiskSource(ctx context.Context, d DiskDiff, codec tarstream.Codec, r
 		}
 		// Bound the parent to disk bytes so its ZIP tail cannot enter this
 		// payload. Layering preserves Zero as an opaque run above older data.
-		merged := fetch.NewLayered(v, &diskMergeBase{Stream: base, size: v.Size(), ctx: ctx})
+		merged := fetch.NewLayered(v, &payloadMergeBase{Stream: base, size: v.Size(), ctx: ctx})
 		return merged, merged.Close, nil
 	}
 	r, holes, close, err := prepareDiskCapture(ctx, d, codec, required, opener)

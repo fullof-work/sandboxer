@@ -4,8 +4,10 @@
 
 The platform uses Cloud Hypervisor (CH) as its microVM monitor. Most paths use
 upstream behavior. Externally managed memory, restore-safe vsock, and reliable VM
-lifecycle barriers are supplied by patches 0001–0007 maintained in this repository.
-Patches 0008–0011 add the ARM SVE snapshot compatibility backport described in §3.8.
+lifecycle barriers are supplied by patches 0001–0008 maintained in this repository.
+Patch 0009 preserves ARM snapshot registers; 0010 and 0011 backport upstream
+restore-order and HTTP allocator seccomp fixes. The series remains on CH v51.1
+and the Host Linux 5.10 baseline.
 This document defines their scope, build procedure, and behavioral contracts.
 
 ## 1. Overview
@@ -35,34 +37,49 @@ The platform has four requirements beyond the pinned upstream VMM behavior:
 The pinned upstream interface does not directly provide this combination. The
 second requirement is particularly important: the platform needs to own fault
 handling and delivery, not just supply data to an upstream external-listener
-model. This memory model also requires avoiding an `EVENT_REMOVE` storm when
-balloon release encounters ranges that have never been resident (patch 0004,
-§3.4).
+model. This memory model requires logical release notification even for pages
+that have never been resident: their lazy source may contain nonzero bytes.
+Patch 0004 may skip redundant inode punching, never the required REMOVE (§3.4).
 
-### 1.2 Patch scope summary
+### 1.2 Patch scope and future evolution
 
-The following line counts describe the reviewed patch set at sandboxer commit
-`c29f9af875c595df68491b50e872007e9285ef48`; they are revision-specific estimates,
-not a permanent size or compatibility guarantee.
+Each patch owns a complete intent, its corrections and its tests. Old numbers in
+this table refer to the original twelve-patch series restored by #377. This
+eleven-patch maintenance series does not include #374's new dirty tracking,
+cumulative API, capability handshake or snapshot format changes.
 
-| File | Approximate changed lines | Purpose |
-| --- | --- | --- |
-| `vmm/src/vm_config.rs` | ~19 | Add `fd` and `uffd_socket` to `MemoryZoneConfig` |
-| `vmm/src/config.rs` | ~9 | Parse the two additional `MemoryConfig::parse` keys |
-| `vmm/src/memory_manager.rs` | ~338 | Inherited backing fd, user-managed skip, in-process uffd creation, `va_report` with `SCM_RIGHTS`, and `UFFDIO_REGISTER` |
-| `vmm/src/seccomp_filters.rs` | ~17 | Allow `userfaultfd`, `UFFDIO_API`, and `UFFDIO_REGISTER` |
-| `virtio-devices/src/balloon.rs` | ~38 | Probe with `SEEK_DATA`; skip `PUNCH_HOLE` and `MADV_DONTNEED` for hole-only file-backed runs |
-| `virtio-devices/src/seccomp_filters.rs` | ~8 | Allow the balloon thread's `SYS_lseek` probe |
-| `virtio-devices/src/vsock/unix/muxer.rs` | ~20 | Persist the host local-port allocation cursor |
-| `virtio-devices/src/vsock/device.rs` / `mod.rs` | ~330 | Stage transport reset at snapshot, reassert its IRQ at restore, and gate RX until guest acknowledgement |
-| `hypervisor/src/cpu.rs` / `kvm/mod.rs` | ~110 | No-miss vCPU kicks with `KVM_SET_SIGNAL_MASK` and a blocked userspace signal mask |
-| `vmm/src/cpu.rs` / `seccomp_filters.rs` | ~550 | Consume kicks at lifecycle safe points, per-request ACKs/deadlines, and KVM ioctl allowlisting |
-| `virtio-devices/src/device.rs` / `epoll_helper.rs` / net / vhost-user | ~280 | Publish/wake pause events and provide a two-way resume barrier, including custom workers |
+| Patch | Purpose and scope | Origin | Future maintenance and removal condition |
+| --- | --- | --- | --- |
+| 0001 | Inherited RAM fd adoption, mapping and ownership | Old 0001, without unused UFFD configuration | Project-maintained. Discuss a generic external-RAM interface upstream; replace only after a released equivalent passes integration. |
+| 0002 | Delegate externally owned RAM snapshot contents | Old 0002 | Project-maintained with 0001. An upstream proposal must preserve the external owner's save/restore responsibility; retain the existing virtio-mem scope. |
+| 0003 | Complete legacy in-process MISSING UFFD handoff, configuration and permissions | Old 0003 plus the socket configuration from 0001 | Project-maintained protocol. Track upstream external paging interfaces; any migration must preserve peer compatibility and ownership. |
+| 0004 | Notify logical release before sparse physical reclaim; errors and real UFFD tests | Old 0004, corrected in place for #378 | Maintain the project optimization. Any upstream sparse-reclaim proposal must preserve REMOVE semantics; this is not an upstream bug caused by unmodified CH. |
+| 0005 | Persist vsock local-port allocation cursor | Old 0005 | Submit the restored-port collision fix and its reproducer upstream. Remove after adopting and validating an equivalent released fix. |
+| 0006 | Stage vsock reset, persist acknowledgement and gate restored RX | Old 0006 | Propose reset timing and lazy-restore semantics upstream separately from port allocation. Maintain until accepted, released and validated. |
+| 0007 | vCPU lifecycle kick, request-specific ACK, timeout and recovery | CPU half of old 0007 | Upstream bugfix candidate with lost-kick and repeated-lifecycle reproducers. Prefer an equivalent upstream fix after verification. |
+| 0008 | Device-worker pause publication and resume acknowledgement | Worker half of old 0007 | Independent upstream synchronization fix candidate. Remove only after worker quiescence and resume-barrier regressions pass with the replacement. |
+| 0009 | Complete ARM SVE/FPSIMD/FP-control snapshot state | Old 0008–0011 combined | SVE is already upstream; submit only the remaining FPCR/FPSR correction and native tests. Retire backported portions when the selected release covers each part. |
+| 0010 | Restore clock, then devices, then vCPUs | Old 0012 | Temporary upstream backport. Remove when the pinned release includes the fix and restore-order validation passes. |
+| 0011 | Restricted HTTP allocator reads and mapping growth, with real BPF tests | Upstream seccomp fixes adapted to v51.1 | Temporary upstream backport. Remove after equivalent permissions and positive/negative filter tests pass on the selected release. |
 
-At that recorded revision, the seven patch files contained 1,665 insertions and
-136 deletions in total. The current series still applies to Cloud Hypervisor `v51.1`.
+The upstream audit is pinned to
+[`0674238bb`](https://github.com/cloud-hypervisor/cloud-hypervisor/commit/0674238bb09082dfe55a4d3215eebf35ee0f5bb1)
+(2026-10-29); planned submissions above are not claims of upstream acceptance.
+Patch numbering is not a binary compatibility identifier. Record the upstream
+source, complete patch hashes and resulting build identity; the original legacy
+CH used by #374 remains a frozen, distinct artifact.
 
 ### 1.3 Maintenance strategy
+
+- Apply the series in order. Each prefix must build and must fully implement any
+  capability it exposes; configuration is introduced with its actual consumer.
+- Fold subsequent fixes and regression tests into their functional owner instead
+  of accumulating fixup patches. Preserve original authorship, upstream links and
+  sign-offs; do not attribute local additions to an upstream author.
+- Verify pure reorganization by comparing complete applied source trees. Record
+  intentional behavioral deltas separately: this maintenance revision changes
+  release notification/order, preservation of released zeros in capture, the ARM
+  SVE capability guard, and HTTP allocator seccomp permissions.
 
 - The repository-relative patch directory is
   `native-deps/deps/ch-patches/*.patch`, applied in numeric order.
@@ -75,7 +92,7 @@ At that recorded revision, the seven patch files contained 1,665 insertions and
 - The external RAM/UFFD design uses in-process creation, `SCM_RIGHTS`, and ioctls
   in `create_ram_region`, and remains a project-maintained patch set. When an
   equivalent upstream vCPU-kick or worker-barrier fix is available, prefer it
-  when upgrading rather than indefinitely maintaining duplicate patch 0007 logic.
+  when upgrading rather than indefinitely maintaining duplicate patch 0007/0008 logic.
 
 ## 2. Activation and command line
 
@@ -170,7 +187,7 @@ shared but has no hard link (`st_nlink == 0`), so the project adds the explicit
 
 Subject: **memory: external uffd handler via in-process create + SCM_RIGHTS handoff**.
 
-Changed files: `memory_manager.rs` and `seccomp_filters.rs`.
+Changed files: `memory_manager.rs`, `vm_config.rs`, `config.rs` and `seccomp_filters.rs`.
 
 Key points:
 
@@ -278,67 +295,67 @@ that deterministic ordering. Run both with the prepared source/artifact contract
 and the existing KVM pressure coverage, including the Linux 5.10 floor. These are
 validation requirements, not a claim that an unexecuted run passed.
 
-### 3.4 0004 — skip hole-only runs during balloon release
-
-Subject: **virtio-devices: balloon — skip PUNCH_HOLE/MADV_DONTNEED on already-sparse
-user-managed ranges**.
+### 3.4 0004 — preserve logical release before sparse reclaim
 
 Changed files: `virtio-devices/src/balloon.rs` and
-`virtio-devices/src/seccomp_filters.rs`.
+`virtio-devices/src/seccomp_filters.rs`. Problem report: [#378](https://github.com/kuasar-sandbox/sandboxer/issues/378).
 
-**Background**: balloon allocation in the configured guest does not request
-`__GFP_ZERO`, and the platform guest configuration does not enable `init_on_alloc`.
-The inflate path updates page metadata and PFN arrays rather than zeroing every
-returned page. The externally managed zone is not prefaulted. Offsets never
-previously touched by the guest can therefore still be holes in the memfd, with
-no inode page or PTE in either process. This does not mean every balloon page at
-cold start is necessarily a hole: the guest can have touched and released pages
-before handing them to the balloon.
+The original optimization skipped both `PUNCH_HOLE` and `MADV_DONTNEED` when
+`SEEK_DATA` proved the backing range was physically empty. It reduced synchronous
+REMOVE processing during cold-start balloon convergence, but its equivalence
+argument was wrong: a physical Hole can still inherit nonzero content from a
+lazy snapshot source. Suppressing REMOVE leaves that source valid, so a later
+CPU fault or backend load can resurrect released content. Both balloon inflate
+and free-page reporting call the affected release helper.
 
-Without the probe, CH calls `release_memory_range` for each returned run:
-`fallocate(PUNCH_HOLE|KEEP_SIZE)` on the memfd plus `madvise(MADV_DONTNEED)` on chVA.
-In the documented uffd model, `MADV_DONTNEED` produces an `EVENT_REMOVE` even for an
-already empty range and waits for the external handler to consume it. Inflating
-across sparse `Capacity − InitialBudget` memory can thus create unnecessary
-serialized work and back-pressure the balloon thread. The chVA `MADV_DONTNEED`,
-not merely the memfd `fallocate`, is the source of this handshake, so avoiding it
-requires skipping both operations for an empty run.
+The corrected sequence is:
 
-**Mechanism**:
+1. Validate the complete guest range and issue `MADV_DONTNEED` on chVA. Even an
+   all-hole range must produce its logical release notification. Advice errors
+   return before probing or punching.
+2. For a file-backed region, translate the guest offset using the region's
+   `file_offset().start()`, then probe with `SEEK_DATA`. `ENXIO`, or Data at/after
+   the end, permits skipping only redundant `PUNCH_HOLE`. Other probe errors
+   fall through to the ordinary punch operation, not to a success return.
+3. Punch the complete released backing range when necessary and propagate errors.
+   A failed punch may leave resident bytes; callers must observe the failure.
 
-- For a region with a file offset, `release_memory_range` probes
-  `[file_off, file_off + len)` with `lseek(fd, file_off, SEEK_DATA)`:
-  - `ENXIO`, or a next-data offset at or beyond `file_off + len`, means the whole
-    run is a hole. Skip both `fallocate` and `madvise` and return `Ok(())`.
-  - Data within the run retains the ordinary `PUNCH_HOLE` plus
-    `MADV_DONTNEED` release of the complete run.
-  - Other `lseek` errors fall through to the ordinary release path; they are not
-    interpreted as proof that the range is empty.
-- The actual predicate is `region.file_offset().is_some()`, not the
-  `user_managed` flag. The probe can also apply to other file-backed regions.
-  Regions without a file offset retain the original path.
-- In the platform memfd use, CH uses mappings and explicitly positioned
-  `fallocate`, not reads/writes dependent on the shared file position. Moving the
-  position for the probe therefore does not change that data path.
-- **Seccomp**: the balloon thread adds `SYS_lseek` to its allowlist. `fallocate`
-  was already allowed and `madvise` comes from the virtio common set. Without this
-  addition, the first probe could terminate the thread with `SIGSYS`.
+The existing Go handler serializes reading REMOVE and publishing `Released`
+with COPY installation using `installMu`. In-flight source reads recheck state
+before installation. After the notification, the CH probe/punch catches earlier
+installed content. This reuses existing synchronization and adds no dirty ledger.
+The actual file-backed predicate is `region.file_offset().is_some()`, not
+`user_managed`; non-file-backed regions still receive advice. The shared file
+position is not used by the mapping/positioned-punch data path. Balloon seccomp
+continues to allow `lseek`; `fallocate` and common `madvise` were already allowed.
 
-**Correctness**: only a run found to contain no data is skipped. A resident run
-that actually requires reclaiming retains the release operations. For the
-untouched external-memory holes described above, the suppressed backendVA
-reclaim would itself be a no-op, so the final host-memory state is unchanged.
+Hole-only release again pays for synchronous REMOVE handling, potentially
+increasing cold-start balloon convergence time. Physical inode punching can still
+be skipped. This fixes correctness without promising a new speedup, suppressing
+events, introducing WP negotiation or raising the Host kernel baseline.
 
-**Effect and tradeoffs**: on the x86_64 4 KiB path, where `pbp` batching is bypassed,
-releasing an entirely sparse balloon interval without the probe can entail about
-`inflated bytes / 4 KiB` synchronous handler handshakes. The probe substitutes a
-local `lseek` for those unnecessary release operations. Pages still resident from
-previous guest activity are not skipped. Guest-exit unmapping and its events are
-separate from inflation. On this path, probing can still cost one `lseek` per
-page; it avoids the corresponding empty-range `madvise`, handler handshake, and
-shared-inode invalidation work. The hole fraction and convergence time depend on
-the workload and environment; this specification makes no universal 99% hole-rate
-or instantaneous-convergence claim.
+Run the ordinary error-path regression and the explicit native UFFD tests:
+
+```sh
+cargo test --locked -p virtio-devices --features kvm --lib release_tests -- --include-ignored --nocapture
+```
+
+The native tests use the production 4 KiB-PFN inflate and range-release helpers,
+real shmem MISSING/REMOVE, nonzero backing offsets, ENXIO and out-of-range Data.
+They compare complete released and neighboring pages, including resident and
+unmaterialized nonzero sources. They require actual UFFD capabilities and are
+kernel component tests, not full VM E2E. The ordinary test checks alignment and
+real punch failure. Retain a failing original-implementation control and also run
+the existing Go release/install tests and rebuilt-CH integration suites.
+
+The release fix includes the associated capture boundary: after CH/backend
+freeze, snapshot samples physical holes and existing page state under installMu.
+Data uses current bytes; Hole+Absent inherits the parent; Hole+Released or Loaded
+is explicit Zero. Loaded+Hole covers a zero installation followed by CH's final
+punch. Capture does not reset state, including on failure. Snapshot layering and
+the existing carriers preserve Zero through capture and restore without refault
+or full-RAM prefilling. This requires no memory.dirty entry, new dirty API or
+history trimming; those remain in #374.
 
 ### 3.5 0005 — persist the vsock host local-port cursor
 
@@ -384,7 +401,7 @@ missing or invalid descriptor makes the source snapshot fail explicitly. Target
 restore activation must succeed without any new available descriptor because the
 reset already exists in the snapshot's used ring.
 
-### 3.7 0007 — reliable VM pause/resume and ordered shutdown
+### 3.7 0007 — vCPU lifecycle requests and acknowledgements
 
 CH v51.1 uses a no-op `SIGRTMIN` handler to interrupt `KVM_RUN`. The control thread
 publishes pause/kill state, calls `pthread_kill` for each vCPU, and waits for loop
@@ -393,7 +410,7 @@ entry to `KVM_RUN` can be consumed too early, leaving that vCPU blocked in the
 next call. Repeating it every 10 ms reduces probability but does not close the
 race.
 
-The patch closes the lifecycle-barrier races through three related changes:
+The patch closes the lifecycle-barrier races through two related changes:
 
 1. Before spawning a vCPU, the creating thread configures `KVM_SET_SIGNAL_MASK`
    and blocks the kick signal so the child inherits the mask from its first
@@ -423,7 +440,9 @@ The patch closes the lifecycle-barrier races through three related changes:
    NMI completes ACK-clear cleanup even after a signal timeout. Both failure
    paths receive a separate fresh deadline. Non-KVM backends retain the 10 ms
    retry. All waits use a 1 s deadline with `CLOCK_MONOTONIC` semantics.
-3. Runtime pause publishes the shared pause event before explicitly unparking
+### 3.8 0008 — virtio worker pause and resume handshakes
+
+Runtime pause publishes the shared pause event before explicitly unparking
    ordinary and custom workers, closing the startup race between a zero-time
    epoll poll and `thread::park`. Resume drains the event before waking workers.
    After returning from park, workers participate in a second barrier; the
@@ -432,27 +451,33 @@ The patch closes the lifecycle-barrier races through three related changes:
    barrier. A restored device that has not received a runtime pause event does
    not wait for a nonexistent ACK.
 
-This patch does not change sandbox configuration, the CH HTTP API, snapshot
+These lifecycle patches do not change sandbox configuration, the CH HTTP API, snapshot
 format, or resource protocol, and does not adjust `cpu.max` around lifecycle
 operations. Timeouts remain bounded failure protection, not the race fix.
 
-### 3.8 0008–0011 — ARM SVE snapshot registers
+### 3.9 0009 — complete ARM CPU snapshot registers
 
 On SVE-enabled ARM hosts, KVM exposes vector state through SVE Z/P/FFR
 registers. Accessing legacy FPSIMD V-register offsets returns `EINVAL`; a
 cold-booted VM can run successfully while snapshot capture fails.
 
-Patches 0008–0010 backport Ruben Hakobyan's merged
+Patch 0009 combines Ruben Hakobyan's merged
 [Cloud Hypervisor PR #8268](https://github.com/cloud-hypervisor/cloud-hypervisor/pull/8268),
 retaining authorship and sign-offs. The reviewed upstream commits are
 `083b41905ea59b335c4f211c4186312e30bbf022`,
 `e9d044730524d12e243737a1888767b3edf123c8`, and
 `4fc414cc8bc56a4c5275b3dd44610e5c75dfbbd1`; context is rebased onto v51.1
-and patches 0001–0007. They enumerate KVM registers, preserve SVE state and
+and the preceding platform patches. They enumerate KVM registers, preserve SVE state and
 restore vector-length selection after vCPU initialization and before SVE
 finalization. The legacy vector path remains available without SVE.
 
-Patch 0011 additionally preserves FPSR/FPCR for both paths: those control and
+The same patch also backports upstream
+[48834e1](https://github.com/cloud-hypervisor/cloud-hypervisor/commit/48834e139e9d1882cdefb6cafa42155a13d173bc):
+SVE finalization checks the VM's KVM ArmSve capability as well as host HWCAP,
+matching feature initialization. The v51.1 adaptation passes the existing VM
+reference rather than importing an unrelated Vcpu ownership refactor.
+
+The same patch additionally preserves FPSR/FPCR for both paths: those control and
 status registers remain accessible even when the vector register family changes.
 It includes explicit native KVM round-trip tests with nonzero register state:
 
@@ -471,9 +496,9 @@ This permits reading older non-SVE state; it does not promise cross-host CPU
 feature compatibility or backwards restore into an unpatched VMM. SVE remains
 enabled, and incompatible register state fails through the existing KVM errors.
 
-### 3.9 0012 — restore the KVM clock before vCPUs
+### 3.10 0010 — restore the KVM clock before vCPUs
 
-Patch 0012 backports upstream [commit ff20f183647c602bf5e5028d99959e5547a7dd84](https://github.com/cloud-hypervisor/cloud-hypervisor/commit/ff20f183647c602bf5e5028d99959e5547a7dd84),
+Patch 0010 backports upstream [commit ff20f183647c602bf5e5028d99959e5547a7dd84](https://github.com/cloud-hypervisor/cloud-hypervisor/commit/ff20f183647c602bf5e5028d99959e5547a7dd84),
 preserving CMGS's authorship and sign-off. In the pinned v51.1 resume path,
 vCPUs could execute before the saved x86 KVM clock was restored. The backport
 restores that clock first, resumes devices, and then resumes vCPUs. The clock
@@ -489,6 +514,31 @@ by the ordinary full E2E selection. Retain the native architecture and product
 provenance; cross-compilation alone does not exercise KVM resume. A successful
 small sample does not establish a failure rate or diagnose unrelated restore
 errors.
+
+### 3.11 0011 — HTTP allocator seccomp compatibility
+
+Large HTTP allocations or frees can trigger glibc's lazy read of
+`/proc/sys/vm/overcommit_memory`, or mapping growth through `mremap`. The v51.1
+HTTP filter can terminate that thread with SIGSYS even though the API operation
+itself is valid. Backport upstream
+[`660b18e`](https://github.com/cloud-hypervisor/cloud-hypervisor/commit/660b18eaace7953721c8ecf371973fc6eb6e2f66)
+(original HTTP fix [`ec157d7`](https://github.com/cloud-hypervisor/cloud-hypervisor/commit/ec157d7eb9f5915512efcd0660a78b41be8bc87e)) and
+[`f05f0c2`](https://github.com/cloud-hypervisor/cloud-hypervisor/commit/f05f0c249e69568dea3ef8e7208d63f6ef8922ea)
+without importing the newer common-filter architecture.
+
+Allow `openat` only with exactly `O_RDONLY|O_CLOEXEC`, plus `read` and `mremap`,
+in the HTTP filter. This restricts flags, not pathnames; it does not promise a
+pathname allowlist. Writable, creating and truncating opens remain trapped.
+The patch's child-process tests install the real production BPF, exercise a
+read and mapping growth, and verify SIGSYS for rejected flags:
+
+```sh
+cargo test --locked -p vmm --no-default-features --features kvm --lib seccomp_filters::tests::http_allocator_probe_is_read_only -- --nocapture
+```
+
+This is an allocator compatibility backport, with no new dirty-memory API or
+response format. `mremap` is an upstream compatibility fix, not evidence that it
+was the syscall in every previously observed API EOF.
 
 ## 4. Build workflow
 
@@ -582,7 +632,7 @@ behavior, including the patches:
 | `fd=` plus `uffd_socket=` | Not available | Create uffd, send it with metadata, and wait for ACK |
 | `/vm.snapshot` of a user-managed zone | Not applicable | Omit the zone from memory-ranges and skip the RAM dump |
 | `/vm.restore` of a user-managed zone | Not applicable | Skip fill; the mapping faults into the external handler when configured |
-| Balloon release of a hole-only file-backed run | Ordinary release path | Skip `PUNCH_HOLE` and `madvise`; resident runs retain ordinary release |
+| Balloon release of a hole-only file-backed run | Ordinary release path | Always notify REMOVE; skip only redundant `PUNCH_HOLE` |
 | Balloon `deflate_on_oom=on` | Supported in v51.1 | Supported |
 | `vm.resize` `desired_balloon` | Supported | Used by the sandbox-local BalloonController |
 | virtio-mem `vm.resize` | Supported | Supported |
@@ -595,8 +645,9 @@ mmu_notifier/EPT and IPI-shootdown pressure and interfere with guest vsock progr
 The rationale and replacement feedback loop are described in the
 [guest kernel specification §5.5](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/vmlinux.md#55-why-free_page_reporting-is-not-negotiated-and-the-role-of-virtio_mem). The sandbox-local BalloonController instead pushes inflate targets through
 `/vm.resize`, with at most one 64 MiB steady-shrink step for each fresh report.
-Patch 0004 skips empty ranges covered by the cold-start target; runtime reclaim
-of resident pages still performs the complete release operations.
+Patch 0004 preserves REMOVE for empty cold-start ranges as well as resident
+runtime reclaim. Only redundant inode punching is skipped; synchronous event
+processing can increase cold-start convergence time.
 `deflate_on_oom` is native to upstream v51.1 and needs no additional patch.
 
 ## 7. Known limitations

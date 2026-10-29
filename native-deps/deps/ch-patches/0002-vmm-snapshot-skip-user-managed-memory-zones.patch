@@ -1,7 +1,7 @@
-From ef7b57d8bfcc1f7c6a7c86809fb7d2d5fa49345f Mon Sep 17 00:00:00 2001
+From f979856364661878934bac7faa4ccf383756b667 Mon Sep 17 00:00:00 2001
 From: Chen Xiaohui <graych@gmail.com>
 Date: Sun, 3 May 2026 22:02:50 +0800
-Subject: [PATCH 2/4] vmm: snapshot: skip user-managed memory zones
+Subject: [PATCH 02/11] vmm: snapshot: skip user-managed memory zones
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
@@ -44,7 +44,7 @@ Signed-off-by: Chen Xiaohui <graych@gmail.com>
  1 file changed, 42 insertions(+), 4 deletions(-)
 
 diff --git a/vmm/src/memory_manager.rs b/vmm/src/memory_manager.rs
-index f6e551d..eca3c3f 100644
+index 26534ef..af739b4 100644
 --- a/vmm/src/memory_manager.rs
 +++ b/vmm/src/memory_manager.rs
 @@ -120,6 +120,13 @@ impl VirtioMemZone {
@@ -120,7 +120,7 @@ index f6e551d..eca3c3f 100644
          }
  
          for guest_ram_mapping in guest_ram_mappings {
-@@ -2061,6 +2091,14 @@ impl MemoryManager {
+@@ -2060,6 +2090,14 @@ impl MemoryManager {
                  table.extend(virtio_mem_zone.plugged_ranges());
              }
  
@@ -136,5 +136,5 @@ index f6e551d..eca3c3f 100644
                  if snapshot
                      && let Some(file_offset) = region.file_offset()
 -- 
-2.30.2
+2.43.0
 

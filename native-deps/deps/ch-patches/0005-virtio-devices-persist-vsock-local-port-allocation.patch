@@ -1,7 +1,7 @@
-From fc7f6d5af20dc61fd7bb64619bea59b7207933ad Mon Sep 17 00:00:00 2001
+From 694ac6cebde9a63dc5a21b27b441aecfa134a3d9 Mon Sep 17 00:00:00 2001
 From: Kuasar Sandbox <noreply@kuasar.dev>
 Date: Wed, 15 Jul 2026 14:18:01 +0800
-Subject: [PATCH] virtio-devices: persist vsock local port allocation
+Subject: [PATCH 05/11] virtio-devices: persist vsock local port allocation
 
 The Unix vsock muxer is reconstructed during restore and currently restarts host-side port allocation at 0x40000000. Guest memory still contains socket tuples from before the snapshot, so reusing one of those ports can make the guest reject the first restore connection with RST.
 

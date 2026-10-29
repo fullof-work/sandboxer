@@ -1,22 +1,25 @@
-From ff20f183647c602bf5e5028d99959e5547a7dd84 Mon Sep 17 00:00:00 2001
+From 52ab9286aab048d3f2574a641c46ae55aa04e70e Mon Sep 17 00:00:00 2001
 From: CMGS <ilskdw@gmail.com>
 Date: Tue, 31 Mar 2026 06:12:21 +0000
-Subject: [PATCH] vmm: restore KVM clock before resuming vCPUs
+Subject: [PATCH 10/11] vmm: restore KVM clock before resuming vCPUs
 
 Reorder resume() to: set_clock, device_manager.resume,
 cpu_manager.resume. This matches the inverse of pause()
 which correctly saves the clock before pausing vCPUs.
 
 Signed-off-by: CMGS <ilskdw@gmail.com>
+
+Upstream: https://github.com/cloud-hypervisor/cloud-hypervisor/commit/ff20f183647c602bf5e5028d99959e5547a7dd84
+Reorganized from original patch 0012.
 ---
  vmm/src/vm.rs | 4 +++-
  1 file changed, 3 insertions(+), 1 deletion(-)
 
 diff --git a/vmm/src/vm.rs b/vmm/src/vm.rs
-index 430c9bdc74..c1e21a5ac9 100644
+index db29072..c30ec98 100644
 --- a/vmm/src/vm.rs
 +++ b/vmm/src/vm.rs
-@@ -3111,7 +3111,8 @@ impl Pausable for Vm {
+@@ -3081,7 +3081,8 @@ impl Pausable for Vm {
              .valid_transition(new_state)
              .map_err(|e| MigratableError::Resume(anyhow!("Invalid transition: {e:?}")))?;
  
@@ -26,7 +29,7 @@ index 430c9bdc74..c1e21a5ac9 100644
          #[cfg(target_arch = "x86_64")]
          {
              if let Some(clock) = &self.saved_clock {
-@@ -3128,6 +3129,7 @@ impl Pausable for Vm {
+@@ -3098,6 +3099,7 @@ impl Pausable for Vm {
          }
  
          self.device_manager.lock().unwrap().resume()?;
@@ -34,3 +37,6 @@ index 430c9bdc74..c1e21a5ac9 100644
  
          // And we're back to the Running state.
          self.state = new_state;
+-- 
+2.43.0
+

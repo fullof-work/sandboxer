@@ -168,7 +168,7 @@ sandbox-ctl snapshot \
 
 A Snapshot always contains memory execution state. One operation produces E and S at the same freeze point, committing S last. On success, the default is to destroy the VM. `--resume` resumes the original VM without making the new E/S its live baseline.
 
-Human-readable local output lists both `Snapshot S` and `Sandbox E`. Default upload stdout still contains only the S Manifest key for shell compatibility. `snapshot_done` returns both `snapshot_ref` and `sandbox_ref`; existing `memory_size`, `memory_resident`, pause/dump timing, and compatibility `overlay_*` response fields remain. `overlay_*` currently mirrors E's identity; only E contains the actual disk graph.
+Human-readable local output lists both `Snapshot S` and `Sandbox E`. Default upload stdout still contains only the S Manifest key for shell compatibility. `snapshot_done` returns both `snapshot_ref` and `sandbox_ref`; existing `memory_size`, `memory_resident`, pause/dump timing, and compatibility `overlay_*` response fields remain. `overlay_*` currently mirrors E's identity; only E contains the actual disk graph. The legacy field name `memory_resident` counts explicit logical memory coverage (Data plus Zero), including released pages retained as Zero; it is neither physical residency nor encoded payload size.
 
 `snapshot --json` emits exactly `{snapshotRef,sandboxRef,removedRefs}` and
 `export --json` emits exactly `{sandboxRef,removedRefs}`, with `removedRefs:[]`
@@ -1923,7 +1923,17 @@ Snapshot/export dependency planning materializes only node-local dependencies th
 
 #### 6.1.2 Managed checkpoint history and selective cleanup
 
-`merge_ref=false` records the current resident working set separately. Starting with
+The current memory layer preserves released content even before it faults again.
+After CH/device pause and backend quiescence, capture jointly samples memfd holes
+and the existing UFFD page states under the installation lock. Resident Data wins;
+Hole+Absent inherits the parent; Hole+Released or Loaded is explicit Zero. The
+Loaded case covers zero installation followed by CH's final punch. The immutable
+layout is streamed after releasing that lock; no handler state is consumed or
+reset on capture success/failure. Zero remains opaque through local merge,
+tarstream, Bundle/ingest, publication and restore. No full-RAM materialization,
+new ZIP entry or cumulative dirty log is required. See [release fix #378](https://github.com/kuasar-sandbox/sandboxer/issues/378).
+
+`merge_ref=false` records the current resident working set and required explicit release zeros separately. Starting with
 `S1 -> S0`, the next capture streams a new immutable historical Snapshot
 `S1′ = S1(memory) over S0(memory)` and writes `S2(current working set) -> S1′`.
 Further local captures repeat this composition: at most one owned local memory
@@ -2459,7 +2469,7 @@ Shrink requires a fresh, non-superseded report and known CH target/current. Each
 
 A short allocation burst can trigger Guest emergency deflation and finish between reports. If inflation then stops below the accepted target, the controller can re-notify that same target after two fresh reports in one epoch observe an unchanged target and actual value. Fresh requested Budget must fit within TargetBudget, and TargetBudget must remain covered by the existing reservation. Normal bounded target steps and partial settlement take priority. Pending growth, restore normalization, pressure, superseded reports, and any actual or target change invalidate the retry candidate. The mutation gate still serializes the operation with snapshot/export, and CH state and report eligibility are checked again immediately before the write. This retry neither requests additional reservation nor lowers `memory.high` or releases reservation; subsequent actual observations use the normal settlement path. Each attempt consumes its two-report confirmation, so the reconciliation ticker cannot repeatedly resize a stalled Guest. An unchanged accepted target cannot confirm delivery after a lost response, and HTTP success never substitutes for observed actual progress.
 
-See [memory.go](../pkg/resctl/memory.go), [memory_controller.go](../pkg/resctl/memory_controller.go) and [balloon.go](../pkg/resctl/balloon.go). Sparse `PUNCH_HOLE`/`MADV_DONTNEED` and hole-only skipping remain in [VMM patch 0004](cloud-hypervisor.md#34-0004--skip-hole-only-runs-during-balloon-release).
+See [memory.go](../pkg/resctl/memory.go), [memory_controller.go](../pkg/resctl/memory_controller.go) and [balloon.go](../pkg/resctl/balloon.go). Logical release notification precedes sparse physical reclaim as defined by [VMM patch 0004](cloud-hypervisor.md#34-0004--preserve-logical-release-before-sparse-reclaim).
 
 ## 10. Resource protocol
 

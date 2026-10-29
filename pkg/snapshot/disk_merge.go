@@ -11,17 +11,17 @@ import (
 	"github.com/kuasar-sandbox/sandboxer/internal/readretry"
 )
 
-// diskMergeBase keeps the existing artifact retry policy while exposing the
-// parent's original run kinds and bounding it to disk bytes, without a second
+// payloadMergeBase keeps the existing artifact retry policy while exposing the
+// parent's original run kinds and bounding it to payload bytes, without a second
 // extent index or a byte-only adapter that would expand logical Zero to Data.
-type diskMergeBase struct {
+type payloadMergeBase struct {
 	fetch.Stream
 	size uint64
 	ctx  context.Context
 }
 
-func (s *diskMergeBase) Size() uint64 { return s.size }
-func (s *diskMergeBase) RunAt(off, limit uint64) (sparse.Run, error) {
+func (s *payloadMergeBase) Size() uint64 { return s.size }
+func (s *payloadMergeBase) RunAt(off, limit uint64) (sparse.Run, error) {
 	if off >= s.size {
 		return nil, io.EOF
 	}
@@ -44,9 +44,9 @@ func (s *diskMergeBase) RunAt(off, limit uint64) (sparse.Run, error) {
 	if run == nil || run.Offset() != off || run.End() <= off || run.End() > off+limit {
 		return nil, readerr.Mark(fmt.Errorf("merge base: invalid run"), false)
 	}
-	return diskMergeRun{run}, nil
+	return payloadMergeRun{run}, nil
 }
-func (s *diskMergeBase) ReadAt(ctx context.Context, buf []byte, off uint64) (int, error) {
+func (s *payloadMergeBase) ReadAt(ctx context.Context, buf []byte, off uint64) (int, error) {
 	if off >= s.size {
 		return 0, io.EOF
 	}
@@ -58,8 +58,8 @@ func (s *diskMergeBase) ReadAt(ctx context.Context, buf []byte, off uint64) (int
 	return read, err
 }
 
-type diskMergeRun struct{ sparse.Run }
+type payloadMergeRun struct{ sparse.Run }
 
-func (r diskMergeRun) ReadAt(ctx context.Context, buf []byte, off uint64) (int, error) {
+func (r payloadMergeRun) ReadAt(ctx context.Context, buf []byte, off uint64) (int, error) {
 	return readretry.ReadAt(ctx, len(buf), func() (int, error) { return r.Run.ReadAt(ctx, buf, off) })
 }

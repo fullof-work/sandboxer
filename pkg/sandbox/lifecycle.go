@@ -46,6 +46,7 @@ import (
 
 // RunOptions controls a single sandbox-ctl run invocation.
 type RunOptions struct {
+	memoryLayout             snapshot.MemoryLayout
 	EnableCheckpoint         bool
 	checkpointPlan           *CheckpointDiskPlan
 	checkpointStorage        *artifact.ProcessStorage
@@ -1138,6 +1139,7 @@ func (q *allQuiescer) Resume() {
 // that owns the bundle holds references; the snapshot path consumes
 // them when a request arrives.
 type SnapshotHandler struct {
+	MemoryLayout          snapshot.MemoryLayout
 	checkpointMaintenance *diffstore.DirectoryMaintenance
 	EnableCheckpoint      bool
 	CheckpointDir         string // derived from the owning VM BaseDir
@@ -1230,7 +1232,8 @@ func (h *SnapshotHandler) handleContext(ctx context.Context, req ctl.Request, cg
 	}()
 	opts := RunOptions{
 		usageSampler: h.usageSampler, checkpointDir: h.CheckpointDir, EnableCheckpoint: h.EnableCheckpoint,
-		Cfg: h.Cfg, PortableConfig: h.PortableConfig, SourceBinding: h.SourceBinding, MemoryBinding: h.MemoryBinding,
+		memoryLayout: h.MemoryLayout,
+		Cfg:          h.Cfg, PortableConfig: h.PortableConfig, SourceBinding: h.SourceBinding, MemoryBinding: h.MemoryBinding,
 		ManifestCfg: h.ManifestCfg, SandboxID: h.SandboxID,
 		Fetcher: h.Fetcher, BundleReader: h.BundleReader, BundleFetcher: h.BundleFetcher, RefLocations: h.RefLocations,
 		CustomerKeyFn: h.CustomerKeyFn, LocalCodec: h.LocalCodec, LocalRequired: h.LocalRequired,
@@ -1262,7 +1265,8 @@ func (h *SnapshotHandler) handleExportContext(ctx context.Context, req ctl.Reque
 	}()
 	opts := RunOptions{
 		usageSampler: h.usageSampler, checkpointDir: h.CheckpointDir, EnableCheckpoint: h.EnableCheckpoint,
-		Cfg: h.Cfg, PortableConfig: h.PortableConfig, SourceBinding: h.SourceBinding, MemoryBinding: h.MemoryBinding,
+		memoryLayout: h.MemoryLayout,
+		Cfg:          h.Cfg, PortableConfig: h.PortableConfig, SourceBinding: h.SourceBinding, MemoryBinding: h.MemoryBinding,
 		ManifestCfg: h.ManifestCfg, SandboxID: h.SandboxID,
 		Fetcher: h.Fetcher, BundleReader: h.BundleReader, BundleFetcher: h.BundleFetcher, RefLocations: h.RefLocations,
 		CustomerKeyFn: h.CustomerKeyFn, LocalCodec: h.LocalCodec, LocalRequired: h.LocalRequired,
@@ -2043,6 +2047,7 @@ func handleSnapshotRequest(
 		Context:               ctx,
 		SandboxID:             sandboxID,
 		APISock:               chSock,
+		MemoryLayout:          opts.memoryLayout,
 		MemfdFD:               mfd.FD(),
 		MemfdSize:             int64(mfd.Size()),
 		Diffs:                 diffs,

@@ -143,8 +143,9 @@ make cloud-hypervisor
 
 - patch 只覆盖平台必须改动的 CH 行为:外部 memfd memory-zone、snapshot 跳过
   user-managed memory zone、通过 unix fd 交接 uffd、balloon 对已经为空的 file-backed
-  run 跳过 `PUNCH_HOLE/MADV_DONTNEED`(驻留数据仍正常回收)、restore-safe vsock,以及可靠的 VM
-  pause/resume/ordered shutdown barrier。
+  run 仅省略冗余 inode 打洞但保留逻辑释放通知、restore-safe vsock、生命周期 barrier、
+  ARM 寄存器保留及适用的上游时钟/seccomp 修复。修正和测试随功能所属补丁维护，
+  未来演进及移除条件记录在 CH owner 文档中。
 - patch 文件按 commit 顺序落在 `deps/ch-patches/`。
 - 升级 CH 版本时先更新 pin,再重新执行 `ch-fetch`、应用 patch、构建、跑
   sandboxer 和 platform e2e。

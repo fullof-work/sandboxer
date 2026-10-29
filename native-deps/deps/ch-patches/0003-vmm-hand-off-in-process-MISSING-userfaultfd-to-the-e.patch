@@ -1,94 +1,53 @@
-From 8c902e806b8f3ed1662db3aaf625a4ee938fdbe2 Mon Sep 17 00:00:00 2001
+From 4475a083a6e8acc0dc36004644c03043a63d1e6f Mon Sep 17 00:00:00 2001
 From: Chen Xiaohui <graych@gmail.com>
 Date: Sun, 3 May 2026 22:04:27 +0800
-Subject: [PATCH 3/4] vmm: memory: external uffd handler via in-process create
- + SCM_RIGHTS
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
+Subject: [PATCH 03/11] vmm: hand off in-process MISSING userfaultfd to the
+ external owner
 
-When `--memory-zone uffd_socket=<path>` is set, register the zone for
-userfaultfd-driven lazy population by an out-of-process handler.
+Keep uffd_socket configuration, parser and Landlock permissions with in-process UFFD creation, registration, SCM_RIGHTS handoff and the legacy acknowledgement. The CH address space owns fault registration; its external peer owns fault service.
 
-Why ownership has to be inverted
-================================
-Linux's userfaultfd is bound to the mm of the syscall caller: a uffd
-created in process P can only register VMAs that live in P's mm. A
-parent process that opens a uffd and inherits it across fork/execve
-to CH cannot register VMAs in CH's mm — UFFDIO_REGISTER returns
-EINVAL because the VMA addresses are not in the uffd's mm.
-
-The straightforward fix is to flip the ownership: CH (which owns the
-chVA mmap of the memfd-backed zone) creates the uffd in-process,
-registers MISSING on its own VMA, then hands the uffd fd back to the
-external handler via SCM_RIGHTS. The kernel routes events to the
-uffd_t, not to the current process, so the handler can drive
-UFFDIO_COPY / UFFDIO_ZEROPAGE through the inherited fd.
-
-Behaviour
-=========
-After successfully mmap'ing an existing_memory_file zone (commit 1),
-create_ram_region runs the following sequence whenever uffd_socket
-is set on the zone:
-
-  1. SYS_userfaultfd(O_CLOEXEC | O_NONBLOCK) — creates uffd in CH mm
-  2. UFFDIO_API negotiates features:
-       MISSING_SHMEM | EVENT_REMOVE | EVENT_UNMAP | THREAD_ID
-     EVENT_FORK is intentionally omitted — requesting it makes
-     UFFDIO_API return EPERM unless CAP_SYS_PTRACE is held; the
-     handler doesn't need cross-mm fork tracking. Bit values match
-     <linux/userfaultfd.h>: 1<<5 / 1<<3 / 1<<6 / 1<<8 (an earlier
-     draft had MISSING_SHMEM=1<<1 by mistake and tripped the EPERM
-     check on EVENT_FORK).
-  3. UFFDIO_REGISTER MISSING on [chVA, chVA+size) — addr is the
-     post-mmap VA in CH's mm.
-  4. connect() the uffd_socket UDS and sendmsg() one length-prefixed
-     JSON message:
-         {"type":"va_report","zone_id":"<id>","va_start":<u64>,"size":<u64>}
-     with the uffd fd attached as SCM_RIGHTS ancillary.
-  5. read() the handler's reply (`{"type":"ack"}` or
-     `{"type":"error","msg":"..."}`). On error CH bubbles it up and
-     refuses to start the VM.
-
-This handshake completes synchronously inside create_ram_region, so
-no vCPU runs before the handler is ready. The same path serves
-cold-start (zone construction) and snapshot-restore (region
-construction from the migration table); both are gated on
-uffd_socket being Some.
-
-Seccomp policy
-==============
-The vmm-thread allowlist gains:
-
-  * SYS_userfaultfd                  (was unlisted)
-  * UFFDIO_API ioctl    (0xc018_aa3f, _IOWR(0xAA, 0x3F, ...))
-  * UFFDIO_REGISTER     (0xc020_aa00, _IOWR(0xAA, 0x00, ...))
-
-Without these the vmm thread takes SIGSYS the moment the new path
-fires. Filter changes apply to all configurations but are harmless
-when uffd_socket is unset (CH never reaches the syscalls).
-
-Backwards compat
-================
-No behaviour change unless uffd_socket is set on at least one zone.
-file:// memory backing, hugepages, and the non-fd memfd_create path
-all skip this code unconditionally.
-
-Testing
-=======
-A handler stub at the UDS path that responds with
-`{"type":"ack"}` on the first message is enough to satisfy the
-handshake. Once the parent owns the uffd fd it drives
-UFFDIO_COPY/ZEROPAGE per fault as usual.
+Reorganized from original patch 0003 and the socket configuration formerly carried by 0001. No new capability or dirty-memory protocol is introduced.
 
 Signed-off-by: Chen Xiaohui <graych@gmail.com>
 ---
- vmm/src/memory_manager.rs  | 242 +++++++++++++++++++++++++++++++++++++
+ vmm/src/config.rs          |   5 +-
+ vmm/src/memory_manager.rs  | 243 +++++++++++++++++++++++++++++++++++++
  vmm/src/seccomp_filters.rs |  17 +++
- 2 files changed, 259 insertions(+)
+ vmm/src/vm_config.rs       |  11 ++
+ 4 files changed, 275 insertions(+), 1 deletion(-)
 
+diff --git a/vmm/src/config.rs b/vmm/src/config.rs
+index 0fd0a6d..a7a64ba 100644
+--- a/vmm/src/config.rs
++++ b/vmm/src/config.rs
+@@ -908,7 +908,8 @@ impl MemoryConfig {
+                     .add("hotplug_size")
+                     .add("hotplugged_size")
+                     .add("prefault")
+-                    .add("fd");
++                    .add("fd")
++                    .add("uffd_socket");
+                 parser.parse(memory_zone).map_err(Error::ParseMemoryZone)?;
+ 
+                 let id = parser.get("id").ok_or(Error::ParseMemoryZoneIdMissing)?;
+@@ -952,6 +953,7 @@ impl MemoryConfig {
+                 let fd = parser
+                     .convert::<i32>("fd")
+                     .map_err(Error::ParseMemoryZone)?;
++                let uffd_socket = parser.get("uffd_socket").map(PathBuf::from);
+ 
+                 zones.push(MemoryZoneConfig {
+                     id,
+@@ -965,6 +967,7 @@ impl MemoryConfig {
+                     hotplugged_size,
+                     prefault,
+                     fd,
++                    uffd_socket,
+                 });
+             }
+             Some(zones)
 diff --git a/vmm/src/memory_manager.rs b/vmm/src/memory_manager.rs
-index eca3c3f..7c4528a 100644
+index af739b4..7c4528a 100644
 --- a/vmm/src/memory_manager.rs
 +++ b/vmm/src/memory_manager.rs
 @@ -282,6 +282,22 @@ pub enum Error {
@@ -153,7 +112,15 @@ index eca3c3f..7c4528a 100644
                      memory_regions.push(Arc::clone(&region));
                      if let Some(memory_zone) = memory_zones.get_mut(&guest_ram_mapping.zone_id) {
                          if guest_ram_mapping.virtio_mem {
-@@ -1397,6 +1438,207 @@ impl MemoryManager {
+@@ -958,6 +999,7 @@ impl MemoryManager {
+                 hotplugged_size: config.hotplugged_size,
+                 prefault: config.prefault,
+                 fd: None,
++                uffd_socket: None,
+             }];
+ 
+             Ok((config.size, zones, allow_mem_hotplug))
+@@ -1396,6 +1438,207 @@ impl MemoryManager {
          }
      }
  
@@ -362,7 +329,7 @@ index eca3c3f..7c4528a 100644
          size: usize,
          hugepages: bool,
 diff --git a/vmm/src/seccomp_filters.rs b/vmm/src/seccomp_filters.rs
-index bb40b99..186baa3 100644
+index bb40b99..84b947f 100644
 --- a/vmm/src/seccomp_filters.rs
 +++ b/vmm/src/seccomp_filters.rs
 @@ -112,6 +112,14 @@ mod kvm {
@@ -403,6 +370,35 @@ index bb40b99..186baa3 100644
          (libc::SYS_mprotect, vec![]),
          (libc::SYS_mremap, vec![]),
          (libc::SYS_munmap, vec![]),
+diff --git a/vmm/src/vm_config.rs b/vmm/src/vm_config.rs
+index 303f05f..22b0850 100644
+--- a/vmm/src/vm_config.rs
++++ b/vmm/src/vm_config.rs
+@@ -167,6 +167,14 @@ pub struct MemoryZoneConfig {
+     /// for it.
+     #[serde(default)]
+     pub fd: Option<i32>,
++    /// UDS path for the va_report handshake to an external uffd handler.
++    /// When set, CH creates a userfaultfd in this process (mm-bound to
++    /// CH's mm so faults route correctly), registers MISSING on the
++    /// memory zone's mmap, then sends `{type:"va_report", va_start,
++    /// size, zone_id}` to this socket with the uffd_fd attached via
++    /// SCM_RIGHTS. Waits for `{type:"ack"}` before allowing vCPU run.
++    #[serde(default)]
++    pub uffd_socket: Option<PathBuf>,
+ }
+ 
+ impl ApplyLandlock for MemoryZoneConfig {
+@@ -174,6 +182,9 @@ impl ApplyLandlock for MemoryZoneConfig {
+         if let Some(file) = &self.file {
+             landlock.add_rule_with_access(file, "rw")?;
+         }
++        if let Some(socket) = &self.uffd_socket {
++            landlock.add_rule_with_access(socket, "rw")?;
++        }
+         Ok(())
+     }
+ }
 -- 
-2.30.2
+2.43.0
 

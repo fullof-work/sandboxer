@@ -4,7 +4,8 @@
 
 平台用 cloud-hypervisor(CH)作为 microVM 监视器。绝大多数路径跑 upstream
 行为,外部托管内存、restore-safe vsock 和可靠 VM lifecycle 通过本仓维护的
-0001–0007 补丁实现。0008–0011 补丁增加 §3.8 所述的 ARM SVE 快照兼容性回移。
+0001–0008 补丁实现。0009 保留 ARM 快照寄存器，0010 和 0011 回移上游恢复顺序及
+HTTP allocator seccomp 修复。继续使用 CH v51.1 和 Host Linux 5.10 基线。
 本文档定义 patch 范围、构建方式及对应行为契约。
 
 ## 1. 概述
@@ -31,30 +32,40 @@
 这些组合能力在所固定的 upstream CH 版本中未直接提供。第二条尤其本质——upstream uffd handler 模型
 是 CH 调外部 socket,handler 提供数据,但平台需要 handler 接管 fault 投递
 路由,upstream 的 listener 模型不够。此外这一模型带来一条派生修复:balloon
-释放路径对从未驻留的空洞 run 不能合成 `EVENT_REMOVE` 风暴(patch 0004,§3.4)。
+释放路径对从未驻留的空洞也必须通知 REMOVE，因为惰性源仍可能含非零内容。
+0004 仅省略冗余 inode 打洞，不能省略必要释放通知（§3.4）。
 
-### 1.2 patch 范围(总结)
+### 1.2 补丁范围与未来演进
 
-以下行数对应 sandboxer 提交 `c29f9af875c595df68491b50e872007e9285ef48` 的补丁集合,
-是该版本的近似范围说明,不是永久的大小或兼容性保证。
+每项补丁包含完整意图、对应修正及测试。下表旧编号指 #377 恢复的原十二项补丁。
+本次十一项维护补丁不包含 #374 的新脏页跟踪、累计 API、能力握手或快照格式改动。
 
-| 文件 | 改动行数 | 内容 |
-|------|----------|------|
-| `vmm/src/vm_config.rs` | ~19 | `MemoryZoneConfig` 新增 `fd` / `uffd_socket` 字段 |
-| `vmm/src/config.rs` | ~9 | `MemoryConfig::parse` 增加两个 key 解析 |
-| `vmm/src/memory_manager.rs` | ~338 | fd 注入 + user_managed skip + create_ram_region 内创建 uffd + va_report sendmsg(SCM_RIGHTS) + UFFDIO_REGISTER |
-| `vmm/src/seccomp_filters.rs` | ~17 | allowlist `userfaultfd` syscall + `UFFDIO_API` / `UFFDIO_REGISTER` ioctl |
-| `virtio-devices/src/balloon.rs` | ~38 | balloon release 对 file-backed region 的空洞 run 跳过 `PUNCH_HOLE`/`MADV_DONTNEED`(`SEEK_DATA` 探测)|
-| `virtio-devices/src/seccomp_filters.rs` | ~8 | balloon 线程 seccomp 放行 `SYS_lseek`(skip-hole 探测所需)|
-| `virtio-devices/src/vsock/unix/muxer.rs` | ~20 | 持久化 host local-port 分配游标 |
-| `virtio-devices/src/vsock/device.rs` / `mod.rs` | ~330 | snapshot 时发布 transport reset,restore 重发 IRQ,guest 确认前 gate RX |
-| `hypervisor/src/cpu.rs` / `kvm/mod.rs` | ~110 | `KVM_SET_SIGNAL_MASK` no-miss vCPU kick,userspace 保持 blocked mask |
-| `vmm/src/cpu.rs` / `seccomp_filters.rs` | ~550 | lifecycle 安全点消费 kick、请求级 ACK/deadline、KVM ioctl allowlist |
-| `virtio-devices/src/device.rs` / `epoll_helper.rs` / net / vhost-user | ~280 | pause event publish/wake + resume 双向 barrier,覆盖自定义 worker |
+| 补丁 | 目的与范围 | 来源 | 未来维护及移除条件 |
+| --- | --- | --- | --- |
+| 0001 | 接收外部 RAM fd，完成映射及所有权管理 | 旧 0001，移出未使用的 UFFD 配置 | 项目自行维护。可向上游讨论通用外部 RAM 接口；仅在已发布等价实现通过集成验证后替换。 |
+| 0002 | 将外部 RAM 的快照内容交给外部所有者 | 旧 0002 | 随 0001 自行维护。上游方案须保留外部保存/恢复职责；不扩展现有 virtio-mem 范围。 |
+| 0003 | 完整旧版 MISSING UFFD 进程内创建、交接、配置与权限 | 旧 0003，加旧 0001 的 socket 配置 | 自行维护协议。跟踪上游外部缺页接口；迁移须保持通信端兼容和所有权语义。 |
+| 0004 | 先通知逻辑释放，再稀疏物理回收；含错误路径和真实 UFFD 测试 | 在旧 0004 内修复 #378 | 自行维护项目优化。若向上游提交稀疏回收，须保持 REMOVE 语义；不能把本地优化引入的问题归为未修改 CH 的缺陷。 |
+| 0005 | 持久化 vsock 本地端口分配游标 | 旧 0005 | 将恢复后的端口冲突修复及复现提交上游。采用已发布等价修复并验证后移除。 |
+| 0006 | 预发布 vsock reset、保存确认状态并限制恢复 RX | 旧 0006 | 与端口分配分开向上游讨论 reset 时机及惰性恢复语义。接受、发布并验证前自行维护。 |
+| 0007 | vCPU 生命周期 kick、请求对应 ACK、超时和恢复 | 旧 0007 的 CPU 部分 | 通用上游修复候选，附丢失 kick 和重复生命周期复现。等价实现验证后优先采用上游。 |
+| 0008 | worker 暂停发布与恢复确认 | 旧 0007 的 worker 部分 | 独立上游同步修复候选。替代实现通过设备静止和恢复 barrier 回归后再移除。 |
+| 0009 | 完整 ARM SVE/FPSIMD/浮点控制状态 | 合并旧 0008–0011 | SVE 已在上游，仅提交剩余 FPCR/FPSR 修正及原生测试。选定版本覆盖各部分后逐项移除回补。 |
+| 0010 | 先恢复时钟，再设备，最后 vCPU | 旧 0012 | 临时上游回补。固定版本包含修复且恢复顺序验证通过后移除。 |
+| 0011 | HTTP allocator 受限读取与映射增长，含真实 BPF 测试 | 适配 v51.1 的上游 seccomp 修复 | 临时上游回补。选定版本具备等价权限且正反过滤测试通过后移除。 |
 
-该历史版本的 7 个 patch 文件合计 1,665 insertions / 136 deletions。当前补丁系列仍基于 cloud-hypervisor `v51.1`。
+上游核对固定于 2026-10-29 的
+[`0674238bb`](https://github.com/cloud-hypervisor/cloud-hypervisor/commit/0674238bb09082dfe55a4d3215eebf35ee0f5bb1)。
+表中的计划提交不表示上游已经接受。编号不是二进制兼容标识；应记录上游源码、完整
+补丁哈希和构建身份。#374 所指的原始旧 CH 仍是冻结、独立的制品。
 
 ### 1.3 维护策略
+
+- 按顺序应用，每个前缀须可构建且完整实现已经声明的能力；配置随实际消费者引入。
+- 后续修复和回归测试并入功能所属补丁，不累积 fixup。保留原作者、上游链接及
+  sign-off；不能将本地新增内容归给上游作者。
+- 比较完整应用后源码树验证纯整理的等价性，单独记录有意行为变化：本次为释放通知/
+  顺序、捕获保留释放零、ARM SVE capability 检查及 HTTP allocator seccomp 权限。
 
 - 仓库相对 patch 路径:`native-deps/deps/ch-patches/*.patch`,按编号顺序应用
 - 在 `sandboxer/native-deps` 中执行 `make ch-patches-apply`(全新 `make cloud-hypervisor` 构建也会执行);
@@ -238,50 +249,55 @@ guest 的 pinning/prefetch 可能填充候选页，因此 E2E 本身不能证明
 结合现有 KVM 内存压力覆盖执行两类测试，并验证 Linux 5.10 最低版本。
 这些是验证要求，不代表尚未执行的测试已经通过。
 
-### 3.4 0004 — balloon release 跳过 user-managed zone 的空洞 run
+### 3.4 0004 — 先保留逻辑释放通知，再稀疏回收
 
-主题:**virtio-devices: balloon — skip PUNCH_HOLE/MADV_DONTNEED on already-sparse
-user-managed ranges**
+修改 `virtio-devices/src/balloon.rs` 和 `virtio-devices/src/seccomp_filters.rs`。
+问题报告：[ #378](https://github.com/kuasar-sandbox/sandboxer/issues/378)。
 
-改动文件:`virtio-devices/src/balloon.rs` / `virtio-devices/src/seccomp_filters.rs`
+原优化在 SEEK_DATA 证明物理范围为空时，同时跳过 PUNCH_HOLE 和 MADV_DONTNEED，
+减少冷启动 balloon 收敛中的同步 REMOVE 工作。但其等价性前提错误：物理 Hole
+仍可能从惰性快照源继承非零内容。抑制 REMOVE 会保留该源，后续 CPU fault 或
+后端加载便可能复活已释放内容。balloon inflate 和 free-page reporting 都调用
+受影响的释放 helper。
 
-**背景**。配置中的 guest balloon 分配不带 `__GFP_ZERO`,平台 guest 内核未启用
-`init_on_alloc`;inflate 路径修改 page 元数据与 PFN 数组,而非把交还的每页清零。
-外部托管 zone 不做 prefault,因此 guest 此前从未访问的 offset 可能仍是 memfd 空洞,
-没有 inode 页,两个进程也没有相应 PTE。但这不代表冷启动交给 balloon 的每一页都必然是
-空洞:guest 可能已经访问并释放过其中一部分页。
+修正后的顺序：
 
-不做探测时,CH 对每个交还 run 调用 `release_memory_range`:
-memfd 上的 `fallocate(PUNCH_HOLE|KEEP_SIZE)` 加 chVA 上的 `madvise(MADV_DONTNEED)`。
-在这里的 uffd 模型中,即使范围已空,后者仍产生 `EVENT_REMOVE` 并等待外部 handler
-消费。对稀疏的 `Capacity − InitialBudget` 区间充气会产生多余串行握手并反压 balloon
-线程。该握手来自 chVA 的 `MADV_DONTNEED`,不只是 memfd 的 fallocate,所以对空 run
-必须同时跳过两者。
+1. 验证完整 guest 范围，在 chVA 上执行 MADV_DONTNEED。即使全是 Hole，也必须
+   产生逻辑释放通知。advice 失败直接返回，不进入探测或打洞。
+2. file-backed region 使用 `file_offset().start()` 转换偏移后执行 SEEK_DATA。
+   ENXIO 或下一个 Data 位于区间末尾及以后，只允许省略冗余 PUNCH_HOLE。其他探测
+   错误进入正常打洞路径，不能直接成功返回。
+3. 必要时对完整释放区间打洞并传递错误。打洞失败可能保留驻留字节，调用方必须
+   观察失败。
 
-**机制**:
+现有 Go handler 在同一 installMu 下读取 REMOVE、发布 Released 和安装 COPY；
+已在进行的源读取在安装前重验状态。通知后，CH 探测/打洞会覆盖此前已安装内容。
+这里复用既有同步，不新增 dirty ledger。实际 file-backed 判定是
+`region.file_offset().is_some()`，不是 user_managed；无 file offset 的区域仍执行
+advice。映射/显式偏移打洞不依赖共享 file position。balloon seccomp 继续允许
+lseek，fallocate 和公共 madvise 原本已允许。
 
-- 对具有 file offset 的 region,`release_memory_range` 使用
-  `lseek(fd, file_off, SEEK_DATA)` 探测 `[file_off, file_off + len)`:
-  - `ENXIO`,或下一数据 offset `≥ file_off + len`:整段为空洞,跳过 fallocate 和 madvise,
-    直接 `Ok(())`。
-  - run 内有数据:保持覆盖整段的 `PUNCH_HOLE` + `MADV_DONTNEED`。
-  - 其他 lseek 错误:落回原 release 路径,不能把错误当作范围为空的证据。
-- 实际条件为 `region.file_offset().is_some()`,而不是 `user_managed` 标志;
-  其他 file-backed region 也可能进入探测。没有 file offset 的 region 保持原路径。
-- 平台对 memfd 使用 mmap 与显式 offset 的 fallocate,不依赖共享文件位置进行读写;
-  lseek 修改文件位置不影响该数据路径。
-- **seccomp**:balloon 线程增加 `SYS_lseek`。fallocate 已在 allowlist 中,madvise 来自
-  virtio 公共集合;缺少新增项时第一次探测可能触发 SIGSYS。
+hole-only 释放重新承担同步 REMOVE 开销，冷启动 balloon 收敛可能变慢；仍可省略
+物理 inode 的冗余打洞。本修复不承诺额外加速，不抑制通知、不引入 WP 协商，也不
+提高 Host 内核基线。
 
-**正确性**:只跳过探测为空的 run;真正需要回收的驻留数据仍执行完整 release。
-对前述从未触碰的外部内存空洞,被抑制的 backendVA reclaim 本身也是 no-op,
-所以 host 内存终态不变。
+执行普通错误路径回归及显式原生 UFFD 测试：
 
-**效果与取舍**:x86_64 4 KiB 路径绕过 pbp 批处理时,若不探测,完全稀疏的充气区间
-可能产生约 `充气字节 / 4 KiB` 次同步 handler 握手。探测用本地 lseek 替代这些多余操作;
-guest 先前访问后仍驻留的页不会被跳过。guest 退出时 unmap 及其事件独立于充气阶段。
-该路径仍可能每页执行一次 lseek,但避免对应空范围的 madvise、handler 握手和共享 inode
-失效工作。空洞比例及收敛时间取决于工作负载与环境,本文不作普遍 99% 空洞率或瞬时收敛承诺。
+```sh
+cargo test --locked -p virtio-devices --features kvm --lib release_tests -- --include-ignored --nocapture
+```
+
+原生测试调用生产 4 KiB PFN inflate 和区间释放 helper，使用真实 shmem MISSING/
+REMOVE，覆盖非零 backing offset、ENXIO、区间外 Data、已物化及未物化非零源，
+比较完整释放页和邻页。它要求实际 UFFD 能力，属于内核组件测试，不能冒充完整 VM
+E2E。普通测试覆盖对齐错误和真实打洞失败。保留旧实现失败对照，并运行现有 Go
+释放/安装测试及使用重建 CH 的集成测试。
+
+释放修复同时覆盖捕获边界：CH/backend 冻结后，在 installMu 下联合采集物理 Hole
+和现有页状态。Data 取当前字节，Hole+Absent 继承父层，Hole+Released 或 Loaded
+保存为显式 Zero；Loaded+Hole 覆盖补零后又被 CH 最终打洞的情况。捕获成功或失败
+均不重置状态。既有层叠与载体保留 Zero，保证无需 refault 或预填全部 RAM 即可
+正确捕获、恢复。不增加 memory.dirty、新 dirty API 或历史裁剪；这些仍留在 #374。
 
 ### 3.5 0005 — 持久化 vsock host local-port 游标
 
@@ -318,14 +334,14 @@ snapshot staging 会先排空 reset 之前已经到达的 eventfd kick。设备�
 阶段若 descriptor 缺失或非法会明确失败;目标 restore activation 即使没有任何新
 available descriptor 也必须成功,因为 reset 已经存在于快照的 used ring 中。
 
-### 3.7 0007 — VM pause/resume 与 ordered shutdown 可靠性
+### 3.7 0007 — vCPU 生命周期请求与确认
 
 CH v51.1 用 no-op `SIGRTMIN` handler 中断 `KVM_RUN`:控制线程先发布 pause/kill
 状态,再 `pthread_kill` 每个 vCPU,等待 vCPU loop 写入 acknowledgement。若 signal
 在 vCPU 检查状态之后、进入下一次 `KVM_RUN` 之前到达 userspace,handler 返回后该
 vCPU 仍可阻塞在 `KVM_RUN`;每 10 ms 重发只能降低概率,不能关闭竞态窗口。
 
-patch 通过三组相互独立但同属 lifecycle barrier 的修复关闭该问题:
+patch 通过两组 vCPU lifecycle barrier 修复关闭该问题:
 
 1. 创建线程在 spawn vCPU 前配置 `KVM_SET_SIGNAL_MASK` 并阻塞 kick signal,使子线程
    从第一条指令起继承 blocked mask;配置失败直接返回,不会让一个提前退出的 vCPU
@@ -348,32 +364,39 @@ patch 通过三组相互独立但同属 lifecycle barrier 的修复关闭该问�
    unpark 并等待已参与 vCPU 恢复;NMI 即使 signal 超时也会完成 ACK-clear cleanup,
    两条错误路径都使用独立的新 deadline。非 KVM backend 保留 10 ms retry。所有等待
    统一使用 `CLOCK_MONOTONIC` 语义的 1 s deadline。
-3. runtime pause 先发布共享 pause event,再显式 unpark 所有普通与自定义 worker,
+### 3.8 0008 — virtio worker 暂停与恢复握手
+
+runtime pause 先发布共享 pause event,再显式 unpark 所有普通与自定义 worker,
    关闭 worker 的 zero-time epoll poll 到 `thread::park` 之间的启动竞态。resume 先
    drain 该 event 再唤醒 worker;worker 从 park 恢复后参加第二次 barrier,control
    thread 收齐 resume ACK 才允许下一次 pause。net 与 vhost-user 的自定义 worker
    handle 同时加入 pause wake 和 resume barrier。恢复态设备若尚未收到 runtime
    pause event,不会等待一个不存在的 ACK。
 
-该 patch 不改变 sandbox 配置、CH HTTP API、snapshot 格式或资源协议,也不在
+这些生命周期 patch 不改变 sandbox 配置、CH HTTP API、snapshot 格式或资源协议,也不在
 lifecycle 前后修改 `cpu.max`。超时仍是最终有界失败保护,不是竞态修复方法。
 
-### 3.8 0008–0011 — ARM SVE 快照寄存器
+### 3.9 0009 — 完整 ARM CPU 快照寄存器
 
 启用 SVE 的 ARM 主机通过 KVM 的 SVE Z/P/FFR 寄存器暴露向量状态。
 访问旧 FPSIMD V 寄存器偏移会返回 `EINVAL`;因此 VM 可以正常冷启动运行,
 但在捕获快照时失败。
 
-0008–0010 回移 Ruben Hakobyan 已合并的
+0009 合并回移 Ruben Hakobyan 已合并的
 [Cloud Hypervisor PR #8268](https://github.com/cloud-hypervisor/cloud-hypervisor/pull/8268),
 保留原作者与签署。审阅的上游提交为
 `083b41905ea59b335c4f211c4186312e30bbf022`、
 `e9d044730524d12e243737a1888767b3edf123c8` 和
-`4fc414cc8bc56a4c5275b3dd44610e5c75dfbbd1`;上下文适配 v51.1 与 0001–0007。
+`4fc414cc8bc56a4c5275b3dd44610e5c75dfbbd1`;上下文适配 v51.1 与前置平台补丁。
 补丁枚举 KVM 寄存器、保存 SVE 状态,并在 vCPU 初始化之后、SVE finalization
 之前恢复向量长度选择。不启用 SVE 时仍使用原有向量路径。
 
-0011 额外为两条路径保留 FPSR/FPCR:向量寄存器族改变时,这些控制和状态寄存器
+同一补丁也回移上游
+[48834e1](https://github.com/cloud-hypervisor/cloud-hypervisor/commit/48834e139e9d1882cdefb6cafa42155a13d173bc)：
+SVE finalize 同时检查 host HWCAP 和 VM 的 KVM ArmSve capability，与初始化一致。
+v51.1 适配直接传递已有 VM 引用，不引入无关的 Vcpu 所有权重构。
+
+同一补丁额外为两条路径保留 FPSR/FPCR:向量寄存器族改变时,这些控制和状态寄存器
 仍然可访问。补丁包含设置非零寄存器状态的原生 KVM 往返测试:
 
 ```sh
@@ -389,9 +412,9 @@ Cloud Hypervisor 二进制执行真实冷启动、guest exec、快照与恢复�
 非 SVE 状态,但不承诺跨主机 CPU 特性兼容,也不承诺向未打补丁的 VMM 反向恢复。
 SVE 保持启用,不兼容寄存器状态通过已有 KVM 错误失败。
 
-### 3.9 0012 — 在 vCPU 前恢复 KVM 时钟
+### 3.10 0010 — 在 vCPU 前恢复 KVM 时钟
 
-补丁 0012 回移上游 [commit ff20f183647c602bf5e5028d99959e5547a7dd84](https://github.com/cloud-hypervisor/cloud-hypervisor/commit/ff20f183647c602bf5e5028d99959e5547a7dd84)，
+补丁 0010 回移上游 [commit ff20f183647c602bf5e5028d99959e5547a7dd84](https://github.com/cloud-hypervisor/cloud-hypervisor/commit/ff20f183647c602bf5e5028d99959e5547a7dd84)，
 保留 CMGS 的作者归属和 sign-off。固定的 v51.1 恢复路径可能在还原已保存的 x86
 KVM 时钟前执行 vCPU。回移后先还原时钟，再恢复设备，最后恢复 vCPU。时钟操作仍仅
 适用于 x86；设备先于 vCPU 的顺序也适用于 ARM。快照 schema、Guest ABI 和固定的
@@ -402,6 +425,27 @@ identity；不具备对应身份的既有二进制不能用于验证回移。重
 `sandbox.memory-budget` 恢复、pause/wake，以及保留当前 direct-I/O 完整性断言的
 `snapshot.restore`，之后执行普通全量 E2E。记录原生架构和产品来源；仅交叉编译不会
 执行真实 KVM resume。小样本成功不能确定故障率，也不能据此诊断其他恢复错误。
+
+### 3.11 0011 — HTTP allocator seccomp 兼容
+
+大 HTTP 分配或释放可能触发 glibc 惰性读取 `/proc/sys/vm/overcommit_memory`，
+也可能通过 mremap 扩展映射。即使 API 操作有效，v51.1 的 HTTP filter 仍可能使
+线程因 SIGSYS 退出。回移上游
+[`660b18e`](https://github.com/cloud-hypervisor/cloud-hypervisor/commit/660b18eaace7953721c8ecf371973fc6eb6e2f66)
+（原 HTTP 修复 [`ec157d7`](https://github.com/cloud-hypervisor/cloud-hypervisor/commit/ec157d7eb9f5915512efcd0660a78b41be8bc87e)）及
+[`f05f0c2`](https://github.com/cloud-hypervisor/cloud-hypervisor/commit/f05f0c249e69568dea3ef8e7208d63f6ef8922ea)，
+不引入新版公共 filter 架构。
+
+仅在 HTTP filter 允许 flags 严格等于 O_RDONLY|O_CLOEXEC 的 openat，以及 read、
+mremap。这限制 flags，不是 pathname 白名单；写入、创建、截断打开仍被拦截。
+子进程测试安装真实生产 BPF，执行读取和映射增长，并验证禁止 flags 触发 SIGSYS：
+
+```sh
+cargo test --locked -p vmm --no-default-features --features kvm --lib seccomp_filters::tests::http_allocator_probe_is_read_only -- --nocapture
+```
+
+这是 allocator 兼容回补，不新增脏页 API 或响应格式。mremap 是上游兼容修复，
+并不能证明它是此前每次 API EOF 所触发的系统调用。
 
 ## 4. 构建工作流
 
@@ -486,7 +530,7 @@ host → guest 方向需要在第一笔写入发 ASCII `CONNECT <port>\n`,CH 回
 | 命令行写 `fd=` + `uffd_socket=` | ✗ | ✓(创建 uffd + sendmsg + 等 ack)|
 | `/vm.snapshot` 对 user_managed zone | (不适用) | 跳过 dump,memory-ranges 表无此 zone |
 | `/vm.restore` 对 user_managed zone | (不适用) | 跳过 fill;配置 uffd 时由映射缺页触发外部 handler |
-| balloon release 对 file-backed region 的空洞 run | 原 release 路径 | 跳过 `PUNCH_HOLE`+`madvise`;驻留 run 保留原 release |
+| balloon release 对 file-backed region 的空洞 run | 原 release 路径 | 始终通知 REMOVE；仅省略冗余 `PUNCH_HOLE` |
 | balloon `deflate_on_oom=on` | ✓(v51.1 已就绪) | ✓ |
 | `vm.resize` `desired_balloon` | ✓ | ✓(sandbox-local BalloonController 调用)|
 | virtio-mem `vm.resize` | ✓ | ✓ |
@@ -499,8 +543,8 @@ host → guest 方向需要在第一笔写入发 ASCII `CONNECT <port>\n`,CH 回
 [Guest Kernel §5.5](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/vmlinux_zh.md#55-为什么不启用-free_page_reporting以及-virtio_mem-的角色))。改由 sandbox-local BalloonController
 经 `/vm.resize` 推 inflate target;steady shrink 每份 fresh report 最多一个
 64MiB step。冷启动命令行 target
-覆盖的稀疏区间由 patch 0004(§3.4)跳过,不产生 `madvise` 广播与
-`EVENT_REMOVE`;运行时回收已驻留页仍走完整 release 路径。
+覆盖的稀疏区间与运行时驻留回收都由 0004 保留 REMOVE，仅省略冗余 inode 打洞；
+同步事件处理可能增加冷启动收敛时间。
 `deflate_on_oom` 是 upstream v51.1 原生,无需新 patch。
 
 ## 7. 已知限制

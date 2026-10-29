@@ -1,0 +1,168 @@
+From 394e25a610e17ae2b851bf458668f8242c508ad5 Mon Sep 17 00:00:00 2001
+From: Chen Xiaohui <graych@gmail.com>
+Date: Thu, 29 Oct 2026 03:12:13 +0800
+Subject: [PATCH 11/11] seccomp: permit read-only HTTP allocator probes and
+ mapping growth
+
+Backport the HTTP allocator permissions from upstream Rob Bradford fixes 660b18eaace7953721c8ecf371973fc6eb6e2f66 (original HTTP-only ec157d7eb9f5915512efcd0660a78b41be8bc87e) and f05f0c249e69568dea3ef8e7208d63f6ef8922ea. Keep exact O_RDONLY|O_CLOEXEC flags and the HTTP-only scope on v51.1.
+
+Real BPF child tests exercise the overcommit read and mremap, and reject writable, creating and truncating opens. These allocator compatibility rules are independent of new snapshot or dirty-memory APIs.
+---
+ vmm/src/seccomp_filters.rs | 135 +++++++++++++++++++++++++++++++++++++
+ 1 file changed, 135 insertions(+)
+
+diff --git a/vmm/src/seccomp_filters.rs b/vmm/src/seccomp_filters.rs
+index 1b99dc9..deff5b5 100644
+--- a/vmm/src/seccomp_filters.rs
++++ b/vmm/src/seccomp_filters.rs
+@@ -884,8 +884,22 @@ fn http_api_thread_rules() -> Result<Vec<(i64, Vec<SeccompRule>)>, BackendError>
+         (libc::SYS_madvise, vec![]),
+         (libc::SYS_mmap, vec![]),
+         (libc::SYS_mprotect, vec![]),
++        (libc::SYS_mremap, vec![]),
+         (libc::SYS_munmap, vec![]),
++        // Freeing a large HTTP response can make glibc trim an arena.
++        // Its lazy overcommit check reads /proc/sys/vm/overcommit_memory.
++        // Keep creation, truncation and writable opens outside this filter.
++        (
++            libc::SYS_openat,
++            or![and![Cond::new(
++                2,
++                ArgLen::Dword,
++                Eq,
++                (libc::O_RDONLY | libc::O_CLOEXEC) as u64,
++            )?]],
++        ),
+         (libc::SYS_prctl, vec![]),
++        (libc::SYS_read, vec![]),
+         (libc::SYS_recvfrom, vec![]),
+         (libc::SYS_recvmsg, vec![]),
+         (libc::SYS_sched_yield, vec![]),
+@@ -996,3 +1010,124 @@ pub fn get_seccomp_filter(
+         .map_err(Error::Backend),
+     }
+ }
++
++#[cfg(all(test, feature = "kvm"))]
++mod tests {
++    use super::*;
++
++    // Run the real filter in a child so a rejected syscall cannot kill the test
++    // runner. The child uses only stack storage and raw syscalls after fork.
++    fn http_open_probe(flags: i32) -> i32 {
++        let filter =
++            get_seccomp_filter(&SeccompAction::Trap, Thread::HttpApi, HypervisorType::Kvm).unwrap();
++        // Resolve the host granularity before fork; the child only uses the value.
++        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
++        assert!(page_size > 0);
++        let page_size = page_size as usize;
++        // SAFETY: No allocation or application locks are used by the child.
++        let child = unsafe { libc::fork() };
++        assert!(child >= 0);
++        if child == 0 {
++            let limit = libc::rlimit {
++                rlim_cur: 0,
++                rlim_max: 0,
++            };
++            // SAFETY: The child owns its resource limit and filter.
++            if unsafe { libc::setrlimit(libc::RLIMIT_CORE, &limit) } != 0 {
++                // SAFETY: Do not run a trapping probe unless core dumps are disabled.
++                unsafe { libc::_exit(9) };
++            }
++            if seccompiler::apply_filter(&filter).is_err() {
++                // SAFETY: Terminate only this child without running destructors.
++                unsafe { libc::syscall(libc::SYS_exit, 10) };
++                unreachable!();
++            }
++            if flags == (libc::O_RDONLY | libc::O_CLOEXEC) {
++                // Exercise the allocator's large-buffer growth under the same
++                // production filter, without depending on glibc size heuristics.
++                // SAFETY: This child owns both the mapping and its replacement.
++                unsafe {
++                    let old = libc::mmap(
++                        std::ptr::null_mut(),
++                        page_size,
++                        libc::PROT_READ | libc::PROT_WRITE,
++                        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
++                        -1,
++                        0,
++                    );
++                    if old == libc::MAP_FAILED {
++                        libc::syscall(libc::SYS_exit, 13);
++                        unreachable!();
++                    }
++                    old.cast::<u8>().write(0x5a);
++                    let grown = libc::mremap(old, page_size, 2 * page_size, libc::MREMAP_MAYMOVE);
++                    if grown == libc::MAP_FAILED {
++                        libc::syscall(libc::SYS_exit, 14);
++                        unreachable!();
++                    }
++                    if grown.cast::<u8>().read() != 0x5a || libc::munmap(grown, 2 * page_size) != 0
++                    {
++                        libc::syscall(libc::SYS_exit, 15);
++                        unreachable!();
++                    }
++                }
++            }
++            let path = if flags == (libc::O_RDONLY | libc::O_CLOEXEC) {
++                c"/proc/sys/vm/overcommit_memory"
++            } else {
++                // Negative probes cannot damage files even if the rule regresses.
++                c"/dev/null"
++            };
++            let mut byte = [0u8; 1];
++            // SAFETY: Paths are NUL-terminated and the read buffer is writable.
++            let status = unsafe {
++                let fd = libc::syscall(libc::SYS_openat, libc::AT_FDCWD, path.as_ptr(), flags, 0);
++                if fd < 0 {
++                    11
++                } else {
++                    let count = libc::syscall(libc::SYS_read, fd, byte.as_mut_ptr(), byte.len());
++                    libc::syscall(libc::SYS_close, fd);
++                    if count == 1 && byte[0].is_ascii_digit() {
++                        0
++                    } else {
++                        12
++                    }
++                }
++            };
++            // SAFETY: Terminate only this child without running destructors.
++            unsafe { libc::syscall(libc::SYS_exit, status) };
++            unreachable!();
++        }
++        let mut status = 0;
++        loop {
++            // SAFETY: Wait only for our child, writing to stack storage.
++            let waited = unsafe { libc::waitpid(child, &mut status, 0) };
++            if waited < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
++                continue;
++            }
++            assert_eq!(waited, child);
++            break;
++        }
++        status
++    }
++
++    #[test]
++    fn http_allocator_probe_is_read_only() {
++        let status = http_open_probe(libc::O_RDONLY | libc::O_CLOEXEC);
++        assert!(libc::WIFEXITED(status));
++        assert_eq!(libc::WEXITSTATUS(status), 0);
++        for flags in [
++            libc::O_WRONLY | libc::O_CLOEXEC,
++            libc::O_RDWR | libc::O_CLOEXEC,
++            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_CREAT,
++            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_TRUNC,
++        ] {
++            let status = http_open_probe(flags);
++            assert!(
++                libc::WIFSIGNALED(status),
++                "flags={flags:#x} status={status}"
++            );
++            assert_eq!(libc::WTERMSIG(status), libc::SIGSYS);
++        }
++    }
++}
+-- 
+2.43.0
+
