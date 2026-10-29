@@ -91,6 +91,16 @@ run_id = uuid.uuid4().hex
 lock = threading.Lock()
 output = os.environ["DIRTY_OBSERVATIONS"]
 os.makedirs(output, exist_ok=False)
+# Bind every observation to the executable actually mapped by the child. The
+# selected path alone could otherwise hide a stale binary or wrapper mix-up.
+executed = f"/proc/{child.pid}/exe"
+with open(executed, "rb") as binary:
+    binary_sha256 = hashlib.file_digest(binary, "sha256").hexdigest()
+with open(f"{output}/ch-process.json", "w") as report:
+    json.dump({"run_id": run_id, "pid": child.pid,
+               "selected_binary": os.environ["DIRTY_REAL_CH"],
+               "executed_binary": os.readlink(executed),
+               "binary_sha256": binary_sha256}, report, indent=2)
 
 def handle(conn):
     global sequence, capture_sequence
