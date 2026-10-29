@@ -1,0 +1,337 @@
+From fece49e2306b9b9ba8bf375f2cf226c68464d418 Mon Sep 17 00:00:00 2001
+From: Chen Xiaohui <graych@gmail.com>
+Date: Mon, 18 May 2026 18:27:14 +0800
+Subject: [PATCH 04/11] virtio-devices: preserve balloon release notifications
+ before sparse reclaim
+
+A physical hole in externally backed RAM may still inherit nonzero bytes from a lazy snapshot source. Always MADV_DONTNEED the complete valid release range before SEEK_DATA can skip redundant inode punching. Propagate advice and punch errors; include regression coverage for empty ranges and failed punching.
+
+This corrects original 0004, which treated absent inode pages as absent logical content. It restores REMOVE delivery and does not implement dirty tracking or snapshot encoding of released pages. Hole-only release again incurs synchronous REMOVE handling.
+
+The original release optimization, its correction and tests now share one functional owner.
+---
+ virtio-devices/src/balloon.rs         | 271 +++++++++++++++++++++++++-
+ virtio-devices/src/seccomp_filters.rs |   9 +-
+ 2 files changed, 275 insertions(+), 5 deletions(-)
+
+diff --git a/virtio-devices/src/balloon.rs b/virtio-devices/src/balloon.rs
+index 3db6832..2cfed19 100644
+--- a/virtio-devices/src/balloon.rs
++++ b/virtio-devices/src/balloon.rs
+@@ -199,14 +199,34 @@ impl BalloonEpollHandler {
+         let region = memory.find_region(range_base).ok_or(Error::GuestMemory(
+             GuestMemoryError::InvalidGuestAddress(range_base),
+         ))?;
++        // Publish REMOVE even for an existing hole: it may inherit nonzero
++        // parent bytes. Notify before probing or punching the backing so the
++        // external handler can invalidate its lazy source for the released range.
++        Self::advise_memory_range(memory, range_base, range_len, libc::MADV_DONTNEED)?;
+         if let Some(f_off) = region.file_offset() {
+-            let offset = range_base.0 - region.start_addr().0;
++            let fd = f_off.file().as_raw_fd();
++            let foff = (range_base.0 - region.start_addr().0 + f_off.start()) as libc::off64_t;
++            let end = foff + range_len as libc::off64_t;
++
++            // SAFETY: the range was validated by get_slice in advise above.
++            let next_data = unsafe { libc::lseek64(fd, foff, libc::SEEK_DATA) };
++            if next_data < 0 {
++                // ENXIO: no data at/after foff -- range is all hole. Any
++                // other lseek error: fall through rather than mask it.
++                if io::Error::last_os_error().raw_os_error() == Some(libc::ENXIO) {
++                    return Ok(());
++                }
++            } else if next_data >= end {
++                // Next byte of data is past our range -- all hole.
++                return Ok(());
++            }
++
+             // SAFETY: FFI call with valid arguments
+             let res = unsafe {
+                 libc::fallocate64(
+-                    f_off.file().as_raw_fd(),
++                    fd,
+                     libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+-                    (offset + f_off.start()) as libc::off64_t,
++                    foff,
+                     range_len as libc::off64_t,
+                 )
+             };
+@@ -216,7 +236,7 @@ impl BalloonEpollHandler {
+             }
+         }
+ 
+-        Self::advise_memory_range(memory, range_base, range_len, libc::MADV_DONTNEED)
++        Ok(())
+     }
+ 
+     fn release_memory_range_4k(
+@@ -675,3 +695,246 @@ impl Snapshottable for Balloon {
+ }
+ impl Transportable for Balloon {}
+ impl Migratable for Balloon {}
++
++#[cfg(test)]
++mod release_tests {
++    use super::*;
++    use std::fs::File;
++    use std::os::fd::FromRawFd;
++    use vm_memory::FileOffset;
++
++    #[test]
++    fn test_release_empty_madvise_and_punch_error() {
++        // SAFETY: static NUL-terminated name, returned fd transferred once.
++        let fd =
++            unsafe { libc::memfd_create(c"balloon-release".as_ptr(), libc::MFD_ALLOW_SEALING) };
++        assert!(fd >= 0);
++        let file = unsafe { File::from_raw_fd(fd) };
++        let page = get_page_size() as usize;
++        file.set_len((2 * page) as u64).unwrap();
++        let mem = GuestMemoryMmap::from_ranges_with_files(&[(
++            GuestAddress(0),
++            2 * page,
++            Some(FileOffset::new(file, 0)),
++        )])
++        .unwrap();
++        // Even an all-hole range must reach MADV, so misalignment fails. The
++        // former SEEK-first early return would incorrectly accept this call.
++        assert!(matches!(
++            BalloonEpollHandler::release_memory_range(&mem, GuestAddress(1), page),
++            Err(Error::MadviseFail(_))
++        ));
++        BalloonEpollHandler::release_memory_range(&mem, GuestAddress(0), page).unwrap();
++        mem.write_obj(0x5au8, GuestAddress(page as u64)).unwrap();
++        // Existing mappings remain writable, but inode mutation is forbidden:
++        // a real fallocate error must retain resident contents and fail.
++        assert_eq!(
++            unsafe { libc::fcntl(fd, libc::F_ADD_SEALS, libc::F_SEAL_FUTURE_WRITE) },
++            0
++        );
++        assert!(matches!(
++            BalloonEpollHandler::release_memory_range(&mem, GuestAddress(page as u64), page),
++            Err(Error::FallocateFail(_))
++        ));
++        assert_eq!(mem.read_obj::<u8>(GuestAddress(page as u64)).unwrap(), 0x5a);
++    }
++
++    // These tests call the production balloon release functions against a real
++    // shmem UFFD. The external reader supplies a nonzero lazy source until REMOVE
++    // invalidates it; comparing complete pages catches resurrection of that source.
++    #[test]
++    #[ignore = "requires userfaultfd shmem MISSING and REMOVE"]
++    fn test_release_unmaterialized_source_with_real_uffd() {
++        for trailing_data in [false, true] {
++            release_with_real_uffd(false, trailing_data);
++        }
++    }
++
++    #[test]
++    #[ignore = "requires userfaultfd shmem MISSING and REMOVE"]
++    fn test_release_resident_source_with_real_uffd() {
++        release_with_real_uffd(true, false);
++    }
++
++    fn release_with_real_uffd(resident: bool, trailing_data: bool) {
++        use std::sync::Arc;
++        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
++        #[repr(C)]
++        struct Api {
++            api: u64,
++            features: u64,
++            ioctls: u64,
++        }
++        #[repr(C)]
++        struct Register {
++            start: u64,
++            len: u64,
++            mode: u64,
++            ioctls: u64,
++        }
++        #[repr(C)]
++        struct Copy {
++            dst: u64,
++            src: u64,
++            len: u64,
++            mode: u64,
++            copied: i64,
++        }
++        // Linux UAPI _IOWR(UFFDIO, command, struct), identical on x86_64/arm64.
++        const API: libc::c_ulong = 0xc018_aa3f;
++        const REGISTER: libc::c_ulong = 0xc020_aa00;
++        const COPY: libc::c_ulong = 0xc028_aa03;
++        let page = get_page_size() as usize;
++        let guest = GuestAddress(4 * page as u64);
++        // SAFETY: the static name is terminated; each returned fd has one owner.
++        let fd = unsafe { libc::memfd_create(c"balloon-uffd-release".as_ptr(), 0) };
++        assert!(fd >= 0);
++        let backing = unsafe { File::from_raw_fd(fd) };
++        backing.set_len((3 * page) as u64).unwrap();
++        let mem = GuestMemoryMmap::from_ranges_with_files(&[(
++            guest,
++            2 * page,
++            Some(FileOffset::new(backing, page as u64)),
++        )])
++        .unwrap();
++        // Test a nonzero backing offset, including SEEK_DATA succeeding only
++        // beyond the released range rather than returning ENXIO.
++        if trailing_data {
++            mem.write_slice(&vec![0x77; page], guest.unchecked_add(page as u64))
++                .unwrap();
++        }
++        let host = mem.get_host_address(guest).unwrap() as u64;
++        let uffd = unsafe {
++            libc::syscall(libc::SYS_userfaultfd, libc::O_CLOEXEC | libc::O_NONBLOCK) as i32
++        };
++        assert!(uffd >= 0, "userfaultfd: {}", io::Error::last_os_error());
++        let uffd = unsafe { File::from_raw_fd(uffd) };
++        let mut api = Api {
++            api: 0xaa,
++            features: (1 << 5) | (1 << 3),
++            ioctls: 0,
++        };
++        assert_eq!(
++            unsafe { libc::ioctl(uffd.as_raw_fd(), API, &mut api) },
++            0,
++            "UFFDIO_API: {}",
++            io::Error::last_os_error()
++        );
++        let mut reg = Register {
++            start: host,
++            len: (2 * page) as u64,
++            mode: 1,
++            ioctls: 0,
++        };
++        assert_eq!(
++            unsafe { libc::ioctl(uffd.as_raw_fd(), REGISTER, &mut reg) },
++            0,
++            "UFFDIO_REGISTER: {}",
++            io::Error::last_os_error()
++        );
++        let source = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 2 * page)]).unwrap();
++        source
++            .write_slice(&vec![0x77; page], GuestAddress(page as u64))
++            .unwrap();
++        let stop = Arc::new(AtomicBool::new(false));
++        let removed = Arc::new(AtomicUsize::new(0));
++        let worker_stop = stop.clone();
++        let worker_removed = removed.clone();
++        let reader = std::thread::spawn(move || {
++            while !worker_stop.load(Ordering::Acquire) {
++                let mut poll = libc::pollfd {
++                    fd: uffd.as_raw_fd(),
++                    events: libc::POLLIN,
++                    revents: 0,
++                };
++                let n = unsafe { libc::poll(&mut poll, 1, 100) };
++                if n < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
++                    continue;
++                }
++                assert!(n >= 0);
++                if n == 0 {
++                    continue;
++                }
++                let mut msg = [0u8; 32];
++                let n = unsafe { libc::read(uffd.as_raw_fd(), msg.as_mut_ptr().cast(), msg.len()) };
++                if n < 0 && io::Error::last_os_error().kind() == io::ErrorKind::WouldBlock {
++                    continue;
++                }
++                assert_eq!(n, msg.len() as isize);
++                let first = u64::from_ne_bytes(msg[8..16].try_into().unwrap());
++                let second = u64::from_ne_bytes(msg[16..24].try_into().unwrap());
++                match msg[0] {
++                    0x15 => {
++                        // UFFD_EVENT_REMOVE: range.start, range.end
++                        assert_eq!((first, second), (host, host + page as u64));
++                        worker_removed.fetch_add(1, Ordering::Release);
++                    }
++                    0x12 => {
++                        // UFFD_EVENT_PAGEFAULT: flags, address
++                        let dst = second & !((page as u64) - 1);
++                        assert!(dst == host || dst == host + page as u64);
++                        let zero = dst == host && worker_removed.load(Ordering::Acquire) > 0;
++                        let src = source
++                            .get_host_address(GuestAddress(if zero { 0 } else { page as u64 }))
++                            .unwrap() as u64;
++                        let mut copy = Copy {
++                            dst,
++                            src,
++                            len: page as u64,
++                            mode: 0,
++                            copied: 0,
++                        };
++                        assert_eq!(
++                            unsafe { libc::ioctl(uffd.as_raw_fd(), COPY, &mut copy) },
++                            0,
++                            "UFFDIO_COPY: {}",
++                            io::Error::last_os_error()
++                        );
++                        assert_eq!(copy.copied, page as i64);
++                    }
++                    event => panic!("unexpected UFFD event {event:#x}"),
++                }
++            }
++        });
++        let mut actual = vec![0u8; 2 * page];
++        if resident {
++            mem.read_slice(&mut actual[..page], guest).unwrap();
++            assert!(actual[..page].iter().all(|b| *b == 0x77));
++        }
++        // Inflate consumes 4 KiB PFNs even on hosts with a larger page size.
++        // Free-page reporting uses release_memory_range directly.
++        let release = if trailing_data {
++            BalloonEpollHandler::release_memory_range(&mem, guest, page)
++        } else {
++            let mut partial = None;
++            let mut result = Ok(());
++            for offset in (0..page).step_by(4096) {
++                result = BalloonEpollHandler::release_memory_range_4k(
++                    &mut partial,
++                    &mem,
++                    ((guest.0 + offset as u64) >> 12) as u32,
++                );
++                if result.is_err() {
++                    break;
++                }
++            }
++            result
++        };
++        mem.read_slice(&mut actual, guest).unwrap();
++        stop.store(true, Ordering::Release);
++        reader.join().unwrap();
++        release.unwrap();
++        assert!(
++            removed.load(Ordering::Acquire) > 0,
++            "sparse release lost REMOVE"
++        );
++        assert!(
++            actual[..page].iter().all(|b| *b == 0),
++            "released page resurrected its lazy source"
++        );
++        assert!(
++            actual[page..].iter().all(|b| *b == 0x77),
++            "release changed the neighboring page"
++        );
++    }
++}
+diff --git a/virtio-devices/src/seccomp_filters.rs b/virtio-devices/src/seccomp_filters.rs
+index 5afd056..e846364 100644
+--- a/virtio-devices/src/seccomp_filters.rs
++++ b/virtio-devices/src/seccomp_filters.rs
+@@ -93,7 +93,14 @@ fn create_virtio_mem_ioctl_seccomp_rule() -> Vec<SeccompRule> {
+ }
+ 
+ fn virtio_balloon_thread_rules() -> Vec<(i64, Vec<SeccompRule>)> {
+-    vec![(libc::SYS_fallocate, vec![])]
++    vec![
++        (libc::SYS_fallocate, vec![]),
++        // release_memory_range probes the memfd with lseek(SEEK_DATA) to
++        // skip redundant PUNCH_HOLE on already-sparse runs (see the
++        // balloon device in this crate). Without this allowlist entry the
++        // balloon thread is SIGSYS-killed on the first probe.
++        (libc::SYS_lseek, vec![]),
++    ]
+ }
+ 
+ fn virtio_block_thread_rules() -> Vec<(i64, Vec<SeccompRule>)> {
+-- 
+2.43.0
+

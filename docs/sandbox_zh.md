@@ -177,7 +177,7 @@ sandbox-ctl snapshot \
 
 Snapshot 始终包含 memory execution state. 一次操作在同一 freeze point 产生 E 和 S,S 最后 commit. 默认成功后销毁 VM;`--resume` 恢复原 VM,但不把新 E/S 设为 live baseline.
 
-Local human output同时列出 `Snapshot S` 与 `Sandbox E`. Upload stdout 仍只输出 S Manifest key,便于当前 orchestrator parser 使用. `snapshot_done` 同时返回 `snapshot_ref` 与 `sandbox_ref`;既有 `memory_size`、`memory_resident`、pause/dump timing 和 compatibility `overlay_*` response 字段保留. `overlay_*` 当前镜像 E identity,真正 disk graph 只在 E 中.
+Local human output同时列出 `Snapshot S` 与 `Sandbox E`. Upload stdout 仍只输出 S Manifest key,便于当前 orchestrator parser 使用. `snapshot_done` 同时返回 `snapshot_ref` 与 `sandbox_ref`;既有 `memory_size`、`memory_resident`、pause/dump timing 和 compatibility `overlay_*` response 字段保留. `overlay_*` 当前镜像 E identity,真正 disk graph 只在 E 中. 既有字段名 `memory_resident` 统计显式逻辑内存覆盖量（Data 加 Zero），包括保留为 Zero 的释放页；它不表示物理驻留量或编码后的 payload 大小。
 
 Capture 的 `snapshot --json` 恰好返回 `{snapshotRef,sandboxRef,removedRefs}`，
 `export --json` 恰好返回 `{sandboxRef,removedRefs}`，capture 的 `removedRefs` 固定为
@@ -1701,13 +1701,20 @@ root carrier物化为`.image`;只有需要作为独立dependency保存的root/da
 
 #### 6.1.2 托管 checkpoint 历史合并与选择性清理
 
+当前内存层必须保留尚未再次缺页的释放内容。CH/设备 pause、backend quiesce 后，
+捕获在安装锁下联合采样 memfd Hole 与现有 UFFD 页状态：驻留 Data 优先，
+Hole+Absent 继承父层，Hole+Released 或 Loaded 表示显式 Zero。Loaded 情况覆盖
+补零后又被 CH 最终打洞的页。释放锁后流式读取固定布局；捕获成功或失败都不消费、
+重置 handler 状态。Zero 在本地合并、tarstream、Bundle/ingest、发布和恢复中保持
+不透明。不需要全 RAM 物化、新 ZIP 条目或累计 dirty 日志。参见[释放修复 #378](https://github.com/kuasar-sandbox/sandboxer/issues/378)。
+
 对本地磁盘 Checkpoint E，keep plan 还记录它精确引用的 DIFF 版本。只有当前 E
 贡献磁盘版本：为内存保留历史 S 不会顺带保留其旧磁盘 Checkpoint。清理先取得目录
 owner，验证完整保留集，再通过 metadata backend 分批删除无用版本、retire 不再
 需要的 DIFF。已有 read pin 延后物理回收。此过程不打开活动 Disk，也不解密
 guest 页；保留集或目录身份检查失败时不会开始修改。
 
-`merge_ref=false` 独立记录本轮驻留工作集。已有 `S1 -> S0` 时，下一次捕获先流式生成新的
+`merge_ref=false` 独立记录本轮驻留工作集及必要的显式释放零。已有 `S1 -> S0` 时，下一次捕获先流式生成新的
 不可变历史 Snapshot `S1′ = S1(memory) 覆盖 S0(memory)`，再写出
 `S2(当前工作集) -> S1′`。后续本地捕获重复该组合，最新 S 下最多保留一个本沙箱拥有的本地
 内存 lower。`merge_ref=true` 将当前驻留内存与整个可合并本地前缀合并；false → true → false
@@ -2233,7 +2240,7 @@ Guest 诊断字段与 host `memory.current` 不决定 Budget；host `memory.curr
 
 短暂分配突发可能触发 Guest 应急 deflate，并在两份报告之间结束。如果随后 inflate 停在 accepted target 以下，controller 可在同一 epoch 内两份新鲜报告确认 target 和 actual 均未变化后，重新通知同一个 target。新鲜报告的 RequestedBudget 必须不超过 TargetBudget，且现有 reservation 仍须覆盖 TargetBudget。正常的有界新 target 和部分结算优先执行。未完成的 grow、restore normalization、pressure、已被取代的报告，以及任何 actual 或 target 变化，都会使重试候选失效。操作仍通过 mutation gate 与 snapshot/export 串行，并在写入前重新检查 CH 状态及报告资格。这次重试不申请额外 reservation，不降低 `memory.high`，也不返还 reservation；后续 actual 观测沿用正常结算路径。每次尝试都会消耗两份报告的确认，因此 reconcile ticker 不会反复 resize 停滞的 Guest。响应丢失后，仅凭 accepted target 未变不能确认该次通知送达，HTTP 成功也不能替代实际进展观测。
 
-源码见 [memory.go](../pkg/resctl/memory.go)、[memory_controller.go](../pkg/resctl/memory_controller.go) 和 [balloon.go](../pkg/resctl/balloon.go)。稀疏 `PUNCH_HOLE`/`MADV_DONTNEED` 与 hole-only skipping 仍由 [VMM patch 0004](cloud-hypervisor_zh.md#34-0004--balloon-release-跳过-user-managed-zone-的空洞-run) 定义。
+源码见 [memory.go](../pkg/resctl/memory.go)、[memory_controller.go](../pkg/resctl/memory_controller.go) 和 [balloon.go](../pkg/resctl/balloon.go)。先通知逻辑释放、再稀疏物理回收的顺序由 [VMM patch 0004](cloud-hypervisor_zh.md#34-0004--先保留逻辑释放通知再稀疏回收) 定义。
 
 ## 10. Resource protocol
 

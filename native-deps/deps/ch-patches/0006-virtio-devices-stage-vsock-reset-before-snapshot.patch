@@ -1,7 +1,7 @@
-From 42f0c03d79c0345e55f8eeb7975494067f8dc3da Mon Sep 17 00:00:00 2001
+From 0c3aa94f16a11c817748f04a61d2731203a3d9f9 Mon Sep 17 00:00:00 2001
 From: Kuasar Sandbox <noreply@kuasar.dev>
 Date: Fri, 17 Jul 2026 17:13:45 +0800
-Subject: [PATCH] virtio-devices: stage vsock reset before snapshot
+Subject: [PATCH 06/11] virtio-devices: stage vsock reset before snapshot
 
 Lazy restore can fault the virtqueue pages after device activation, so consuming an event descriptor while activating a restored vsock device is not reliable. Publish TRANSPORT_RESET while the source VM is paused for snapshot instead, persist the pending acknowledgement, and only re-signal the already-used event queue after restore.
 

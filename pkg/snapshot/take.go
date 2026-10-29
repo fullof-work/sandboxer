@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 	"github.com/kuasar-sandbox/sandboxer/pkg/chapi"
@@ -37,11 +38,12 @@ type Quiescer interface {
 type Sources struct {
 	CheckpointID string
 	Context      context.Context
-	SandboxID    string // <sid> for output filename / symlink
-	APISock      string // CH api socket
-	MemfdFD      int    // memfd backing the zone (read-only here; CH is paused)
-	MemfdSize    int64  // ramSize
-	StagingDir   string // CH /vm.snapshot dest for config.json/state.json (caller creates+removes)
+	SandboxID    string       // <sid> for output filename / symlink
+	APISock      string       // CH api socket
+	MemfdFD      int          // memfd backing the zone (read-only here; CH is paused)
+	MemfdSize    int64        // ramSize
+	MemoryLayout MemoryLayout // optional only for callers without a live UFFD handler
+	StagingDir   string       // CH /vm.snapshot dest for config.json/state.json (caller creates+removes)
 
 	// Diffs are the logical disks' writable diffs to capture, in order: Diffs[0]
 	// is the root, Diffs[1:] are the boot.disks[] data disks (boot.disks[]
@@ -112,7 +114,9 @@ type Outputs struct {
 	SandboxRef   string
 	SandboxPath  string
 
-	MemorySize       uint64
+	MemorySize uint64
+	// MemoryResident is explicit logical memory coverage (Data plus Zero),
+	// not physical residency or encoded payload bytes.
 	MemoryResident   uint64
 	WallclockPauseMs int64
 	WallclockDumpMs  int64
@@ -268,13 +272,20 @@ func Take(s Sources, sink ArtifactSink, resumeAfter bool) (_ *Outputs, retErr er
 		return nil, fmt.Errorf("build snapshot.cfg: %w", err)
 	}
 	// T6: [memory][ZIP] bundle → sink, streamed from the memfd (CH paused, so
-	// the mapping is stable); only resident pages are read/transferred.
-	memHoles, err := WalkHoles(s.MemfdFD, s.MemfdSize)
-	if err != nil {
-		return nil, fmt.Errorf("memory holes: %w", err)
+	// the mapping is stable). Resident Data is read; released holes are explicit
+	// Zero, and only untouched holes may inherit a parent.
+	var memHoles, memZeros []sparse.Extent
+	if s.MemoryLayout != nil {
+		memHoles, memZeros, err = s.MemoryLayout()
+	} else {
+		memHoles, err = WalkHoles(s.MemfdFD, s.MemfdSize)
 	}
-	var memSrc io.ReadSeeker = memfdReader(s.MemfdFD, s.MemfdSize)
-	memSrcHoles := memHoles
+	if err != nil {
+		return nil, fmt.Errorf("memory layout: %w", err)
+	}
+	var memorySource fetch.Stream = &releasedMemorySource{
+		fd: s.MemfdFD, size: uint64(s.MemfdSize), holes: memHoles, zeros: memZeros,
+	}
 	memoryBaseOpen := false
 	var closeMemoryBase func() error
 	defer func() {
@@ -285,16 +296,20 @@ func Take(s Sources, sink ArtifactSink, resumeAfter bool) (_ *Outputs, retErr er
 		}
 	}()
 	if s.MergeBaseSnapshot != "" {
-		base, baseHoles, berr := openMergeBaseWithOpener(ctx, s.MergeBaseSnapshot, s.MemfdSize, s.LocalCodec, s.LocalRequired, s.MemoryMergeBaseOpener)
+		base, _, berr := openMergeBaseWithOpener(ctx, s.MergeBaseSnapshot, s.MemfdSize, s.LocalCodec, s.LocalRequired, s.MemoryMergeBaseOpener)
 		if berr != nil {
 			return nil, fmt.Errorf("merge memory base: %w", berr)
 		}
-		closeMemoryBase = base.Close
+		// Reuse the bounded/retrying parent view used for disk exports. Only
+		// Hole inherits; explicit Zero must mask old parent contents.
+		memorySource = fetch.NewLayered(memorySource, &payloadMergeBase{Stream: base.stream, size: uint64(s.MemfdSize), ctx: ctx})
+		closeMemoryBase = memorySource.Close
 		memoryBaseOpen = true
-		memSrc, memSrcHoles = mergeSparse(memSrc, memHoles, base, baseHoles, s.MemfdSize)
 	}
-	out.MemoryResident = residentBytes(s.MemfdSize, memSrcHoles) // bytes actually written (merged)
-	memorySource := &seekerSource{rs: memSrc, size: uint64(s.MemfdSize), holes: memSrcHoles}
+	out.MemoryResident, err = explicitMemoryBytes(memorySource)
+	if err != nil {
+		return nil, fmt.Errorf("memory runs: %w", err)
+	}
 	snapshotSource, err := snapshotfile.BuildSource(memorySource, configJSON, stateJSON, snapshotCfg)
 	if err != nil {
 		return nil, fmt.Errorf("build Snapshot S: %w", err)

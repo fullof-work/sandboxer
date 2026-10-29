@@ -176,10 +176,11 @@ Conventions:
 
 - Patches cover CH behavior required by the platform: external memfd memory
   zones, skipping user-managed RAM in snapshots, handing uffd to the external
-  owner over a Unix socket, skipping `PUNCH_HOLE`/`MADV_DONTNEED` for already-empty
-  file-backed balloon ranges, restore-safe vsock, and reliable
-  pause/resume/ordered-shutdown barriers. Resident memory still follows the
-  ordinary balloon release path.
+  owner over a Unix socket, preserving logical balloon release before skipping
+  redundant inode punching, restore-safe vsock, lifecycle barriers, ARM register
+  preservation and applicable upstream clock/seccomp fixes. Each functional patch
+  includes its corrections and tests; future maintenance and retirement conditions
+  are recorded in the CH owner document.
 - Patch files are stored in commit order in `deps/ch-patches/`.
 - For an upstream CH upgrade, update the pin, fetch/import the intended source,
   reapply the patches, build, and run the sandboxer and platform E2E suites.

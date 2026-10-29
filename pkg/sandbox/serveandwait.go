@@ -678,6 +678,17 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 	}
 	snapDisks = bindCheckpointDisks(snapDisks, p.Disks)
 	snapHandler := &SnapshotHandler{
+		MemoryLayout: func() ([]sparse.Extent, []sparse.Extent, error) {
+			uffdHandlerMu.Lock()
+			h := uffdHandler
+			uffdHandlerMu.Unlock()
+			if h == nil {
+				return nil, nil, fmt.Errorf("snapshot: UFFD handler is unavailable")
+			}
+			return h.CaptureMemoryLayout(func() ([]sparse.Extent, error) {
+				return snapshot.WalkHoles(memfd.FD(), int64(memfd.Size()))
+			})
+		},
 		EnableCheckpoint: enabled,
 		CheckpointDir:    filepath.Join(p.BaseDir, "checkpoint"),
 		Cfg:              p.SnapCfg,
