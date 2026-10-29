@@ -140,6 +140,12 @@ func TestActiveZeroExportIncludesAcceptedWrite(t *testing.T) {
 			}
 			defer d.Close()
 			defer once.Do(func() { close(gate) })
+			// Finish fresh checkpoint publication before adding writes whose
+			// writeback is deliberately blocked by this test. Otherwise its
+			// initialization drain can wait on gate while Export waits on it.
+			if err := d.WaitMaterialized(context.Background()); err != nil {
+				t.Fatal(err)
+			}
 			if err := d.Discard(0, cowBlockSize); err != nil {
 				t.Fatal(err)
 			}
