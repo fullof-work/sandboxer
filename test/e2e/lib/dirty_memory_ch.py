@@ -120,9 +120,6 @@ def handle(conn):
         if first.split()[1] == b"/api/v1/vm.dirty-memory":
             with open(f"{output}/dirty-requests.jsonl", "a") as target:
                 target.write(json.dumps({"pid": child.pid, "run_id": run_id}) + "\n")
-            if os.environ.get("DIRTY_MEMORY_HIDE_LOG") == "1":
-                conn.sendall(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-                return
         backend = socket.socket(socket.AF_UNIX)
         for attempt in range(500):
             try:

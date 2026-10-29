@@ -67,6 +67,13 @@
         "snapshot.dirty-memory.sh",
         "snapshot.ch-compat.sh"
       ]
+    },
+    {
+      "name": "cloud-hypervisor-compat",
+      "env": "COMPAT_CH_BIN",
+      "cases": [
+        "snapshot.ch-compat.sh"
+      ]
     }
   ]
 }

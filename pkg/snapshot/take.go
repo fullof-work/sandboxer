@@ -288,6 +288,9 @@ func Take(s Sources, sink ArtifactSink, resumeAfter bool) (_ *Outputs, retErr er
 		if err != nil {
 			return nil, fmt.Errorf("capture memory view: %w", err)
 		}
+		if view.WorkingSetOnly {
+			logf("snapshot memory compatibility: CH dirty API unavailable; preserving complete working set")
+		}
 		if view.Size != uint64(s.MemfdSize) {
 			return nil, fmt.Errorf("capture memory size mismatch")
 		}

@@ -587,9 +587,11 @@ unrelated migration timeout additions since ad5f3eea; CH stays pinned to v51.1.
 Validation includes native KVM slot-failure/retry and migration-owner rejection,
 raw net/vsock writers, initialization, and the sandbox `snapshot.dirty-memory`
 case's full-RAM comparisons, same-state size accounting and response loss. The
-`snapshot.ch-compat` case hides the endpoint to exercise fallback and query
-caching in regular CI; release acceptance additionally runs the same compatibility
-path with the actual rebuilt #379 CH, on x86_64 and aarch64 as applicable.
+`snapshot.ch-compat` case uses a test-only CH built from the formal first eleven
+patches via the existing native build recipe. On both native CI architectures it
+checks legacy cold capture and four-entry native snapshots restored by that CH,
+including one-time capability discovery, release and reuse. The helper records
+its applied source tree, patch hashes and binary hash; it is not a product VMM.
 
 ## 4. Build workflow
 
