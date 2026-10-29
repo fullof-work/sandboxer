@@ -218,13 +218,12 @@ func (m *AddressMap) bindInitial(fd int) error {
 	return nil
 }
 
-// removeStaged rolls back a rejected va_report, including a bound fd whose
-// initialization failed before its ACK. Never use it for an admitted region.
+// removeStaged rolls back a rejected first va_report; active maps are untouched.
 func (m *AddressMap) removeStaged(va, size, off uint64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for i, v := range m.vmas {
-		if v.process == ProcessCH && v.start == va && v.end-va == size && v.memfdOffset == off {
+		if v.process == ProcessCH && v.start == va && v.end-va == size && v.memfdOffset == off && v.uffdFD == 0 {
 			m.vmas = append(m.vmas[:i], m.vmas[i+1:]...)
 			return
 		}

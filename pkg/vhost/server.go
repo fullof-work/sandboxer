@@ -940,6 +940,3 @@ func (s *Server) maybeStartWorker(idx int) {
 	go s.runWorker(idx, q)
 	s.logf("vhost: started worker for queue %d", idx)
 }
-
-// SetDirtyTracker binds the instance accumulator before serving guest memory.
-func (s *Server) SetDirtyTracker(mark func(uint64, uint64) error) { s.memTable.MarkDirty = mark }

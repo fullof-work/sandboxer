@@ -30,8 +30,8 @@
 
 这些组合能力在所固定的 upstream CH 版本中未直接提供。第二条尤其本质——upstream uffd handler 模型
 是 CH 调外部 socket,handler 提供数据,但平台需要 handler 接管 fault 投递
-路由,upstream 的 listener 模型不够。此外，从未驻留的空洞 run 可能继承父层
-非零内容，balloon 仍须发送逻辑释放通知，只能跳过无效的 inode punch（§3.4）。
+路由,upstream 的 listener 模型不够。此外这一模型带来一条派生修复:balloon
+释放路径对从未驻留的空洞 run 不能合成 `EVENT_REMOVE` 风暴(patch 0004,§3.4)。
 
 ### 1.2 patch 范围(总结)
 
@@ -148,7 +148,7 @@ share-storage live migration 场景)。我们的 user_managed zone 满足"file-b
 
 改动文件:`memory_manager.rs` / `seccomp_filters.rs`
 
-以下是 0003 最初的 MISSING-only 握手；当前协议由 0013 扩展，见示例后的说明。
+要点:
 
 - `create_ram_region` 在 mmap 完成后,如果 zone 配了 `uffd_socket`:
 
@@ -205,9 +205,8 @@ worker 退出后才替换内存表。
 队列能够推进；`ENOENT` 或无效注册使请求失败。真正的 CPU MISSING fault
 遇到 Loaded 页仍走独立的已回收页处理路径。
 
-当前 `va_report` v1 显式传递 `version=1`、`page_shift=12` 和 `file_offset`。
-x86 与 ARM 均使用 MISSING 注册和普通 COPY；ACK 确认描述符及坐标映射已被接管。
-memfd 偏移通过内部回调传递，并与实际 CH VA 区间及持有的 UFFD fd 关联。只有成功接管后，新注册才可用于加载；接管失败
+`va_report` 的线格式不变。已计算的 memfd 偏移通过内部回调传递，并与实际 CH
+VA 区间及持有的 UFFD fd 关联。只有成功接管后，新注册才可用于加载；接管失败
 回滚暂存的地址映射，由回调调用方清理 fd。加载可取消地等待注册就绪，并在区域
 边界拆分。UNMAP 使对应注册区间失效；REMOVE 释放页内容但保留注册。
 
@@ -239,18 +238,50 @@ guest 的 pinning/prefetch 可能填充候选页，因此 E2E 本身不能证明
 结合现有 KVM 内存压力覆盖执行两类测试，并验证 Linux 5.10 最低版本。
 这些是验证要求，不代表尚未执行的测试已经通过。
 
-### 3.4 0004 — balloon 空洞探测（当前顺序由 0013 修正）
+### 3.4 0004 — balloon release 跳过 user-managed zone 的空洞 run
 
-0004 引入 file-backed RAM 的 SEEK_DATA 探测及 balloon 线程 `SYS_lseek`
-seccomp 放行。0013 保留探测，但不再跳过空洞区间的 chVA `MADV_DONTNEED`：
-restore 的未物化 Hole 可能仍继承父层非零内容，逻辑释放必须先通知 handler。
+主题:**virtio-devices: balloon — skip PUNCH_HOLE/MADV_DONTNEED on already-sparse
+user-managed ranges**
 
-当前 release 顺序为 **chVA MADV_DONTNEED → SEEK_DATA → 必要的 PUNCH_HOLE**。
-即使整个区间已稀疏，也先执行 MADV。handler 持有 installMu 读取 REMOVE
-并发布 R/Released；内核 ACK 可以早于用户态发布，但填充和 CaptureView
-不能越过这个发布边界。探测只能避免 inode 的无效 punch，不能省掉逻辑释放事件。MADV 或 punch 失败走错误路径；SEEK_DATA 返回 ENXIO 表示没有 Data，其他 SEEK 错误则保守继续 PUNCH_HOLE。已累计 R/D
-不回退。handler 在 installMu 下同时读取事件、记录 R/D 和发布 Released 状态，
-从而让后台填充和 CaptureView 在事件读取与状态发布之间无法进入。
+改动文件:`virtio-devices/src/balloon.rs` / `virtio-devices/src/seccomp_filters.rs`
+
+**背景**。配置中的 guest balloon 分配不带 `__GFP_ZERO`,平台 guest 内核未启用
+`init_on_alloc`;inflate 路径修改 page 元数据与 PFN 数组,而非把交还的每页清零。
+外部托管 zone 不做 prefault,因此 guest 此前从未访问的 offset 可能仍是 memfd 空洞,
+没有 inode 页,两个进程也没有相应 PTE。但这不代表冷启动交给 balloon 的每一页都必然是
+空洞:guest 可能已经访问并释放过其中一部分页。
+
+不做探测时,CH 对每个交还 run 调用 `release_memory_range`:
+memfd 上的 `fallocate(PUNCH_HOLE|KEEP_SIZE)` 加 chVA 上的 `madvise(MADV_DONTNEED)`。
+在这里的 uffd 模型中,即使范围已空,后者仍产生 `EVENT_REMOVE` 并等待外部 handler
+消费。对稀疏的 `Capacity − InitialBudget` 区间充气会产生多余串行握手并反压 balloon
+线程。该握手来自 chVA 的 `MADV_DONTNEED`,不只是 memfd 的 fallocate,所以对空 run
+必须同时跳过两者。
+
+**机制**:
+
+- 对具有 file offset 的 region,`release_memory_range` 使用
+  `lseek(fd, file_off, SEEK_DATA)` 探测 `[file_off, file_off + len)`:
+  - `ENXIO`,或下一数据 offset `≥ file_off + len`:整段为空洞,跳过 fallocate 和 madvise,
+    直接 `Ok(())`。
+  - run 内有数据:保持覆盖整段的 `PUNCH_HOLE` + `MADV_DONTNEED`。
+  - 其他 lseek 错误:落回原 release 路径,不能把错误当作范围为空的证据。
+- 实际条件为 `region.file_offset().is_some()`,而不是 `user_managed` 标志;
+  其他 file-backed region 也可能进入探测。没有 file offset 的 region 保持原路径。
+- 平台对 memfd 使用 mmap 与显式 offset 的 fallocate,不依赖共享文件位置进行读写;
+  lseek 修改文件位置不影响该数据路径。
+- **seccomp**:balloon 线程增加 `SYS_lseek`。fallocate 已在 allowlist 中,madvise 来自
+  virtio 公共集合;缺少新增项时第一次探测可能触发 SIGSYS。
+
+**正确性**:只跳过探测为空的 run;真正需要回收的驻留数据仍执行完整 release。
+对前述从未触碰的外部内存空洞,被抑制的 backendVA reclaim 本身也是 no-op,
+所以 host 内存终态不变。
+
+**效果与取舍**:x86_64 4 KiB 路径绕过 pbp 批处理时,若不探测,完全稀疏的充气区间
+可能产生约 `充气字节 / 4 KiB` 次同步 handler 握手。探测用本地 lseek 替代这些多余操作;
+guest 先前访问后仍驻留的页不会被跳过。guest 退出时 unmap 及其事件独立于充气阶段。
+该路径仍可能每页执行一次 lseek,但避免对应空范围的 madvise、handler 握手和共享 inode
+失效工作。空洞比例及收敛时间取决于工作负载与环境,本文不作普遍 99% 空洞率或瞬时收敛承诺。
 
 ### 3.5 0005 — 持久化 vsock host local-port 游标
 
@@ -372,50 +403,6 @@ identity；不具备对应身份的既有二进制不能用于验证回移。重
 `snapshot.restore`，之后执行普通全量 E2E。记录原生架构和产品来源；仅交叉编译不会
 执行真实 KVM resume。小样本成功不能确定故障率，也不能据此诊断其他恢复错误。
 
-### 3.10 0013–0014 — 累计 dirty memory
-
-每个外部托管 RAM 实例初始化时就启用 MemoryManager 级 KVM dirty logging，
-先消费并累计已有软件 bitmap，不调用会清空软件记录的 VM migration hook。
-`GET /api/v1/vm.dirty-memory` 返回 version=1、page_shift=12 以及每个 slot 的
-GPA、size、memfd file_offset 和累计 u64 bitmap。各来源/slot 消费后立即 OR 到
-实例累计集合，再处理下一个 slot 或返回响应；失败 slot 先全 dirty 再报错。
-响应丢失或重复采集不清空累计集合。Go 端使用完整、有界 HTTP 读取并验证 region
-覆盖/重叠/偏移与尾部无效位后转换成 memfd 坐标。net/vsock 原始可写别名和 Go
-vhost 的 DMA/status/used-ring 写入在暴露缓冲区前标记范围，部分失败不会撤销记录。
-
-0014 在消费日志前先检查完整坐标映射；注册变化时先把全部已知 region 保守标脏再报错。
-
-va_report v1 显式传 page_shift 和 file_offset，ACK 确认注册已被接管。
-原生 4 KiB x86 和 ARM 共用既有 MISSING 路径。Data、Zero、父 Hole、tail
-和 EnsureLoaded 填充均使用普通 COPY 或 ZEROPAGE；shmem 不支持 ZEROPAGE 时
-用零缓冲区 COPY。填充恢复固定基线；
-写入由 KVM、CH 和 Go 累计记录，释放永久保留为候选。不需要 write-protect
-能力协商或 fault 路径。KVM 可能将 x86 只读页保守记为 dirty，使其保留在捕获中。
-MISSING fault 的 write 标志不精确代表 guest 写入，不能用它替代 KVM 日志。
-意外的 WP 或 MINOR fault 直接报错，不覆盖实时内容。更大 host page 被明确拒绝。
-
-捕获在 pause、backend quiesce、CH snapshot 写入及日志采集后取得固定 M/D/R。
-UNMAP、registration 缺口、事件流损坏、Loaded 无 release 却变 Hole 均使捕获
-报错。D/R 不因捕获成功、失败或 merge_ref 切换清空；生命周期和 exec/stdio 屏障
-仍沿用既有流程。S 编码及历史裁剪见 [sandbox.md 中文版](sandbox_zh.md#snapshot-format)。
-
-0016 适配上游 [glibc allocator 修复](https://github.com/cloud-hypervisor/cloud-hypervisor/commit/660b18eaace7953721c8ecf371973fc6eb6e2f66)
-中 HTTP 线程所需的部分。释放较大的 dirty-memory 响应可能触发 arena 裁剪，其
-延迟初始化的 overcommit 检查会读取 `/proc/sys/vm/overcommit_memory`。已复现的
-6 GiB 捕获因此在交付响应前触发 SIGSYS，导致 CH 终止。回移保留精确的
-`O_RDONLY|O_CLOEXEC` 标志；可写、创建和截断模式仍被拦截。同时纳入上游
-[HTTP mremap 许可](https://github.com/cloud-hypervisor/cloud-hypervisor/commit/f05f0c249e69568dea3ef8e7208d63f6ef8922ea)
-以支持 allocator 扩容；后者是兼容性覆盖，不是该捕获故障中实际观察到的系统调用。
-子进程测试验证实际过滤器下的映射扩容、读取及禁止的打开模式，既有 6 GiB Demo
-验证完整捕获路径。上游较新的公共过滤器和 SIGSYS handler 重构并非本回移的前提。
-
-Host 基线仍为 Linux 5.10，使用既有 MISSING_SHMEM 支持。提案中的 Linux 6.6
-指验证主机，不是新的最低要求。统一原生日志方案接受 x86 只读页的保守候选，
-不要求 shmem write protection。
-未来升级 CH 时，应将其 raw RX dirty 标记和 allocator 修复与 0013、0016 对照，
-避免叠加重复实现。上游 [RX 完成后标记](https://github.com/cloud-hypervisor/cloud-hypervisor/commit/3777ba8ded440cca2d953cd40e8b1ee43ae6c682)
-修复相同的 raw buffer 覆盖缺口；当前累计 checkpoint 路径还保留部分写入后返回错误时的标记。
-
 ## 4. 构建工作流
 
 `sandboxer/native-deps` 从固定 v51.1 tarball 构建,应用
@@ -499,7 +486,7 @@ host → guest 方向需要在第一笔写入发 ASCII `CONNECT <port>\n`,CH 回
 | 命令行写 `fd=` + `uffd_socket=` | ✗ | ✓(创建 uffd + sendmsg + 等 ack)|
 | `/vm.snapshot` 对 user_managed zone | (不适用) | 跳过 dump,memory-ranges 表无此 zone |
 | `/vm.restore` 对 user_managed zone | (不适用) | 跳过 fill;配置 uffd 时由映射缺页触发外部 handler |
-| balloon release 对 file-backed region 的空洞 run | 原 release 路径 | 先 `MADV_DONTNEED` 再探测；只跳过无效的 `PUNCH_HOLE` |
+| balloon release 对 file-backed region 的空洞 run | 原 release 路径 | 跳过 `PUNCH_HOLE`+`madvise`;驻留 run 保留原 release |
 | balloon `deflate_on_oom=on` | ✓(v51.1 已就绪) | ✓ |
 | `vm.resize` `desired_balloon` | ✓ | ✓(sandbox-local BalloonController 调用)|
 | virtio-mem `vm.resize` | ✓ | ✓ |
@@ -512,8 +499,8 @@ host → guest 方向需要在第一笔写入发 ASCII `CONNECT <port>\n`,CH 回
 [Guest Kernel §5.5](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/vmlinux_zh.md#55-为什么不启用-free_page_reporting以及-virtio_mem-的角色))。改由 sandbox-local BalloonController
 经 `/vm.resize` 推 inflate target;steady shrink 每份 fresh report 最多一个
 64MiB step。冷启动命令行 target
-覆盖的稀疏区间也先执行 `MADV_DONTNEED`，再由 SEEK_DATA 探测避免无效 inode
-punch；已驻留区间仍执行必要的 PUNCH_HOLE（§3.4）。
+覆盖的稀疏区间由 patch 0004(§3.4)跳过,不产生 `madvise` 广播与
+`EVENT_REMOVE`;运行时回收已驻留页仍走完整 release 路径。
 `deflate_on_oom` 是 upstream v51.1 原生,无需新 patch。
 
 ## 7. 已知限制
