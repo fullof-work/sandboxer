@@ -84,10 +84,7 @@ type uffdioRegisterStruct struct {
 	Ioctls     uint64
 }
 
-const (
-	uffdRegisterMissing uint64 = 1 << 0
-	uffdRegisterWP      uint64 = 1 << 1
-)
+const uffdRegisterMissing uint64 = 1 << 0
 
 // uffdio_copy struct.
 type uffdioCopyStruct struct {
@@ -97,8 +94,6 @@ type uffdioCopyStruct struct {
 	Mode   uint64
 	Copied int64 // out
 }
-
-const uffdCopyModeWP uint64 = 1 << 1
 
 // uffdio_zeropage struct.
 type uffdioZeropageStruct struct {

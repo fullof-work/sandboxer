@@ -193,7 +193,7 @@ orchestrator 本地数据库并重新创建记录；两个组件均不迁移、�
 数据。缺少必填 `resumeSandboxRef` 字段的旧迁移 token（包括缺少 E 的 Snapshot token）必须废弃，从完整 S/E 记录重新签发。portable
 Export 即使在工件不可用时也只使用已记录的对，绝不读取 S 来发现 E。
 
-`--drop-caches` 只属于 memory snapshot,默认 false. `--merge-ref=false` 独立录制当前工作集并保留一个历史合并层；true 将当前内存与本沙箱 checkpoint 的本地历史前缀合并。两者均在外部归属处停止，磁盘合并不受该开关影响。完整规则见[checkpoint 历史与清理](sandbox_zh.md#checkpoint-history)。
+`--drop-caches` 只属于 memory snapshot,默认 false. `--merge-ref=false` 独立录制当前工作集并保留一个历史合并层；true（默认）将累计变化与本沙箱 checkpoint 的本地历史前缀合并。两者均在外部归属处停止，磁盘合并不受该开关影响。完整规则见[checkpoint 历史与清理](sandbox_zh.md#checkpoint-history)。
 
 local `snapshot` 只需 `--sandbox-id` 或 `--path-id` 之一。两者同时给出时
 PathID 只选择 `RunRoot/PathID/ctl.sock`，不做身份一致性校验。`--output` 可以位于
@@ -1714,12 +1714,30 @@ owner，验证完整保留集，再通过 metadata backend 分批删除无用版
 需要的 DIFF。已有 read pin 延后物理回收。此过程不打开活动 Disk，也不解密
 guest 页；保留集或目录身份检查失败时不会开始修改。
 
-`merge_ref=false` 独立记录本轮驻留工作集及必要的显式释放零。已有 `S1 -> S0` 时，下一次捕获先流式生成新的
-不可变历史 Snapshot `S1′ = S1(memory) 覆盖 S0(memory)`，再写出
-`S2(当前工作集) -> S1′`。后续本地捕获重复该组合，最新 S 下最多保留一个本沙箱拥有的本地
-内存 lower。`merge_ref=true` 将当前驻留内存与整个可合并本地前缀合并；false → true → false
-切换同样收敛。reader 仍支持旧的多层输入。恢复执行状态和 `sandbox_ref` 只来自最新 S，
-历史 S 只提供 memory。
+CH 具备累计日志时，默认 `merge_ref=true` 捕获相对实例固定运行基线 B 的变化，并吸收
+可合并本地历史。`merge_ref=false` 保留完整当前工作集和必要显式 Zero，把本地历史裁剪成
+独立 H。单本地父与多父遵守相同裁剪规则。捕获成功、失败和模式切换均不清空
+CPU/CH/Go/释放累计记录，也不推进 B。没有新 CH API 时，两种模式均保留完整当前工作集；
+历史仍利用父层已有元数据裁剪。
+
+S 可在 config.json、state.json、snapshot.cfg 后追加 `memory.dirty`，cfg version 保持 1。
+条目是 16 字节小端头（encoding_version=1、page_shift=12、memory_size）和每 4 KiB 页
+一位、低位优先的位图。缺失表示全部显式 Data/Zero 按 dirty；存在的全零位图表示没有 dirty。
+新 reader 接受三/四条目；旧 reader 仅承诺原三条目图。恢复始终读取完整 Memory。
+
+历史对有效 dirty 候选取并集，最终值从原始完整 newest-first 层叠 Memory 获取。
+只有层声明的有序父视图与实际后缀等价时才使用 clean 标注，否则保留该层全部显式内容。
+当前 Data 和 Zero 覆盖历史，Hole 继承。执行状态和 sandbox_ref 只取最新 S。
+仅物理引用变更时原样保留位图；内存改变或无法证明等价的 rebase（含 rewrite --skip-verify）
+须重算或全 dirty。内容或元数据改变产生新 S identity。
+
+输出前检查既有 64 MiB ZIP tail、载体 extent 和索引预算。仅新增位图导致超预算时，
+新捕获可以全 dirty 三条目退化；普通 publish 必须保留已有元数据。稀疏映射超限时仅在
+旧逐制品覆盖范围内保留额外 Data，字节取当前完整真值；必要 Zero 不得变成 Hole。
+退化记录原因和额外 Data，仍受原预算约束。尺寸证据须在相同 codec/父链/状态下包含
+payload、位图/头/ZIP 开销、顶层/H 及按身份去重的可达本地制品。
+两架构统一 MISSING + KVM/CH/Go 日志，允许 x86 只读物化保守多报。Host Linux 5.10
+基线保持不变。能力识别和兼容边界见 [CH 0012](cloud-hypervisor_zh.md#312-0012--checkpoint-内存变化累计记录)。
 
 前缀必须属于当前沙箱的规范 `BaseDir/checkpoint`。先按完整来源绑定和 Bundle 实际成员选择
 物理载体，再比较路径。named location 或外部模板是边界，即使文件可在本机读取、甚至映射

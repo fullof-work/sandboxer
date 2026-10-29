@@ -150,10 +150,13 @@ type checkpointSourceStream struct {
 func (s *checkpointSourceStream) Close() error { return s.close() }
 
 type memoryHistory struct {
-	refs       []string
-	memory     *checkpointStream
-	historical fetch.Stream
-	base       string
+	refs                                  []string
+	memory                                *checkpointStream
+	historical                            fetch.Stream
+	fullMemory                            sparse.Source
+	proofCandidates                       sparse.Source // bitmap-only union, diagnostics only; never used to trim
+	base                                  string
+	configJSON, stateJSON, snapshotConfig []byte
 }
 
 func (h *memoryHistory) Close() error {
@@ -193,12 +196,15 @@ func prepareMemoryHistory(ctx context.Context, opts RunOptions, merge bool, size
 	if err != nil {
 		return nil, err
 	}
-	if len(prefix) == 0 || !merge && len(prefix) == 1 {
+	if len(prefix) == 0 {
 		h.refs, err = memoryRefsForSnapshot(b)
 		return h, err
 	}
 	h.refs = append([]string(nil), all[len(prefix):]...)
 	var layers []fetch.Stream
+	var candidates []fetch.Stream
+	var diagnostic []fetch.Stream
+	unproved := false
 	var top *snapshotfile.Root
 	defer func() {
 		if retErr != nil {
@@ -221,6 +227,32 @@ func prepareMemoryHistory(ctx context.Context, opts RunOptions, merge bool, size
 			return nil, err
 		}
 		layers = append(layers, root.Memory)
+		cfg, err := snapshot.ParseConfig(root.SnapshotConfig)
+		if err != nil {
+			return nil, err
+		}
+		hinted, err := snapshot.DirtyMemory(root.Memory, root.MemoryDirty)
+		if err != nil {
+			return nil, err
+		}
+		diagnostic = append(diagnostic, &checkpointSourceStream{Source: hinted, close: func() error { return nil }})
+		candidate := hinted
+		if root.MemoryDirty != nil && !memoryParentViewEqual(cfg.FromRefs, all[i+1:]) {
+			candidate = root.Memory
+			unproved = true
+			if opts.memoryLogf != nil {
+				opts.memoryLogf("dirty memory fallback: parent view unproved for history layer %s; retaining all explicit content", raw)
+			}
+		}
+		candidates = append(candidates, &checkpointSourceStream{Source: candidate, close: func() error { return nil }})
+		if !merge && len(prefix) == 1 && root.MemoryDirty == nil {
+			// Legacy/all-dirty single parent is already the desired H.
+			if err := root.Close(); err != nil {
+				return nil, err
+			}
+			h.refs, err = memoryRefsForSnapshot(b)
+			return h, err
+		}
 		if root.Memory.Size() != size {
 			return nil, fmt.Errorf("checkpoint memory layer size %d, expected %d", root.Memory.Size(), size)
 		}
@@ -228,7 +260,16 @@ func prepareMemoryHistory(ctx context.Context, opts RunOptions, merge bool, size
 			top = root
 		}
 	}
-	h.memory = &checkpointStream{Stream: fetch.NewLayered(layers...)}
+	full := fetch.NewLayered(layers...)
+	selected, err := snapshot.SelectMemory(full, fetch.NewLayered(candidates...))
+	if err != nil {
+		return nil, err
+	}
+	h.fullMemory = full
+	if unproved {
+		h.proofCandidates = fetch.NewLayered(diagnostic...)
+	}
+	h.memory = &checkpointStream{Stream: &checkpointSourceStream{Source: selected, close: full.Close}}
 	if merge {
 		h.base = prefix[0]
 		if err := h.validateMergeBase(ctx, size); err != nil {
@@ -251,6 +292,7 @@ func prepareMemoryHistory(ctx context.Context, opts RunOptions, merge bool, size
 	if err != nil {
 		return nil, err
 	}
+	h.configJSON, h.stateJSON, h.snapshotConfig = top.ConfigJSON, top.StateJSON, encoded
 	h.historical = &checkpointSourceStream{Source: source, close: h.memory.Close}
 	return h, nil
 }
@@ -412,4 +454,34 @@ func retainedCheckpointDependency(ctx context.Context, dep artifactDependency, o
 	}
 	ref.Path = filepath.Base(ref.Path)
 	return ref.String(), true, nil
+}
+
+// Reference identities bind complete S content and ordered parent declarations.
+// Physical path/location rewrites do not change identity. An unqualified file
+// or a different identity scheme cannot establish equivalence. This compares
+// the entire declared suffix, never a shared parent or sibling relationship.
+func memoryParentViewEqual(declared, actual []string) bool {
+	if len(declared) != len(actual) {
+		return false
+	}
+	identity := func(raw string) string {
+		r, err := manifest.ParseRef(raw)
+		if err != nil {
+			return ""
+		}
+		if r.Scheme == manifest.RefSchemeManifest {
+			return "manifest:" + r.Path
+		}
+		if r.Digest == "" {
+			return ""
+		}
+		return r.DigestScheme + ":" + r.Digest
+	}
+	for i, raw := range declared {
+		id := identity(raw)
+		if id == "" || id != identity(actual[i]) {
+			return false
+		}
+	}
+	return true
 }

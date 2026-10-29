@@ -25,6 +25,7 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/sparse"
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 	"github.com/kuasar-sandbox/sandboxer/pkg/artifact"
+	"github.com/kuasar-sandbox/sandboxer/pkg/chapi"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"github.com/kuasar-sandbox/sandboxer/pkg/ctl"
 	"github.com/kuasar-sandbox/sandboxer/pkg/guestlink"
@@ -369,6 +370,10 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 		return -1, fmt.Errorf("memfd create: %w", err)
 	}
 	defer memfd.Close()
+	dirty, err := memory.NewDirty(uint64(memfd.Size()))
+	if err != nil {
+		return -1, err
+	}
 
 	// AddressMap is shared between the va_report server (registers
 	// ProcessCH on receive) and the uffd Handler (Locate on each fault).
@@ -404,6 +409,7 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 			}
 			h, err := uffd.NewWithBackendUffd(uffdFD, addrMap, uffd.Config{
 				MemfdFD:    memfd.FD(),
+				Dirty:      dirty,
 				BackendVA:  memfd.Addr(),
 				Size:       memfd.Size(),
 				Source:     p.UffdSource,
@@ -454,6 +460,7 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 	addServer := func(sock string, backend vhost.Backend, label, path string, ro bool) error {
 		s := vhost.NewServer(sock, backend, logf)
 		s.SetReadFatal(reportReadFatal)
+		s.SetDirtyTracker(dirty.Mark)
 		s.SetMemoryLoader(func(ctx context.Context, off, length uint64) error {
 			select {
 			case <-ctx.Done():
@@ -677,17 +684,31 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 		enabled = enabled || p.owner.spec.EnableCheckpoint
 	}
 	snapDisks = bindCheckpointDisks(snapDisks, p.Disks)
+	dirtyCollector := chapi.NewDirtyMemoryCollector(chapi.Client{Sock: chSock, RespDeadline: p.SnapCfg.CHApiDeadline()}, uint64(memfd.Size()))
 	snapHandler := &SnapshotHandler{
-		MemoryLayout: func() ([]sparse.Extent, []sparse.Extent, error) {
+		CaptureMemory: func(ctx context.Context) (*memory.CaptureView, error) {
+			report, supported, err := dirtyCollector.Collect(ctx)
+			if err != nil {
+				return nil, err
+			}
+			if supported {
+				for _, region := range report.Regions {
+					if err := dirty.MergeWords(region.FileOffset, region.Size, region.Bitmap); err != nil {
+						return nil, err
+					}
+				}
+			}
 			uffdHandlerMu.Lock()
 			h := uffdHandler
 			uffdHandlerMu.Unlock()
 			if h == nil {
-				return nil, nil, fmt.Errorf("snapshot: UFFD handler is unavailable")
+				return nil, fmt.Errorf("dirty memory: UFFD handler unavailable")
 			}
-			return h.CaptureMemoryLayout(func() ([]sparse.Extent, error) {
-				return snapshot.WalkHoles(memfd.FD(), int64(memfd.Size()))
-			})
+			view, err := h.CaptureView()
+			if err == nil {
+				view.WorkingSetOnly = !supported
+			}
+			return view, err
 		},
 		EnableCheckpoint: enabled,
 		CheckpointDir:    filepath.Join(p.BaseDir, "checkpoint"),

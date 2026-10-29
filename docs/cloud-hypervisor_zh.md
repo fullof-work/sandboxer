@@ -38,7 +38,7 @@ HTTP allocator seccomp 修复。继续使用 CH v51.1 和 Host Linux 5.10 基线
 ### 1.2 补丁范围与未来演进
 
 每项补丁包含完整意图、对应修正及测试。下表旧编号指 #377 恢复的原十二项补丁。
-本次十一项维护补丁不包含 #374 的新脏页跟踪、累计 API、能力握手或快照格式改动。
+前十一项继续保持 #379 的维护范围。0012 独立维护完整累计内存日志；UFFD 接管继续使用原 ACK。
 
 | 补丁 | 目的与范围 | 来源 | 未来维护及移除条件 |
 | --- | --- | --- | --- |
@@ -53,6 +53,7 @@ HTTP allocator seccomp 修复。继续使用 CH v51.1 和 Host Linux 5.10 基线
 | 0009 | 完整 ARM SVE/FPSIMD/浮点控制状态 | 合并旧 0008–0011 | SVE 已在上游，仅提交剩余 FPCR/FPSR 修正及原生测试。选定版本覆盖各部分后逐项移除回补。 |
 | 0010 | 先恢复时钟，再设备，最后 vCPU | 旧 0012 | 临时上游回补。固定版本包含修复且恢复顺序验证通过后移除。 |
 | 0011 | HTTP allocator 受限读取与映射增长，含真实 BPF 测试 | 适配 v51.1 的上游 seccomp 修复 | 临时上游回补。选定版本具备等价权限且正反过滤测试通过后移除。 |
+| 0012 | CPU/CH 生命周期累计位图、原始写入、初始化、累计 API 及测试 | 已撤回 #375 的日志部分，适配 #379 | 固定基线 API 暂自行维护并推动上游接口讨论；原始写入对齐上游 3777ba8d。仅在等价源码及集成验证成立后移除对应部分。 |
 
 上游核对固定于 2026-10-29 的
 [`0674238bb`](https://github.com/cloud-hypervisor/cloud-hypervisor/commit/0674238bb09082dfe55a4d3215eebf35ee0f5bb1)。
@@ -446,6 +447,41 @@ cargo test --locked -p vmm --no-default-features --features kvm --lib seccomp_fi
 
 这是 allocator 兼容回补，不新增脏页 API 或响应格式。mremap 是上游兼容修复，
 并不能证明它是此前每次 API EOF 所触发的系统调用。
+
+### 3.12 0012 — checkpoint 内存变化累计记录
+
+外部 RAM 在内存初始化阶段启用 KVM 日志，并在任何清理前保存软件 seed 写入。
+CPU/KVM、CH AtomicBitmap 和原始写入（net RX、vsock buffer、快照 reset/event/used ring）
+共同进入生命周期累计集合。校验后的可写范围在交出原始指针前先标记，保守覆盖部分写入和失败。
+上游 [3777ba8d](https://github.com/cloud-hypervisor/cloud-hypervisor/commit/3777ba8ded440cca2d953cd40e8b1ee43ae6c682)
+已修复新代码的 net readv 覆盖；本 v51.1 适配还保留失败时的候选，不引入无关 net 重构。
+
+`GET /api/v1/vm.dirty-memory` 返回 version=1、page_shift=12 以及 slot/GPA/size/
+file_offset/bitmap。每个已消费来源先转移到累计集合，再读取下一个来源或 slot。
+失败 slot 在报错前全部记脏；registration 变化保留全部已知范围。HTTP 响应丢失和重试
+不清除累计记录。迁移 start/read/stop 不能消费或关闭 checkpoint 拥有的日志：外部
+checkpoint RAM 在访问迁移目标或进入失败清理前即拒绝 live migration。
+
+`va_report` 保留现有字段和 FD，仅增加可选 `file_offset`。ACK 仍为
+`{"type":"ack"}`，只确认接管，不声明日志能力。不新增版本 ACK、WP 协商、预物化或
+内核基线。新 CH 自行初始化累计记录。宿主首次实际捕获时识别 API：完整合法响应选择原生
+日志，完整 404 选择工作集兼容，其他错误使捕获失败。结果固定于当前 CH 进程；原生模式
+后续遇到错误不得降级。API 数据版本、页粒度和区域校验仍必须执行。
+
+兼容基线是 v51.1 加 #379 的 0001–0011，不含 0012。它沿用相同惰性源和释放安全的
+Data/Zero/Hole 捕获，全部显式工作集内容保守按 dirty 处理。冻结的 #379 之前 0004
+二进制仍有已单独修复的释放缺陷；404 不能证明已修复。撤回的 #375 版本 ACK 协议
+不属于支持目标。restore 在启动 CH 前校验单 ram0、shared、非 prefault、4 KiB、
+按序连续 memfd offset 和空 CH memory-ranges；两架构的 GPA 缺口仍遵守旧无偏移报告契约。
+
+累计日志后续修正和测试均回折 0012；释放顺序属于 0004，HTTP allocator 权限属于 0011。
+通用原始写入修正跟随上游，生命周期 API 在上游接口达成一致前自行维护。上游核对到
+d1719ac8，相比 ad5f3eea 仅新增无关的迁移超时处理；继续固定 CH v51.1。
+
+验证覆盖原生 KVM slot 失败/重试、迁移日志所有权拒绝、net/vsock 原始写入、初始化，
+以及 `snapshot.dirty-memory` 的完整 RAM 比较、同状态尺寸和响应丢失。
+常规 CI 的 `snapshot.ch-compat` 隐藏日志接口，验证回退与探测缓存；发布验收还需用
+实际按 #379 重建的 CH 在 x86_64/aarch64 适用路径运行同一兼容测试。
 
 ## 4. 构建工作流
 

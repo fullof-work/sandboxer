@@ -23,7 +23,7 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/tarstream"
 	"github.com/kuasar-sandbox/sandboxer/pkg/chapi"
 	"github.com/kuasar-sandbox/sandboxer/pkg/config"
-	"github.com/kuasar-sandbox/sandboxer/pkg/snapshotfile"
+	"github.com/kuasar-sandbox/sandboxer/pkg/memory"
 )
 
 // Quiescer abstracts the vhost backend's pause/resume hooks. A typical
@@ -36,14 +36,21 @@ type Quiescer interface {
 
 // Sources gathers the inputs Take needs.
 type Sources struct {
-	CheckpointID string
-	Context      context.Context
-	SandboxID    string       // <sid> for output filename / symlink
-	APISock      string       // CH api socket
-	MemfdFD      int          // memfd backing the zone (read-only here; CH is paused)
-	MemfdSize    int64        // ramSize
-	MemoryLayout MemoryLayout // optional only for callers without a live UFFD handler
-	StagingDir   string       // CH /vm.snapshot dest for config.json/state.json (caller creates+removes)
+	MemoryLayout MemoryLayout // standalone callers with an existing stable layout
+	// CaptureMemory collects CH logs then freezes M/D/R after snapshot writes.
+	CaptureMemory    func(context.Context) (*memory.CaptureView, error)
+	MemoryWorkingSet bool
+	// MemoryFallbackBase is the full owned history, before dirty trimming.
+	MemoryFallbackBase sparse.Source
+	// MemoryProofCandidates is a diagnostic bitmap-only history union, never an output selection.
+	MemoryProofCandidates sparse.Source
+	CheckpointID          string
+	Context               context.Context
+	SandboxID             string // <sid> for output filename / symlink
+	APISock               string // CH api socket
+	MemfdFD               int    // memfd backing the zone (read-only here; CH is paused)
+	MemfdSize             int64  // ramSize
+	StagingDir            string // CH /vm.snapshot dest for config.json/state.json (caller creates+removes)
 
 	// Diffs are the logical disks' writable diffs to capture, in order: Diffs[0]
 	// is the root, Diffs[1:] are the boot.disks[] data disks (boot.disks[]
@@ -272,48 +279,77 @@ func Take(s Sources, sink ArtifactSink, resumeAfter bool) (_ *Outputs, retErr er
 		return nil, fmt.Errorf("build snapshot.cfg: %w", err)
 	}
 	// T6: [memory][ZIP] bundle → sink, streamed from the memfd (CH paused, so
-	// the mapping is stable). Resident Data is read; released holes are explicit
-	// Zero, and only untouched holes may inherit a parent.
-	var memHoles, memZeros []sparse.Extent
-	if s.MemoryLayout != nil {
-		memHoles, memZeros, err = s.MemoryLayout()
+	// the mapping is stable); only resident pages are read/transferred.
+	var memorySource sparse.Source
+	var dirty []byte
+	var workingMemory sparse.Source
+	if s.CaptureMemory != nil {
+		view, err := s.CaptureMemory(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("capture memory view: %w", err)
+		}
+		if view.Size != uint64(s.MemfdSize) {
+			return nil, fmt.Errorf("capture memory size mismatch")
+		}
+		memorySource, dirty, err = CaptureMemory(fdReaderAt(s.MemfdFD), view, s.MemoryWorkingSet)
+		if err != nil {
+			return nil, err
+		}
+		workingMemory, _, err = CaptureMemory(fdReaderAt(s.MemfdFD), view, true)
+		if err != nil {
+			return nil, err
+		}
 	} else {
-		memHoles, err = WalkHoles(s.MemfdFD, s.MemfdSize)
+		var holes, zeros []sparse.Extent
+		if s.MemoryLayout != nil {
+			holes, zeros, err = s.MemoryLayout()
+		} else {
+			holes, err = WalkHoles(s.MemfdFD, s.MemfdSize)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("memory layout: %w", err)
+		}
+		memorySource = &releasedMemorySource{fd: s.MemfdFD, size: uint64(s.MemfdSize), holes: holes, zeros: zeros}
 	}
-	if err != nil {
-		return nil, fmt.Errorf("memory layout: %w", err)
+	if workingMemory == nil {
+		workingMemory = memorySource
 	}
-	var memorySource fetch.Stream = &releasedMemorySource{
-		fd: s.MemfdFD, size: uint64(s.MemfdSize), holes: memHoles, zeros: memZeros,
+	fallbackCoverage := DataCoverage(workingMemory)
+	fallbackValues := workingMemory
+	if s.MemoryFallbackBase != nil {
+		fallbackCoverage = fetch.NewLayered(memoryBorrow{fallbackCoverage}, memoryBorrow{s.MemoryFallbackBase})
+		fallbackValues = fetch.NewLayered(memoryBorrow{workingMemory}, memoryBorrow{s.MemoryFallbackBase})
 	}
 	memoryBaseOpen := false
 	var closeMemoryBase func() error
 	defer func() {
 		if memoryBaseOpen {
-			if closeErr := closeMemoryBase(); closeErr != nil {
-				retErr = errors.Join(retErr, fmt.Errorf("close memory merge base: %w", closeErr))
-			}
+			retErr = errors.Join(retErr, closeMemoryBase())
 		}
 	}()
+	var proofCandidates sparse.Source
 	if s.MergeBaseSnapshot != "" {
+		if s.MemoryProofCandidates != nil {
+			proofCandidates = fetch.NewLayered(memoryBorrow{memorySource}, memoryBorrow{s.MemoryProofCandidates})
+		}
 		base, _, berr := openMergeBaseWithOpener(ctx, s.MergeBaseSnapshot, s.MemfdSize, s.LocalCodec, s.LocalRequired, s.MemoryMergeBaseOpener)
 		if berr != nil {
 			return nil, fmt.Errorf("merge memory base: %w", berr)
 		}
 		// Reuse the bounded/retrying parent view used for disk exports. Only
 		// Hole inherits; explicit Zero must mask old parent contents.
-		memorySource = fetch.NewLayered(memorySource, &payloadMergeBase{Stream: base.stream, size: uint64(s.MemfdSize), ctx: ctx})
-		closeMemoryBase = memorySource.Close
+		merged := fetch.NewLayered(memoryBorrow{memorySource}, &payloadMergeBase{Stream: base.stream, size: uint64(s.MemfdSize), ctx: ctx})
+		memorySource = merged
+		closeMemoryBase = merged.Close
 		memoryBaseOpen = true
+		// C and H are dirty relative to the retained external suffix.
+		dirty = nil
 	}
-	out.MemoryResident, err = explicitMemoryBytes(memorySource)
-	if err != nil {
-		return nil, fmt.Errorf("memory runs: %w", err)
-	}
-	snapshotSource, err := snapshotfile.BuildSource(memorySource, configJSON, stateJSON, snapshotCfg)
+	snapshotSource, storage, err := BuildCaptureSource(ctx, sink, memorySource, dirty, configJSON, stateJSON, snapshotCfg, fallbackCoverage, fallbackValues, proofCandidates, logf)
 	if err != nil {
 		return nil, fmt.Errorf("build Snapshot S: %w", err)
 	}
+	out.MemoryResident = storage.DataBytes + storage.ZeroBytes
 	out.SnapshotRef, out.SnapshotPath, err = sink.AbsorbSnapshot(ctx, snapshotSource)
 	var memoryBaseCloseErr error
 	if memoryBaseOpen {
@@ -403,3 +439,8 @@ func absorbOverlayWithOpener(ctx context.Context, sink ArtifactSink, d DiskDiff,
 	}
 	return sink.AbsorbOverlay(ctx, src, holes)
 }
+
+// memoryBorrow lends a three-state source without transferring its owner.
+type memoryBorrow struct{ sparse.Source }
+
+func (memoryBorrow) Close() error { return nil }

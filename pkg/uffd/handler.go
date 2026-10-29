@@ -13,6 +13,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/kuasar-sandbox/sandboxer/pkg/memory"
 	"golang.org/x/sys/unix"
 )
 
@@ -45,6 +46,7 @@ const (
 // Config gathers everything the handler needs from the caller. Memfd /
 // BackendVA / Size come from pkg/memory.Memfd.
 type Config struct {
+	Dirty *memory.Dirty
 	// Context follows the VM read lifetime. ReadFatal reports a mandatory
 	// source failure to its owner and must not synchronously join this handler.
 	Context   context.Context
@@ -100,7 +102,9 @@ type Config struct {
 //
 // 5.10+ kernel compatible — no MINOR_SHMEM / UFFDIO_CONTINUE required.
 type Handler struct {
-	cfg Config
+	cfg          Config
+	released     *memory.Dirty
+	captureError error // guarded by installMu; sticky registration/event failure
 
 	// Lock order: admission (uffdsMu), installMu, AddressMap, PageState.
 	// installMu covers nonblocking event read + release publication and each
@@ -188,7 +192,7 @@ type handlerStats struct {
 	removeEventsBatched atomic.Uint64 // events that went through the batch path (avg events/syscall = removeEventsBatched / madviseCalls)
 	backendLookupMiss   atomic.Uint64 // EVENT_REMOVE with no backend VMA covering the offset (registration bug)
 
-	inflight        atomic.Int64 // faults currently being serviced (gauge; ≤ NumWorkers)
+	inflight        atomic.Int64 // faults currently being serviced by workers
 	inflightHWM     atomic.Uint64
 	queueDepthHWM   atomic.Uint64
 	faultQueueWait  latHist
@@ -282,6 +286,14 @@ func NewWithBackendUffd(uffdCFromCH int, addrMap *AddressMap, cfg Config) (*Hand
 		return nil, err
 	}
 
+	if cfg.Dirty == nil {
+		cfg.Dirty, _ = memory.NewDirty(uint64(cfg.Size))
+	}
+	if cfg.Dirty.Size() != uint64(cfg.Size) {
+		_ = unix.Close(epfd)
+		return nil, fmt.Errorf("uffd: dirty RAM size mismatch")
+	}
+	released, _ := memory.NewDirty(uint64(cfg.Size))
 	numPages := cfg.Size / PageSize
 	state := NewPageStateMap(numPages)
 
@@ -310,8 +322,8 @@ func NewWithBackendUffd(uffdCFromCH int, addrMap *AddressMap, cfg Config) (*Hand
 	}
 	h := &Handler{
 		cfg:                 cfg,
+		released:            released,
 		registrationChanged: make(chan struct{}),
-		uffds:               []*os.File{os.NewFile(uintptr(uffdCFromCH), "uffd_C_chVA_region0")},
 		addrMap:             addrMap,
 		state:               state,
 		epfd:                epfd,
@@ -327,6 +339,13 @@ func NewWithBackendUffd(uffdCFromCH int, addrMap *AddressMap, cfg Config) (*Hand
 		tailIdle:            make(chan struct{}, 1),
 		ops:                 realUffdOps,
 	}
+	if err := h.seedRegion(uffdCFromCH); err != nil {
+		cancel()
+		_ = unix.Close(epfd)
+		return nil, err
+	}
+	// Adopt only after every fallible constructor step; the caller owns the FD on error.
+	h.uffds = []*os.File{os.NewFile(uintptr(uffdCFromCH), "uffd_C_chVA_region0")}
 	return h, nil
 }
 
@@ -382,6 +401,12 @@ func (h *Handler) AddUffd(uffdFD int, va, size, offset uint64) error {
 		}
 	}
 	h.addrMap.mu.Unlock()
+	if err := h.seedRegion(uffdFD); err != nil {
+		h.captureError = err
+		_ = unix.EpollCtl(h.epfd, unix.EPOLL_CTL_DEL, uffdFD, nil)
+		h.addrMap.removeStaged(va, size, offset)
+		return err
+	}
 	h.uffds = append(h.uffds, os.NewFile(uintptr(uffdFD), "uffd_CH_region"))
 	close(h.registrationChanged)
 	h.registrationChanged = make(chan struct{})
@@ -477,6 +502,7 @@ func (h *Handler) runReader() {
 			if errors.Is(err, unix.EBADF) {
 				return
 			}
+			h.invalidateCapture(fmt.Errorf("uffd: epoll_wait: %w", err))
 			h.logf("uffd: epoll_wait: %v", err)
 			h.stats.errors.Add(1)
 			return
@@ -509,8 +535,14 @@ func (h *Handler) drain(fd int, buf []byte, msgSize int) {
 				}
 			}
 		}
+		if !h.readerStop.Load() && ((err != nil && !errors.Is(err, unix.EAGAIN) && !errors.Is(err, unix.EINTR)) || (err == nil && (n == 0 || n%msgSize != 0))) {
+			h.captureError = fmt.Errorf("uffd: event stream fd=%d bytes=%d: %v", fd, n, err)
+		}
 		h.installMu.Unlock()
 		if err != nil {
+			if errors.Is(err, unix.EINTR) {
+				continue
+			}
 			if errors.Is(err, unix.EAGAIN) {
 				return
 			}
@@ -544,6 +576,7 @@ func (h *Handler) dispatch(msg *uffdMsg, fromFD int) {
 		pf := (*uffdMsgPagefault)(unsafe.Pointer(&msg.Arg[0]))
 		offset, ok := h.addrMap.Locate(pf.Address)
 		if !ok {
+			h.invalidateCapture(fmt.Errorf("uffd: fault registration missing at 0x%x", pf.Address))
 			h.logf("uffd: fault at unknown va 0x%x (fd=%d)", pf.Address, fromFD)
 			h.stats.errors.Add(1)
 			_ = ioctlUffdWake(fromFD, pf.Address&^(PageSize-1), PageSize)
@@ -562,6 +595,7 @@ func (h *Handler) dispatch(msg *uffdMsg, fromFD int) {
 		h.dispatchRelease(msg, fromFD)
 		h.installMu.Unlock()
 	default:
+		h.invalidateCapture(fmt.Errorf("uffd: unexpected event 0x%x", msg.Event))
 		h.logf("uffd: unexpected event 0x%x on fd=%d", msg.Event, fromFD)
 	}
 }
@@ -572,6 +606,7 @@ func (h *Handler) dispatchRelease(msg *uffdMsg, fd int) {
 	rm := (*uffdMsgRemove)(unsafe.Pointer(&msg.Arg[0]))
 	h.handleRemoveLocked(rm.Start, rm.End, fd)
 	if msg.Event == uffdEventUnmap {
+		h.captureError = fmt.Errorf("uffd: UNMAP invalidated capture registration")
 		h.addrMap.invalidate(fd, rm.Start, rm.End)
 		// Reading UNMAP lets the unmapping thread resume, but does not wake
 		// page faults whose events we already consumed. An in-flight worker
@@ -607,6 +642,7 @@ func (h *Handler) handleRemove(startVA, endVA uint64, fromFD int) {
 
 func (h *Handler) handleRemoveLocked(startVA, endVA uint64, fromFD int) {
 	if endVA <= startVA || startVA%PageSize != 0 || endVA%PageSize != 0 {
+		h.captureError = fmt.Errorf("uffd: invalid release range")
 		return
 	}
 	// Walk intersections without retaining AddressMap's lock across reclaim.
@@ -624,8 +660,15 @@ func (h *Handler) handleRemoveLocked(startVA, endVA uint64, fromFD int) {
 			}
 		}
 		h.addrMap.mu.RUnlock()
-		if next == 0 {
+		if next == 0 || next-length != cursor {
+			h.captureError = fmt.Errorf("uffd: release registration gap")
 			break
+		}
+		if h.released != nil {
+			_ = h.released.Mark(startOff, length)
+		}
+		if h.cfg.Dirty != nil {
+			_ = h.cfg.Dirty.Mark(startOff, length)
 		}
 		h.state.SetRange(startOff/PageSize, (startOff+length)/PageSize, StateReleased)
 		select {
