@@ -1,22 +1,21 @@
-From c9efa1521a83d21c070b7d5c062bf9bb177962a2 Mon Sep 17 00:00:00 2001
+From caffb52b9b59949b7f75b7a1526d11b2f23854f0 Mon Sep 17 00:00:00 2001
 From: Chen Xiaohui <graych@gmail.com>
 Date: Wed, 28 Oct 2026 23:18:48 +0800
-Subject: [PATCH 13/13] vmm: accumulate checkpoint dirty memory and negotiate
- atomic WP fills
+Subject: [PATCH] vmm: accumulate checkpoint dirty memory
 
 ---
  fuzz/fuzz_targets/http_api.rs      |   8 +-
  net_util/src/queue_pair.rs         |   1 +
- virtio-devices/src/balloon.rs      |  29 ++---
- virtio-devices/src/vsock/packet.rs |  17 ++-
+ virtio-devices/src/balloon.rs      |  29 ++-----
+ virtio-devices/src/vsock/packet.rs |  17 +++-
  vmm/src/api/http/http_endpoint.rs  |   7 +-
- vmm/src/api/http/mod.rs            |  10 +-
- vmm/src/api/mod.rs                 |  34 ++++++
- vmm/src/dirty_memory.rs            |  92 ++++++++++++++++
- vmm/src/lib.rs                     |  11 ++
- vmm/src/memory_manager.rs          | 166 +++++++++++++++++++++++++----
+ vmm/src/api/http/mod.rs            |  10 ++-
+ vmm/src/api/mod.rs                 |  34 ++++++++
+ vmm/src/dirty_memory.rs            |  92 +++++++++++++++++++++
+ vmm/src/lib.rs                     |  11 +++
+ vmm/src/memory_manager.rs          | 124 ++++++++++++++++++++++++-----
  vmm/src/vm.rs                      |   8 ++
- 11 files changed, 330 insertions(+), 53 deletions(-)
+ 11 files changed, 291 insertions(+), 50 deletions(-)
  create mode 100644 vmm/src/dirty_memory.rs
 
 diff --git a/fuzz/fuzz_targets/http_api.rs b/fuzz/fuzz_targets/http_api.rs
@@ -390,7 +389,7 @@ index dcf6614..c0df903 100644
          if let Some(ref mut vm) = self.vm {
              let info = vm.counters().inspect_err(|e| {
 diff --git a/vmm/src/memory_manager.rs b/vmm/src/memory_manager.rs
-index 7c4528a..5ff8591 100644
+index 7c4528a..9d9c714 100644
 --- a/vmm/src/memory_manager.rs
 +++ b/vmm/src/memory_manager.rs
 @@ -164,6 +164,8 @@ struct ArchMemRegion {
@@ -582,88 +581,17 @@ index 7c4528a..5ff8591 100644
      ) -> Result<(), Error> {
          use std::io::IoSlice;
          use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-@@ -1471,7 +1547,7 @@ impl MemoryManager {
-         if raw < 0 {
-             return Err(Error::UffdRegister(io::Error::last_os_error()));
-         }
--        let uffd: OwnedFd = unsafe { OwnedFd::from_raw_fd(raw as i32) };
-+        let mut uffd: OwnedFd = unsafe { OwnedFd::from_raw_fd(raw as i32) };
- 
-         // UFFDIO_API: negotiate features. The handler doesn't need
-         // EXACT_ADDRESS / WP / MINOR; MISSING_SHMEM (for our memfd) +
-@@ -1515,6 +1591,26 @@ impl MemoryManager {
-             return Err(Error::UffdRegister(io::Error::last_os_error()));
-         }
- 
-+        const WP_FEATURES: u64 = (1 << 0) | (1 << 12); // PAGEFAULT_FLAG_WP, WP_HUGETLBFS_SHMEM
-+        let mut copy_mode_wp =
-+            cfg!(target_arch = "x86_64") && api_req.features & WP_FEATURES == WP_FEATURES;
-+        if copy_mode_wp {
-+            let raw =
-+                unsafe { libc::syscall(libc::SYS_userfaultfd, libc::O_CLOEXEC | libc::O_NONBLOCK) };
-+            if raw < 0 {
-+                return Err(Error::UffdRegister(io::Error::last_os_error()));
-+            }
-+            uffd = unsafe { OwnedFd::from_raw_fd(raw as i32) };
-+            api_req.features = UFFD_FEATURE_MISSING_SHMEM
-+                | UFFD_FEATURE_EVENT_REMOVE
-+                | UFFD_FEATURE_EVENT_UNMAP
-+                | UFFD_FEATURE_THREAD_ID
-+                | WP_FEATURES;
-+            if unsafe { libc::ioctl(uffd.as_raw_fd(), UFFDIO_API_IOCTL, &mut api_req) } < 0 {
-+                return Err(Error::UffdRegister(io::Error::last_os_error()));
-+            }
-+        }
-+
-         // UFFDIO_REGISTER MISSING on [addr, addr+size) in CH's mm.
-         const UFFDIO_REGISTER: libc::c_ulong = 0xc020_aa00;
-         const UFFDIO_REGISTER_MODE_MISSING: u64 = 1;
-@@ -1534,7 +1630,7 @@ impl MemoryManager {
-                 start: addr,
-                 len: size as u64,
-             },
--            mode: UFFDIO_REGISTER_MODE_MISSING,
-+            mode: UFFDIO_REGISTER_MODE_MISSING | if copy_mode_wp { 2 } else { 0 },
-             ioctls: 0,
-         };
-         let r = unsafe {
-@@ -1544,9 +1640,23 @@ impl MemoryManager {
-                 &mut reg_req as *mut _ as *mut libc::c_void,
-             )
-         };
--        if r < 0 {
-+        if r < 0 && copy_mode_wp && io::Error::last_os_error().raw_os_error() == Some(libc::EINVAL)
-+        {
-+            // A feature-advertising kernel can still reject WP for this region.
-+            // Register MISSING and explicitly negotiate conservative fallback.
-+            copy_mode_wp = false;
-+            reg_req.mode = UFFDIO_REGISTER_MODE_MISSING;
-+            if unsafe { libc::ioctl(uffd.as_raw_fd(), UFFDIO_REGISTER, &mut reg_req) } < 0 {
-+                return Err(Error::UffdRegister(io::Error::last_os_error()));
-+            }
-+        } else if r < 0 {
-             return Err(Error::UffdRegister(io::Error::last_os_error()));
-         }
-+        if copy_mode_wp && reg_req.ioctls & (1 << 6) == 0 {
-+            return Err(Error::UffdSocketBadResp(
-+                "WP registration lacks WRITEPROTECT ioctl".into(),
-+            ));
-+        }
- 
-         // Send va_report + uffd fd via SCM_RIGHTS, then read ack.
-         let mut socket = UnixStream::connect(socket_path)
-@@ -1554,6 +1664,10 @@ impl MemoryManager {
+@@ -1554,6 +1630,9 @@ impl MemoryManager {
  
          let body = serde_json::to_vec(&serde_json::json!({
              "type":     "va_report",
 +            "version": 1,
 +            "page_shift": 12,
 +            "file_offset": file_offset,
-+            "copy_mode_wp": copy_mode_wp,
              "zone_id":  zone_id,
              "va_start": addr,
              "size":     size as u64,
-@@ -1602,7 +1716,9 @@ impl MemoryManager {
+@@ -1602,7 +1681,9 @@ impl MemoryManager {
          // Read ack (no fd attached on response).
          use std::io::Read;
          let mut len_buf = [0u8; 4];
@@ -674,7 +602,7 @@ index 7c4528a..5ff8591 100644
          let resp_len = u32::from_le_bytes(len_buf) as usize;
          if resp_len > 64 * 1024 {
              return Err(Error::UffdSocketBadResp(format!(
-@@ -1611,10 +1727,18 @@ impl MemoryManager {
+@@ -1611,10 +1692,17 @@ impl MemoryManager {
          }
          let mut resp = vec![0u8; resp_len];
          socket.read_exact(&mut resp).map_err(Error::UffdSocketIo)?;
@@ -686,10 +614,9 @@ index 7c4528a..5ff8591 100644
 -            Some("ack") => {}
 +            Some("ack") => {
 +                if parsed.get("version").and_then(|v| v.as_u64()) != Some(1)
-+                    || parsed.get("copy_mode_wp").and_then(|v| v.as_bool()) != Some(copy_mode_wp)
 +                {
 +                    return Err(Error::UffdSocketBadResp(
-+                        "handler did not acknowledge dirty/WP capabilities".into(),
++                        "handler did not acknowledge memory registration".into(),
 +                    ));
 +                }
 +            }

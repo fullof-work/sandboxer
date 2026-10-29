@@ -160,9 +160,12 @@ stop_vm
 
 # Exercise real CH MADV/REMOVE/PUNCH, then restore released Zero and reuse RAM.
 restore "$CP/$(ref_path "$OUT/recovered.json")" release
- guest release >"$OUT/balloon-guest-release.json"
-python3 "$SANDBOXER_LIB/dirty_memory_balloon.py" "$WORK/runtime/$SID/ch.sock" 100663296 >"$OUT/balloon-inflate.jsonl"
+guest release >"$OUT/balloon-guest-release.json"
+# Arm a single real balloon operation at the next pause boundary, after the
+# production snapshot mutation gate excludes normal memory-policy resizes.
+printf '%s\n' 100663296 >"$DIRTY_OBSERVATIONS/balloon-before-pause"
 capture false balloon
+cp "$DIRTY_OBSERVATIONS/balloon-inflate.jsonl" "$OUT/balloon-inflate.jsonl"
 python3 - "$OUT/balloon-comparison.json" <<'PYTEST'
 import json,sys
 r=json.load(open(sys.argv[1]));assert r['layers'][0]['Zero']>0,r
@@ -170,6 +173,19 @@ PYTEST
 BALLOON="$CP/$(ref_path "$OUT/balloon.json")"
 stop_vm
 restore "$BALLOON" reuse
+# Exec readiness precedes StartRestore normalization. The saved 96 MiB target
+# must be accepted before our deflate request, or normalization can undo it.
+python3 - "$OUT/reuse.log" <<'PYNORMALIZE'
+import pathlib,sys,time
+path=pathlib.Path(sys.argv[1])
+deadline=time.monotonic()+20
+while time.monotonic()<deadline:
+ if "memory: restore SafeTarget normalization accepted target=100663296" in path.read_text():
+  break
+ time.sleep(.1)
+else:
+ raise RuntimeError("restored balloon normalization did not complete")
+PYNORMALIZE
 python3 "$SANDBOXER_LIB/dirty_memory_balloon.py" "$WORK/runtime/$SID/ch.sock" 0 >"$OUT/balloon-deflate.jsonl"
 guest reuse >"$OUT/balloon-guest-reuse.json"
 capture true reuse

@@ -43,14 +43,14 @@ type VAReportServer struct {
 	// handler should adopt the uffd fd (the server passes ownership)
 	// and start its goroutines. Returning an error causes the
 	// va_report to be NAK'd and the fd closed.
-	OnReady func(uffdFD int, vaStart, size, memfdOffset uint64, writeProtect bool) error
+	OnReady func(uffdFD int, vaStart, size, memfdOffset uint64) error
 
 	// OnRegister is invoked synchronously on each SUBSEQUENT va_report.
 	// The handler should adopt the new uffd fd (also passed by
 	// ownership) and add it to its epoll set. Returning an error NAKs.
 	// May be left nil; in that case any second va_report is rejected
 	// (single-region mode).
-	OnRegister func(uffdFD int, vaStart, size, memfdOffset uint64, writeProtect bool) error
+	OnRegister func(uffdFD int, vaStart, size, memfdOffset uint64) error
 
 	connMu            sync.Mutex
 	activeConn        *net.UnixConn
@@ -149,14 +149,12 @@ type vaReportMsg struct {
 	Version    uint32  `json:"version"`
 	PageShift  uint32  `json:"page_shift"`
 	FileOffset *uint64 `json:"file_offset"`
-	CopyModeWP bool    `json:"copy_mode_wp"`
 }
 
 type ackMsg struct {
-	Type       string `json:"type"`
-	Msg        string `json:"msg,omitempty"`
-	Version    uint32 `json:"version,omitempty"`
-	CopyModeWP bool   `json:"copy_mode_wp"`
+	Type    string `json:"type"`
+	Msg     string `json:"msg,omitempty"`
+	Version uint32 `json:"version,omitempty"`
 }
 
 func (s *VAReportServer) handle(conn *net.UnixConn) {
@@ -217,7 +215,7 @@ func (s *VAReportServer) handle(conn *net.UnixConn) {
 		} else {
 			adoptErr = s.AddrMap.RegisterVMA(ProcessCH, req.VAStart, req.Size, memfdOffset)
 			if adoptErr == nil {
-				adoptErr = s.OnReady(uffdFD, req.VAStart, req.Size, memfdOffset, req.CopyModeWP)
+				adoptErr = s.OnReady(uffdFD, req.VAStart, req.Size, memfdOffset)
 				if adoptErr != nil {
 					s.AddrMap.removeStaged(req.VAStart, req.Size, memfdOffset)
 				}
@@ -226,7 +224,7 @@ func (s *VAReportServer) handle(conn *net.UnixConn) {
 	} else {
 		// Handler stages the interval and atomically commits fd adoption with
 		// installation visibility. A failed epoll add leaves neither published.
-		adoptErr = s.OnRegister(uffdFD, req.VAStart, req.Size, memfdOffset, req.CopyModeWP)
+		adoptErr = s.OnRegister(uffdFD, req.VAStart, req.Size, memfdOffset)
 	}
 	if adoptErr != nil {
 		s.mu.Unlock()
@@ -243,7 +241,7 @@ func (s *VAReportServer) handle(conn *net.UnixConn) {
 
 	s.Logf("vareport: accepted region #%d zone=%s va=0x%x size=%d memfd_off=0x%x uffd_fd=%d",
 		regionIdx, req.ZoneID, req.VAStart, req.Size, memfdOffset, uffdFD)
-	if err := writeLPJSON(conn, ackMsg{Type: "ack", Version: req.Version, CopyModeWP: req.CopyModeWP}); err != nil {
+	if err := writeLPJSON(conn, ackMsg{Type: "ack", Version: req.Version}); err != nil {
 		s.Logf("vareport: write ack: %v", err)
 	}
 }

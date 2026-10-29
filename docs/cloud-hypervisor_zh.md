@@ -81,7 +81,7 @@ CH `--memory-zone` 增加两个 key:
 - **仅写 fd**:CH 把 fd 当 backing,跳过 memfd_create;snapshot 时跳过 dump;
   restore 时不 fill。这条独立成立(无 uffd 仍可外部托管)
 - **fd + uffd_socket 同时写**:在 fd 行为基础上叠加,CH 内 `userfaultfd()`
-  → `UFFDIO_API` → `UFFDIO_REGISTER MISSING (plus negotiated WP) on chVA` → `connect uffd_socket`
+  → `UFFDIO_API` → `UFFDIO_REGISTER MISSING on chVA` → `connect uffd_socket`
   → `sendmsg(va_report; SCM_RIGHTS=uffd_fd)` → 等 ack。ack 之前 vCPU 不允许
   跑
 
@@ -205,9 +205,8 @@ worker 退出后才替换内存表。
 队列能够推进；`ENOENT` 或无效注册使请求失败。真正的 CPU MISSING fault
 遇到 Loaded 页仍走独立的已回收页处理路径。
 
-当前 `va_report` v1 显式传递 `version=1`、`page_shift=12`、`file_offset`
-及 `copy_mode_wp` 能力。x86 尝试 MISSING+WP 注册，并要求 ACK 确认原子
-COPY_MODE_WP；无法协商时保守记录物化页为 dirty。ARM 使用原生 KVM 日志。
+当前 `va_report` v1 显式传递 `version=1`、`page_shift=12` 和 `file_offset`。
+x86 与 ARM 均使用 MISSING 注册和普通 COPY；ACK 确认描述符及坐标映射已被接管。
 memfd 偏移通过内部回调传递，并与实际 CH VA 区间及持有的 UFFD fd 关联。只有成功接管后，新注册才可用于加载；接管失败
 回滚暂存的地址映射，由回调调用方清理 fd。加载可取消地等待注册就绪，并在区域
 边界拆分。UNMAP 使对应注册区间失效；REMOVE 释放页内容但保留注册。
@@ -373,7 +372,7 @@ identity；不具备对应身份的既有二进制不能用于验证回移。重
 `snapshot.restore`，之后执行普通全量 E2E。记录原生架构和产品来源；仅交叉编译不会
 执行真实 KVM resume。小样本成功不能确定故障率，也不能据此诊断其他恢复错误。
 
-### 3.10 0013–0014 — 累计 dirty memory 与原子 clean 填充
+### 3.10 0013–0014 — 累计 dirty memory
 
 每个外部托管 RAM 实例初始化时就启用 MemoryManager 级 KVM dirty logging，
 先消费并累计已有软件 bitmap，不调用会清空软件记录的 VM migration hook。
@@ -385,14 +384,15 @@ GPA、size、memfd file_offset 和累计 u64 bitmap。各来源/slot 消费后�
 vhost 的 DMA/status/used-ring 写入在暴露缓冲区前标记范围，部分失败不会撤销记录。
 
 0014 在消费日志前先检查完整坐标映射；注册变化时先把全部已知 region 保守标脏再报错。
-WP 遇到 EAGAIN 后立即归还 worker，以按页去重、RAM 页数有界的小批轮转队列重试，
-避免满 WP 队列阻止 reader 读取 REMOVE/UNMAP；每次重试仍先校验注册并记 D。
 
-va_report v1 显式传 page_shift、file_offset 和 copy_mode_wp，ACK 回显协商结果。
-x86 有 shmem WP 能力时注册 MISSING|WP，所有 clean Data、Zero、父 Hole、tail
-和 EnsureLoaded 填充都原子使用 COPY_MODE_WP。WP fault 单独分支先标记 D 再
-unprotect，不走 missing refill。4 KiB ARM 使用 MISSING 和原生 KVM 日志；x86
-能力不足时将物化页保守计 dirty 并记录退化。更大 host page 被明确拒绝。
+va_report v1 显式传 page_shift 和 file_offset，ACK 确认注册已被接管。
+原生 4 KiB x86 和 ARM 共用既有 MISSING 路径。Data、Zero、父 Hole、tail
+和 EnsureLoaded 填充均使用普通 COPY 或 ZEROPAGE；shmem 不支持 ZEROPAGE 时
+用零缓冲区 COPY。填充恢复固定基线；
+写入由 KVM、CH 和 Go 累计记录，释放永久保留为候选。不需要 write-protect
+能力协商或 fault 路径。KVM 可能将 x86 只读页保守记为 dirty，使其保留在捕获中。
+MISSING fault 的 write 标志不精确代表 guest 写入，不能用它替代 KVM 日志。
+意外的 WP 或 MINOR fault 直接报错，不覆盖实时内容。更大 host page 被明确拒绝。
 
 捕获在 pause、backend quiesce、CH snapshot 写入及日志采集后取得固定 M/D/R。
 UNMAP、registration 缺口、事件流损坏、Loaded 无 release 却变 Hole 均使捕获
@@ -409,8 +409,9 @@ UNMAP、registration 缺口、事件流损坏、Loaded 无 release 却变 Hole �
 子进程测试验证实际过滤器下的映射扩容、读取及禁止的打开模式，既有 6 GiB Demo
 验证完整捕获路径。上游较新的公共过滤器和 SIGSYS handler 重构并非本回移的前提。
 
-Host 基线仍为 Linux 5.10。不能用内核版本号替代实际 shmem WP 能力；提案中的
-Linux 6.6 指验证主机，不是新的最低要求。基线上保留既有 MISSING_SHMEM 路径。
+Host 基线仍为 Linux 5.10，使用既有 MISSING_SHMEM 支持。提案中的 Linux 6.6
+指验证主机，不是新的最低要求。统一原生日志方案接受 x86 只读页的保守候选，
+不要求 shmem write protection。
 未来升级 CH 时，应将其 raw RX dirty 标记和 allocator 修复与 0013、0016 对照，
 避免叠加重复实现。上游 [RX 完成后标记](https://github.com/cloud-hypervisor/cloud-hypervisor/commit/3777ba8ded440cca2d953cd40e8b1ee43ae6c682)
 修复相同的 raw buffer 覆盖缺口；当前累计 checkpoint 路径还保留部分写入后返回错误时的标记。

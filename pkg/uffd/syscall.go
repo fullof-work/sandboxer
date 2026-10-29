@@ -21,14 +21,13 @@ import (
 // userfaultfd ioctl request numbers, computed from the kernel header.
 // _IOWR(0xAA, n, struct sz)  →  0xc0_<sz<<16>>_aa_n
 const (
-	uffdioAPI          uintptr = 0xc018_aa3f // sizeof(uffdio_api)        = 24
-	uffdioRegister     uintptr = 0xc020_aa00 // sizeof(uffdio_register)   = 32
-	uffdioUnregister   uintptr = 0x8010_aa01 // sizeof(uffdio_range)      = 16
-	uffdioWake         uintptr = 0x8010_aa02 // sizeof(uffdio_range)      = 16
-	uffdioCopy         uintptr = 0xc028_aa03 // sizeof(uffdio_copy)       = 40
-	uffdioZeropage     uintptr = 0xc020_aa04 // sizeof(uffdio_zeropage)   = 32
-	uffdioWriteProtect uintptr = 0xc018_aa06
-	uffdioContinue     uintptr = 0xc018_aa07 // sizeof(uffdio_continue)   = 24
+	uffdioAPI        uintptr = 0xc018_aa3f // sizeof(uffdio_api)        = 24
+	uffdioRegister   uintptr = 0xc020_aa00 // sizeof(uffdio_register)   = 32
+	uffdioUnregister uintptr = 0x8010_aa01 // sizeof(uffdio_range)      = 16
+	uffdioWake       uintptr = 0x8010_aa02 // sizeof(uffdio_range)      = 16
+	uffdioCopy       uintptr = 0xc028_aa03 // sizeof(uffdio_copy)       = 40
+	uffdioZeropage   uintptr = 0xc020_aa04 // sizeof(uffdio_zeropage)   = 32
+	uffdioContinue   uintptr = 0xc018_aa07 // sizeof(uffdio_continue)   = 24
 )
 
 // uffdio_api struct.
@@ -85,10 +84,7 @@ type uffdioRegisterStruct struct {
 	Ioctls     uint64
 }
 
-const (
-	uffdRegisterMissing uint64 = 1 << 0
-	uffdRegisterWP      uint64 = 1 << 1
-)
+const uffdRegisterMissing uint64 = 1 << 0
 
 // uffdio_copy struct.
 type uffdioCopyStruct struct {
@@ -98,8 +94,6 @@ type uffdioCopyStruct struct {
 	Mode   uint64
 	Copied int64 // out
 }
-
-const uffdCopyModeWP uint64 = 1 << 1
 
 // uffdio_zeropage struct.
 type uffdioZeropageStruct struct {
@@ -166,14 +160,10 @@ func ioctlUffdAPI(fd int, requested uint64) (uint64, error) {
 
 // ioctlUffdRegister registers [start, start+len) for MISSING faults.
 func ioctlUffdRegister(fd int, start, length uint64) error {
-	return ioctlUffdRegisterMode(fd, start, length, uffdRegisterMissing)
-}
-
-func ioctlUffdRegisterMode(fd int, start, length, mode uint64) error {
 	req := uffdioRegisterStruct{
 		RangeStart: start,
 		RangeLen:   length,
-		Mode:       mode,
+		Mode:       uffdRegisterMissing,
 	}
 	if _, _, errno := unix.Syscall(unix.SYS_IOCTL,
 		uintptr(fd), uffdioRegister,
@@ -187,15 +177,10 @@ func ioctlUffdRegisterMode(fd int, start, length, mode uint64) error {
 // byte count even when ioctl returns an errno. Callers validate its range and
 // page alignment before updating statistics or PageState.
 func ioctlUffdCopy(fd int, dst, src, length uint64) (int64, error) {
-	return ioctlUffdCopyMode(fd, dst, src, length, 0)
-}
-
-func ioctlUffdCopyMode(fd int, dst, src, length, mode uint64) (int64, error) {
 	req := uffdioCopyStruct{
-		Mode: mode,
-		Dst:  dst,
-		Src:  src,
-		Len:  length,
+		Dst: dst,
+		Src: src,
+		Len: length,
 	}
 	_, _, errno := unix.Syscall(unix.SYS_IOCTL,
 		uintptr(fd), uffdioCopy,
@@ -280,17 +265,6 @@ func madviseDontneedRange(addr, length uintptr) error {
 	// ioctls above. Avoids fabricating a Go slice header from a uintptr, which
 	// is what trips go vet's unsafeptr check (a uintptr isn't GC-tracked).
 	if _, _, errno := unix.Syscall(unix.SYS_MADVISE, addr, length, uintptr(unix.MADV_DONTNEED)); errno != 0 {
-		return errno
-	}
-	return nil
-}
-
-func ioctlUffdWriteProtect(fd int, start, length uint64, protect bool) error {
-	req := struct{ Start, Length, Mode uint64 }{Start: start, Length: length}
-	if protect {
-		req.Mode = 1
-	}
-	if _, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(fd), uffdioWriteProtect, uintptr(unsafe.Pointer(&req))); errno != 0 {
 		return errno
 	}
 	return nil

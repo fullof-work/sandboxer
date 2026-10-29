@@ -17,18 +17,12 @@ import (
 )
 
 type uffdOps struct {
-	copyWP       func(fd int, dst uint64, src []byte) (int64, error)
-	writeProtect func(fd int, start, length uint64, protect bool) error
-	copy         func(fd int, dst uint64, src []byte) (int64, error)
-	zeropage     func(fd int, dst, length uint64) (int64, error)
-	wake         func(fd int, start, length uint64) error
+	copy     func(fd int, dst uint64, src []byte) (int64, error)
+	zeropage func(fd int, dst, length uint64) (int64, error)
+	wake     func(fd int, start, length uint64) error
 }
 
 var realUffdOps = uffdOps{
-	copyWP: func(fd int, dst uint64, src []byte) (int64, error) {
-		return ioctlUffdCopyMode(fd, dst, uint64(uintptr(unsafe.Pointer(&src[0]))), uint64(len(src)), uffdCopyModeWP)
-	},
-	writeProtect: ioctlUffdWriteProtect,
 	copy: func(fd int, dst uint64, src []byte) (int64, error) {
 		return ioctlUffdCopy(fd, dst, uint64(uintptr(unsafe.Pointer(&src[0]))), uint64(len(src)))
 	},
@@ -63,18 +57,22 @@ type urgentOutcome struct {
 	tailEligible bool
 }
 
-func (h *Handler) handleFault(ev faultEvent, pageBuf []byte) (retryWP bool) {
+func (h *Handler) handleFault(ev faultEvent, pageBuf []byte) {
 	inflight := h.stats.inflight.Add(1)
 	recordAtomicMax(&h.stats.inflightHWM, uint64(inflight))
 	defer h.stats.inflight.Add(-1)
+
+	// This handler only registers MISSING. Never reinterpret a different
+	// fault kind as an absent page and overwrite already present contents.
+	if ev.flags&(uffdPagefaultFlagWP|uffdPagefaultFlagMinor) != 0 {
+		h.failRead(fmt.Errorf("uffd: unsupported pagefault flags 0x%x", ev.flags))
+		return
+	}
 
 	memfdOffset, ok := h.addrMap.Locate(ev.address)
 	if !ok {
 		err := fmt.Errorf("uffd: fault registration missing at 0x%x", ev.address)
 		h.invalidateCapture(err)
-		if ev.flags&uffdPagefaultFlagWP != 0 {
-			h.failRead(err)
-		}
 		h.logf("uffd: handleFault unknown va 0x%x", ev.address)
 		h.stats.errors.Add(1)
 		h.wake(ev.uffdFD, ev.address&^(PageSize-1), PageSize)
@@ -84,15 +82,6 @@ func (h *Handler) handleFault(ev faultEvent, pageBuf []byte) (retryWP bool) {
 	pageOffset := memfdOffset &^ (PageSize - 1)
 	pageIdx := pageOffset / PageSize
 
-	if ev.flags&uffdPagefaultFlagWP != 0 {
-		if err := h.handleWP(ev.uffdFD, pageVA, pageOffset); err != nil {
-			if errors.Is(err, unix.EAGAIN) {
-				return true
-			}
-			h.failRead(err)
-		}
-		return
-	}
 	switch state := h.state.Get(pageIdx); state {
 	case StateAbsent:
 		h.stats.faultsAbsent.Add(1)

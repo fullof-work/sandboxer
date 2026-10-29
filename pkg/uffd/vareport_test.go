@@ -59,7 +59,7 @@ func TestVAReportRollbackAndOffsetHandoff(t *testing.T) {
 	}
 	defer unix.Close(memfd)
 	srv := &VAReportServer{Path: filepath.Join(t.TempDir(), "uffd.sock"), AddrMap: m}
-	srv.OnReady = func(fd int, va, size, off uint64, wp bool) error {
+	srv.OnReady = func(fd int, va, size, off uint64) error {
 		if failFirst {
 			failFirst = false
 			return errors.New("injected adoption failure")
@@ -72,7 +72,7 @@ func TestVAReportRollbackAndOffsetHandoff(t *testing.T) {
 		}
 		return err
 	}
-	srv.OnRegister = func(fd int, va, size, off uint64, wp bool) error {
+	srv.OnRegister = func(fd int, va, size, off uint64) error {
 		offsets = append(offsets, off)
 		return handler.AddUffd(fd, va, size, off)
 	}

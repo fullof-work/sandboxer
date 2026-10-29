@@ -124,6 +124,22 @@ def handle(conn):
                 break
             except (FileNotFoundError, ConnectionRefusedError):
                 time.sleep(0.01)
+        # Test-only release injection after sandboxer has acquired its snapshot
+        # balloon mutation gate and quiesced the app, before vCPUs are paused.
+        # The ordinary memory controller cannot race this target. The real
+        # guest balloon thread still runs; no response or RAM bytes are forged.
+        # CaptureState's earlier diagnostic observation precedes this injection;
+        # CH's subsequent snapshot contains the resulting actual device state.
+        balloon_marker = f"{output}/balloon-before-pause"
+        if first.split()[1] == b"/api/v1/vm.pause" and os.path.exists(balloon_marker):
+            with lock:
+                with open(balloon_marker) as source:
+                    target = int(source.read())
+                os.unlink(balloon_marker)
+                with open(f"{output}/balloon-inflate.jsonl", "w") as report:
+                    subprocess.run([sys.executable,
+                                    os.path.join(os.environ["SANDBOXER_LIB"], "dirty_memory_balloon.py"),
+                                    back, str(target)], stdout=report, check=True, timeout=20)
         backend.sendall(first + b"".join(headers) + b"\r\n" + body)
         response = http.client.HTTPResponse(backend)
         response.begin()

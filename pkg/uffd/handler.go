@@ -1,7 +1,6 @@
 package uffd
 
 import (
-	"container/list"
 	"context"
 	"errors"
 	"fmt"
@@ -47,8 +46,7 @@ const (
 // Config gathers everything the handler needs from the caller. Memfd /
 // BackendVA / Size come from pkg/memory.Memfd.
 type Config struct {
-	Dirty        *memory.Dirty
-	WriteProtect bool
+	Dirty *memory.Dirty
 	// Context follows the VM read lifetime. ReadFatal reports a mandatory
 	// source failure to its owner and must not synchronously join this handler.
 	Context   context.Context
@@ -105,7 +103,6 @@ type Config struct {
 // 5.10+ kernel compatible — no MINOR_SHMEM / UFFDIO_CONTINUE required.
 type Handler struct {
 	cfg          Config
-	writeProtect map[int]bool // guarded by installMu; negotiated before va_report ACK
 	released     *memory.Dirty
 	captureError error // guarded by installMu; sticky registration/event failure
 
@@ -195,7 +192,7 @@ type handlerStats struct {
 	removeEventsBatched atomic.Uint64 // events that went through the batch path (avg events/syscall = removeEventsBatched / madviseCalls)
 	backendLookupMiss   atomic.Uint64 // EVENT_REMOVE with no backend VMA covering the offset (registration bug)
 
-	inflight        atomic.Int64 // faults currently being serviced (workers plus one reader WP attempt)
+	inflight        atomic.Int64 // faults currently being serviced by workers
 	inflightHWM     atomic.Uint64
 	queueDepthHWM   atomic.Uint64
 	faultQueueWait  latHist
@@ -325,7 +322,6 @@ func NewWithBackendUffd(uffdCFromCH int, addrMap *AddressMap, cfg Config) (*Hand
 	}
 	h := &Handler{
 		cfg:                 cfg,
-		writeProtect:        map[int]bool{uffdCFromCH: cfg.WriteProtect},
 		released:            released,
 		registrationChanged: make(chan struct{}),
 		uffds:               []*os.File{os.NewFile(uintptr(uffdCFromCH), "uffd_C_chVA_region0")},
@@ -370,7 +366,7 @@ func workerCount(numWorkers int) int {
 // Safe to call concurrently with the reader goroutine — the new fd is
 // added to the same epoll set, and runReader picks events off any
 // ready fd without caring how many fds exist.
-func (h *Handler) AddUffd(uffdFD int, va, size, offset uint64, wp ...bool) error {
+func (h *Handler) AddUffd(uffdFD int, va, size, offset uint64) error {
 	if uffdFD <= 0 {
 		return fmt.Errorf("uffd: invalid fd")
 	}
@@ -403,14 +399,10 @@ func (h *Handler) AddUffd(uffdFD int, va, size, offset uint64, wp ...bool) error
 		}
 	}
 	h.addrMap.mu.Unlock()
-	if len(wp) > 0 {
-		h.writeProtect[uffdFD] = wp[0]
-	}
 	if err := h.seedRegion(uffdFD); err != nil {
 		h.captureError = err
 		_ = unix.EpollCtl(h.epfd, unix.EPOLL_CTL_DEL, uffdFD, nil)
 		h.addrMap.removeStaged(va, size, offset)
-		delete(h.writeProtect, uffdFD)
 		return err
 	}
 	h.uffds = append(h.uffds, os.NewFile(uintptr(uffdFD), "uffd_CH_region"))
@@ -586,15 +578,6 @@ func (h *Handler) dispatch(msg *uffdMsg, fromFD int) {
 			h.logf("uffd: fault at unknown va 0x%x (fd=%d)", pf.Address, fromFD)
 			h.stats.errors.Add(1)
 			_ = ioctlUffdWake(fromFD, pf.Address&^(PageSize-1), PageSize)
-			return
-		}
-		// WP resolves one already-materialized page without source I/O. Try it
-		// once here to avoid a worker handoff on every first guest write.
-		// drain has published every release in this read batch and opened the
-		// installation gate. EAGAIN still goes to the bounded worker retry
-		// queue: the reader must never wait for a future REMOVE event.
-		if pf.Flags&uffdPagefaultFlagWP != 0 &&
-			!h.handleFault(faultEvent{address: pf.Address, flags: pf.Flags, uffdFD: fromFD}, nil) {
 			return
 		}
 		idx := offset / PageSize
@@ -841,53 +824,12 @@ func (h *Handler) runWorker(idx int) {
 	// single Handler-wide tailBuf under tailBusy reservation.
 	pageBuf := make([]byte, PageSize)
 	q := h.queue[idx]
-	// Retries are deduplicated by registered page, bounded by RAM pages, and
-	// rotated in small batches. Neither the reader nor a worker waits for a
-	// pending REMOVE to clear mmap_changing. Close joins this worker before
-	// closing any descriptor, just as it does for ordinary fault processing.
-	type wpKey struct {
-		fd int
-		va uint64
-	}
-	pending := list.New()
-	byPage := make(map[wpKey]*list.Element)
-	keyFor := func(ev faultEvent) wpKey { return wpKey{ev.uffdFD, ev.address &^ (PageSize - 1)} }
-	process := func(ev faultEvent) {
-		if ev.flags&uffdPagefaultFlagWP == 0 {
-			h.handleFault(ev, pageBuf)
-			return
-		}
-		key := keyFor(ev)
-		retry := h.handleFault(ev, pageBuf)
-		if old := byPage[key]; old != nil {
-			pending.Remove(old)
-			delete(byPage, key)
-		}
-		if retry {
-			if len(byPage) >= h.cfg.Size/PageSize {
-				h.failRead(fmt.Errorf("uffd: WP retry pages exceed RAM registration"))
-				return
-			}
-			byPage[key] = pending.PushBack(ev)
-		}
-	}
-	ticker := time.NewTicker(time.Millisecond)
-	defer ticker.Stop()
 	for {
-		var retryC <-chan time.Time
-		if pending.Len() != 0 {
-			retryC = ticker.C
-		}
-
 		select {
 		case <-h.stop:
 			return
 		case <-h.ctx.Done():
 			return
-		case <-retryC:
-			for n := min(pending.Len(), 32); n > 0 && h.ctx.Err() == nil; n-- {
-				process(pending.Front().Value.(faultEvent))
-			}
 		case ev, ok := <-q:
 			if !ok || h.ctx.Err() != nil {
 				return
@@ -901,7 +843,7 @@ func (h *Handler) runWorker(idx int) {
 				ev.mandatory.done <- h.loadPage(ev.mandatory.ctx, ev.mandatory.offset, pageBuf)
 				h.stats.inflight.Add(-1)
 			} else {
-				process(ev)
+				h.handleFault(ev, pageBuf)
 			}
 		}
 	}
@@ -966,7 +908,7 @@ func (h *Handler) Stats() map[string]uint64 {
 	}
 }
 
-// Inflight is the number of faults currently being serviced (≤ NumWorkers+1 (including the reader WP attempt)).
+// Inflight is the number of faults currently being serviced (≤ NumWorkers).
 func (h *Handler) Inflight() int64 { return h.stats.inflight.Load() }
 
 // QueueDepth is the number of faults enqueued but not yet picked up by a

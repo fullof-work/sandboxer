@@ -26,8 +26,10 @@ call("PUT", "vm.resize", {"desired_balloon": target})
 for attempt in range(100):
     info = call("GET", "vm.info")
     actual = info["memory_actual_size"]
-    print(json.dumps({"desired_balloon": target, "memory_actual_size": actual}), flush=True)
-    if actual == (256 << 20) - target:
+    accepted = info["config"]["balloon"]["size"]
+    print(json.dumps({"desired_balloon": target, "accepted_balloon": accepted,
+                      "memory_actual_size": actual}), flush=True)
+    if accepted == target and actual == (256 << 20) - target:
         break
     time.sleep(.1)
 else:

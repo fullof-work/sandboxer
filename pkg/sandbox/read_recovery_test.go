@@ -100,7 +100,7 @@ func testMandatoryReadFatalDuringPostSpawn(t *testing.T, blockReady bool) {
 			}
 			defer conn.Close()
 			conn.SetDeadline(time.Now().Add(time.Second))
-			body, _ := json.Marshal(map[string]any{"type": "va_report", "va_start": uint64(0x100000), "size": uint64(4096), "version": 1, "page_shift": 12, "file_offset": 0, "copy_mode_wp": false})
+			body, _ := json.Marshal(map[string]any{"type": "va_report", "va_start": uint64(0x100000), "size": uint64(4096), "version": 1, "page_shift": 12, "file_offset": 0})
 			frame := make([]byte, 4+len(body))
 			binary.LittleEndian.PutUint32(frame, uint32(len(body)))
 			copy(frame[4:], body)

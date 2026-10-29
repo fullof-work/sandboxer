@@ -3,7 +3,6 @@ package uffd
 import (
 	"errors"
 	"fmt"
-	"runtime"
 
 	"golang.org/x/sys/unix"
 )
@@ -45,14 +44,11 @@ func (h *Handler) seedRegion(fd int) error {
 			off = uint64(hole)
 		}
 	}
-	if runtime.GOARCH != "arm64" && !h.writeProtect[fd] {
-		h.logf("dirty memory fallback: region fd=%d has no atomic shmem COPY_MODE_WP; materialized pages are conservatively dirty", fd)
-	}
 	return nil
 }
 
 // All callers hold installMu. An unknown existing folio is conservative dirty;
-// it cannot be assumed protected just because COPY reports EEXIST.
+// COPY reporting EEXIST does not prove that its contents still equal B.
 func (h *Handler) markInstall(fd int, dst, length uint64) error {
 	if h.cfg.Dirty == nil {
 		return nil
@@ -64,18 +60,9 @@ func (h *Handler) markInstall(fd int, dst, length uint64) error {
 	return h.cfg.Dirty.Mark(off, length)
 }
 func (h *Handler) copyCleanLocked(fd int, dst uint64, data []byte) (int64, error) {
-	copyOp := h.ops.copy
-	if h.writeProtect[fd] {
-		copyOp = h.ops.copyWP
-		if copyOp == nil {
-			return 0, fmt.Errorf("uffd: protected COPY unavailable")
-		}
-	} else if runtime.GOARCH != "arm64" {
-		if err := h.markInstall(fd, dst, uint64(len(data))); err != nil {
-			return 0, err
-		}
-	}
-	n, err := copyOp(fd, dst, data)
+	// Ordinary installation restores the fixed baseline, not a new write.
+	// CPU, CH and Go writers supply D; released pages remain covered by R.
+	n, err := h.ops.copy(fd, dst, data)
 	if errors.Is(err, unix.EEXIST) {
 		if markErr := h.markInstall(fd, dst, uint64(len(data))); markErr != nil {
 			return n, markErr
@@ -84,16 +71,6 @@ func (h *Handler) copyCleanLocked(fd int, dst uint64, data []byte) (int64, error
 	return n, err
 }
 func (h *Handler) zeroCleanLocked(fd int, dst, length uint64) (int64, error, bool) {
-	if h.writeProtect[fd] {
-		n, err := h.copyCleanLocked(fd, dst, zeroScratch[:length])
-		h.stats.copies.Add(1)
-		return n, err, false
-	}
-	if runtime.GOARCH != "arm64" {
-		if err := h.markInstall(fd, dst, length); err != nil {
-			return 0, err, true
-		}
-	}
 	n, err := h.ops.zeropage(fd, dst, length)
 	if n == 0 && (errors.Is(err, unix.EINVAL) || errors.Is(err, unix.EOPNOTSUPP)) {
 		n, err = h.copyCleanLocked(fd, dst, zeroScratch[:length])
@@ -106,30 +83,6 @@ func (h *Handler) zeroCleanLocked(fd int, dst, length uint64) (int64, error, boo
 		}
 	}
 	return n, err, true
-}
-
-// handleWP makes one attempt. EAGAIN must return to the worker: retaining a
-// worker here can fill its queue and stop the reader before a pending REMOVE.
-func (h *Handler) handleWP(fd int, va, off uint64) error {
-	h.installMu.Lock()
-	defer h.installMu.Unlock()
-	if err := h.ctx.Err(); err != nil {
-		return err
-	}
-	if !h.writeProtect[fd] || !h.addrMap.owns(fd, va, off, PageSize) {
-		return fmt.Errorf("uffd: WP fault outside protected registration")
-	}
-	if h.cfg.Dirty == nil || h.ops.writeProtect == nil {
-		return fmt.Errorf("uffd: WP tracker unavailable")
-	}
-	if err := h.cfg.Dirty.Mark(off, PageSize); err != nil {
-		return err
-	}
-	// D precedes every unprotect attempt, including transient/permanent failure.
-	if err := h.ops.writeProtect(fd, va, PageSize, false); err != nil {
-		return fmt.Errorf("uffd: unprotect: %w", err)
-	}
-	return nil
 }
 
 // A queued MISSING event can be stale after another installer populated the

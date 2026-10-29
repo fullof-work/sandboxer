@@ -97,7 +97,7 @@ The memory-backing and external-fault-handler contracts are:
   Externally owned backing does not itself require uffd.
 - **Both `fd` and `uffd_socket` are set**: in addition to the backing behavior,
   CH performs `userfaultfd()` → `UFFDIO_API` →
-  `UFFDIO_REGISTER MISSING (plus negotiated WP) on chVA` → `connect uffd_socket` →
+  `UFFDIO_REGISTER MISSING on chVA` → `connect uffd_socket` →
   `sendmsg(va_report; SCM_RIGHTS=uffd_fd)` → wait for acknowledgement.
   vCPUs must not run before the acknowledgement.
 
@@ -237,10 +237,9 @@ retries cancelably outside the worker, permitting the event reader and CPU fault
 queues to progress; `ENOENT`/invalid registration fails the request. A genuine
 CPU MISSING fault on a Loaded page remains a separate reclaimed-page path.
 
-Current `va_report` v1 carries explicit `version=1`, `page_shift=12`,
-`file_offset` and `copy_mode_wp`. x86 attempts MISSING+WP registration and
-requires ACK confirmation of atomic COPY_MODE_WP; unavailable negotiation
-conservatively marks materialized pages dirty. ARM uses the native KVM log.
+Current `va_report` v1 carries explicit `version=1`, `page_shift=12` and
+`file_offset`. Both x86 and ARM use MISSING registration and ordinary COPY;
+the ACK confirms adoption of the descriptor and coordinate map.
 The memfd offset passes through internal callbacks and is associated with the
 actual CH VA interval and owned UFFD descriptor. New registrations become usable only after successful adoption;
 failed adoption rolls back the staged map and leaves fd cleanup to the sender of
@@ -450,7 +449,7 @@ provenance; cross-compilation alone does not exercise KVM resume. A successful
 small sample does not establish a failure rate or diagnose unrelated restore
 errors.
 
-### 3.10 0013–0014 — cumulative dirty memory and atomic clean installation
+### 3.10 0013–0014 — cumulative dirty memory
 
 Externally managed RAM enables MemoryManager-level KVM dirty logging during
 initialization. Existing software bits are accumulated first, without the VM
@@ -466,15 +465,17 @@ offsets and unused bits, then converts into memfd coordinates. Raw net/vsock
 writable aliases and Go vhost DMA/status/used-ring writes mark their ranges
 before exposure, including partially failed writes.
 
-va_report v1 carries page_shift, file_offset and copy_mode_wp; its ACK confirms
-the negotiated result. On x86 with shmem WP support, registration uses MISSING|WP
-and every clean Data, Zero, parent Hole, tail and EnsureLoaded installation uses
-atomic COPY_MODE_WP. A separate WP branch marks D before unprotecting, without
-missing-page refill. EAGAIN returns the worker to its event queue; retries are
-page-deduplicated, RAM-bounded and rotated in small batches, so a full WP queue
-cannot prevent the reader from reaching REMOVE/UNMAP. Native 4 KiB ARM uses MISSING and KVM logging. Unsupported
-x86 WP conservatively marks materialized pages dirty and reports the fallback;
-larger host pages are rejected.
+va_report v1 carries page_shift and file_offset; its ACK confirms registration
+adoption. Native 4 KiB x86 and ARM share the existing MISSING path. Data, Zero,
+parent Hole, tail and EnsureLoaded fills use ordinary COPY or ZEROPAGE, with
+zero-buffer COPY when shmem ZEROPAGE is unsupported. Filling restores the fixed
+baseline; writes are accumulated
+from KVM, CH and Go, and releases remain permanent candidates. No write-protect
+capability negotiation or fault path is required. KVM may conservatively report
+read-only x86 pages as dirty, so they can remain in a capture. MISSING fault
+write flags are not an exact guest-write signal and are not used to replace the
+KVM log. Unexpected WP or MINOR faults fail closed without overwriting live
+contents. Larger host pages are rejected.
 
 After pause, backend quiesce, CH snapshot writes and final log collection,
 CaptureView fixes M/D/R. UNMAP, registration gaps, broken event streams, or a
@@ -496,9 +497,10 @@ mapping growth, reads and rejected open modes; the existing 6 GiB Demo exercises
 the full capture path. The newer common-filter and SIGSYS-handler refactors are
 not prerequisites for this backport.
 
-The Host baseline remains Linux 5.10. A kernel version number is not a proxy for
-shmem WP capability; Linux 6.6 in the proposal describes a validation host, not
-a new minimum. Keep the existing MISSING_SHMEM path available on the baseline.
+The Host baseline remains Linux 5.10 with the existing MISSING_SHMEM support.
+Linux 6.6 in the proposal describes a validation host, not a new minimum.
+The unified native-log design accepts conservative x86 read-only candidates
+instead of requiring shmem write protection.
 When rebasing CH, reconcile its raw RX dirty marking and allocator fixes with
 0013 and 0016 instead of stacking duplicate implementations. In particular,
 upstream [RX completion marking](https://github.com/cloud-hypervisor/cloud-hypervisor/commit/3777ba8ded440cca2d953cd40e8b1ee43ae6c682)

@@ -1,8 +1,8 @@
-From 7b8c9f6f7abb38d8951d3b0d45c4f2999dd55fb4 Mon Sep 17 00:00:00 2001
+From bca1b2ac2b97b0fcc6f6c410358788ff40d220fa Mon Sep 17 00:00:00 2001
 From: Chen Xiaohui <graych@gmail.com>
 Date: Thu, 29 Oct 2026 01:30:37 +0800
-Subject: [PATCH 15/15] tests: cover checkpoint raw writers and real release
- and slot failures
+Subject: [PATCH] tests: cover checkpoint raw writers and real release and slot
+ failures
 
 ---
  net_util/src/tap.rs                |  65 ++++++++++++++++++
@@ -223,10 +223,10 @@ index c073bea..22fe845 100644
      use virtio_queue::QueueOwnedT;
      use vm_memory::GuestAddress;
 diff --git a/vmm/src/memory_manager.rs b/vmm/src/memory_manager.rs
-index e45b826..a0b8951 100644
+index e04408f..b806e4b 100644
 --- a/vmm/src/memory_manager.rs
 +++ b/vmm/src/memory_manager.rs
-@@ -3137,3 +3137,108 @@ impl Migratable for MemoryManager {
+@@ -3101,3 +3101,108 @@ impl Migratable for MemoryManager {
          Ok(table)
      }
  }

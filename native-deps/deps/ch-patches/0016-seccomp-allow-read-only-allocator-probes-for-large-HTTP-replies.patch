@@ -1,4 +1,4 @@
-From b87f36d78453d35ccbf1707a6f28e0adfd0def85 Mon Sep 17 00:00:00 2001
+From 52053f78447a86d6a666b0d375a2634a596f5d12 Mon Sep 17 00:00:00 2001
 From: Chen Xiaohui <graych@gmail.com>
 Date: Thu, 29 Oct 2026 03:12:13 +0800
 Subject: [PATCH] seccomp: permit HTTP allocator syscalls for large dirty

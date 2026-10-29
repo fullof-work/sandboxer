@@ -1,8 +1,8 @@
-From beac75fe6ddf13c82b33990d4dfd99bfab86727c Mon Sep 17 00:00:00 2001
+From 6566da4b5b478073934b877ff145803e6a81b94a Mon Sep 17 00:00:00 2001
 From: Chen Xiaohui <graych@gmail.com>
 Date: Thu, 29 Oct 2026 00:51:29 +0800
-Subject: [PATCH 14/14] vmm: retain all checkpoint dirty regions on
- registration changes
+Subject: [PATCH] vmm: retain all checkpoint dirty regions on registration
+ changes
 
 ---
  vmm/src/dirty_memory.rs   | 33 +++++++++++++++++++++++++++++++++
@@ -59,7 +59,7 @@ index 2a6c80d..b75cacb 100644
 +    }
  }
 diff --git a/vmm/src/memory_manager.rs b/vmm/src/memory_manager.rs
-index 5ff8591..e45b826 100644
+index 9d9c714..e04408f 100644
 --- a/vmm/src/memory_manager.rs
 +++ b/vmm/src/memory_manager.rs
 @@ -1131,23 +1131,18 @@ impl MemoryManager {

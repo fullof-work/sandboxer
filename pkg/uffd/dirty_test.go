@@ -3,8 +3,6 @@ package uffd
 import (
 	"bytes"
 	"context"
-	"errors"
-	"runtime"
 	"testing"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest/fetch"
@@ -15,11 +13,8 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func TestRealWriteProtectCleanFillDirtyWriteAndReleaseCapture(t *testing.T) {
-	if runtime.GOARCH != "amd64" {
-		t.Skip("atomic shmem WP is the x86 path; ARM uses native KVM log")
-	}
-	h, backend, cpu := realShmemHandler(t, 32, newRecordingSnapshot(32*PageSize, sparse.Data, 0x37), true)
+func TestRealMissingCleanFillRecordedWriteAndReleaseCapture(t *testing.T) {
+	h, backend, cpu := realShmemHandler(t, 32, newRecordingSnapshot(32*PageSize, sparse.Data, 0x37))
 	if cpu[0] != 0x37 {
 		t.Fatal("urgent fill content")
 	}
@@ -32,19 +27,23 @@ func TestRealWriteProtectCleanFillDirtyWriteAndReleaseCapture(t *testing.T) {
 	}
 	for _, b := range v.Dirty {
 		if b != 0 {
-			t.Fatalf("clean COPY/WP materialization dirty: %x", v.Dirty)
+			t.Fatalf("ordinary materialization invented dirty: %x", v.Dirty)
 		}
 	}
-	cpu[0] = 0x71
+	// A backend writer supplies D before modifying its already loaded alias.
+	if err := h.cfg.Dirty.Mark(0, 1); err != nil {
+		t.Fatal(err)
+	}
+	backend[0] = 0x71
 	if backend[0] != 0x71 {
-		t.Fatal("WP write content")
+		t.Fatal("recorded write content")
 	}
 	v, err = h.CaptureView()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if v.Dirty[0]&1 == 0 {
-		t.Fatal("WP branch lost write")
+		t.Fatal("recorded write lost")
 	}
 	// Prove this nonzero parent page is still unmaterialized before release.
 	if v.Materialized[3]&1 != 0 {
@@ -110,7 +109,10 @@ func TestRealWriteProtectCleanFillDirtyWriteAndReleaseCapture(t *testing.T) {
 	if !bytes.Equal(backend[24*PageSize:25*PageSize], make([]byte, PageSize)) {
 		t.Fatal("released parent refilled stale bytes")
 	}
-	cpu[24*PageSize] = 0x5d
+	if err := h.cfg.Dirty.Mark(24*PageSize, 1); err != nil {
+		t.Fatal(err)
+	}
+	backend[24*PageSize] = 0x5d
 	v, err = h.CaptureView()
 	if err != nil {
 		t.Fatal(err)
@@ -119,12 +121,9 @@ func TestRealWriteProtectCleanFillDirtyWriteAndReleaseCapture(t *testing.T) {
 		t.Fatal("reuse cleared R/D or lost Data")
 	}
 }
-func TestRealWriteProtectZeroAndTailStayClean(t *testing.T) {
-	if runtime.GOARCH != "amd64" {
-		t.Skip("x86 atomic WP path")
-	}
+func TestRealMissingZeroAndTailDoNotInventDirtyWrites(t *testing.T) {
 	for _, source := range []SnapshotReader{ZeroSource{}, newRecordingSnapshot(32*PageSize, sparse.Zero, 0), newRecordingSnapshot(32*PageSize, sparse.Hole, 0)} {
-		h, backend, cpu := realShmemHandler(t, 32, source, true)
+		h, backend, cpu := realShmemHandler(t, 32, source)
 		if cpu[0] != 0 {
 			t.Fatal("zero content")
 		}
@@ -140,7 +139,10 @@ func TestRealWriteProtectZeroAndTailStayClean(t *testing.T) {
 				t.Fatalf("clean Zero/Hole dirty: %x", v.Dirty)
 			}
 		}
-		cpu[20*PageSize] = 9
+		if err := h.cfg.Dirty.Mark(20*PageSize, 1); err != nil {
+			t.Fatal(err)
+		}
+		backend[20*PageSize] = 9
 		if backend[20*PageSize] != 9 {
 			t.Fatal("zero clean page not writable")
 		}
@@ -149,7 +151,7 @@ func TestRealWriteProtectZeroAndTailStayClean(t *testing.T) {
 			t.Fatal(err)
 		}
 		if v.Dirty[2]&(1<<4) == 0 {
-			t.Fatal("zero WP write lost")
+			t.Fatal("recorded zero-page write lost")
 		}
 	}
 }
@@ -163,52 +165,23 @@ func TestCaptureRejectsUnexplainedLoadedHole(t *testing.T) {
 	}
 }
 
-func TestWPRetryReleasesInstallGateAndRetainsDirty(t *testing.T) {
-	if runtime.GOARCH != "amd64" {
-		t.Skip("x86 WP retry path")
-	}
-	h, _, _ := realShmemHandler(t, 1, ZeroSource{}, true)
-	h.installMu.Lock()
-	fd := h.uffds[0].Fd()
-	h.addrMap.mu.RLock()
-	var va uint64
-	for _, v := range h.addrMap.vmas {
-		if v.process == ProcessCH {
-			va = v.start
-			break
-		}
-	}
-	h.addrMap.mu.RUnlock()
-	attempts := 0
-	first := make(chan struct{})
-	h.ops.writeProtect = func(_ int, _ uint64, _ uint64, _ bool) error {
-		if !h.cfg.Dirty.Contains(0) {
-			t.Error("unprotect attempted before dirty publication")
-		}
-		attempts++
-		if attempts == 1 {
-			close(first)
-			return unix.EAGAIN
-		}
-		return nil
-	}
-	h.installMu.Unlock()
-	if err := h.handleWP(int(fd), va, 0); !errors.Is(err, unix.EAGAIN) {
-		t.Fatalf("first attempt: %v", err)
-	}
-	<-first
-	h.installMu.Lock()
-	h.handleRemoveLocked(va, va+PageSize, int(fd))
-	h.installMu.Unlock()
-	if err := h.handleWP(int(fd), va, 0); err != nil {
-		t.Fatal(err)
-	}
-	if attempts < 2 || !h.cfg.Dirty.Contains(0) || !h.released.Contains(0) {
-		t.Fatal("retry lost D/R")
-	}
-	h.ops.writeProtect = func(int, uint64, uint64, bool) error { return unix.EIO }
-	if err := h.handleWP(int(fd), va, 0); err == nil || !h.cfg.Dirty.Contains(0) {
-		t.Fatal("failed unprotect lost D", err)
+func TestMissingHandlerRejectsOtherFaultKindsWithoutFilling(t *testing.T) {
+	for name, flags := range map[string]uint64{"write-protect": uffdPagefaultFlagWP, "minor": uffdPagefaultFlagMinor} {
+		t.Run(name, func(t *testing.T) {
+			h := newUnitHandler(t, PageSize, ZeroSource{})
+			defer h.cancel()
+			var fatal error
+			h.cfg.ReadFatal = func(err error) { fatal = err }
+			h.ops = uffdOps{
+				copy:     func(int, uint64, []byte) (int64, error) { t.Fatal("unexpected copy"); return 0, nil },
+				zeropage: func(int, uint64, uint64) (int64, error) { t.Fatal("unexpected zero"); return 0, nil },
+				wake:     func(int, uint64, uint64) error { t.Fatal("unexpected wake"); return nil },
+			}
+			h.handleFault(faultEvent{uffdFD: unitFD, address: unitCHVA, flags: flags}, nil)
+			if fatal == nil || h.ctx.Err() == nil || h.state.Get(0) != StateAbsent {
+				t.Fatal("unsupported fault did not fail closed")
+			}
+		})
 	}
 }
 

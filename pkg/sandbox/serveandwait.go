@@ -403,22 +403,21 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 		Logf:                 logf,
 		HandshakeDeadline:    p.VAReportDeadline,
 		RequireDirtyTracking: true,
-		OnReady: func(uffdFD int, vaStart, size, memfdOffset uint64, wp bool) error {
+		OnReady: func(uffdFD int, vaStart, size, memfdOffset uint64) error {
 			numWorkers := 0
 			if p.SnapCfg != nil && p.SnapCfg.Resources.Capacity.CPU > 0 {
 				numWorkers = int(p.SnapCfg.Resources.Capacity.CPU)
 			}
 			h, err := uffd.NewWithBackendUffd(uffdFD, addrMap, uffd.Config{
-				MemfdFD:      memfd.FD(),
-				Dirty:        dirty,
-				WriteProtect: wp,
-				BackendVA:    memfd.Addr(),
-				Size:         memfd.Size(),
-				Source:       p.UffdSource,
-				Context:      backendCtx,
-				ReadFatal:    reportReadFatal,
-				NumWorkers:   numWorkers,
-				Logf:         logf,
+				MemfdFD:    memfd.FD(),
+				Dirty:      dirty,
+				BackendVA:  memfd.Addr(),
+				Size:       memfd.Size(),
+				Source:     p.UffdSource,
+				Context:    backendCtx,
+				ReadFatal:  reportReadFatal,
+				NumWorkers: numWorkers,
+				Logf:       logf,
 			})
 			if err != nil {
 				return err
@@ -431,14 +430,14 @@ func ServeAndWait(p VMParams) (exitCode int, retErr error) {
 			logf("uffd handler: adopted CH uffd region #0 fd=%d size=%d", uffdFD, size)
 			return nil
 		},
-		OnRegister: func(uffdFD int, vaStart, size, memfdOffset uint64, wp bool) error {
+		OnRegister: func(uffdFD int, vaStart, size, memfdOffset uint64) error {
 			uffdHandlerMu.Lock()
 			h := uffdHandler
 			uffdHandlerMu.Unlock()
 			if h == nil {
 				return fmt.Errorf("OnRegister called before OnReady (no handler yet)")
 			}
-			if err := h.AddUffd(uffdFD, vaStart, size, memfdOffset, wp); err != nil {
+			if err := h.AddUffd(uffdFD, vaStart, size, memfdOffset); err != nil {
 				return err
 			}
 			logf("uffd handler: attached additional region fd=%d size=%d", uffdFD, size)
