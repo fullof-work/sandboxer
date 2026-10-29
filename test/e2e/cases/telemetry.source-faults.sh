@@ -502,47 +502,18 @@ def vsock_case(work, ref):
         cleanup_sources(sb, trace, (observer,), relay, failure)
 
 
-def observe_ch_hold(sb, relay, before):
-    # Follow every usage round while pressure reaches the selected real reply,
-    # then throughout the hold. A wait here could hide the last healthy update.
-    observed, samples, counts = [], [], []
-    deadline, held_at = time.monotonic() + 15, None
-    while True:
-        view = sb.view()
-        assert view["live"]["run_epoch"] == before["live"]["run_epoch"], "CH hold observation epoch changed"
-        observed.append(view)
-        now = time.monotonic()
-        if relay.held.is_set():
-            if held_at is None:
-                held_at = now
-            if len(samples) < 12 and now - held_at >= len(samples):
-                samples.append(view)
-                counts.append(resources(sb))
-            if now - held_at >= 12:
-                assert len(samples) == 12
-                return observed, samples, counts
-        else:
-            assert now < deadline, "selected real CH reply was not reached"
-        time.sleep(.1)
-
-
-def validate_ch_missing(samples, baseline, observed=None):
+def validate_ch_missing(samples, baseline):
     # The first two seconds can still legitimately reuse a fresh pre-fault
     # actual. Once stale, no target write or old actual can refresh it.
     steady = samples[3:]
     assert len(steady) >= 8
-    previous_id = int(baseline["last_request_id"])
-    for row in samples if observed is None else observed:
+    for row in samples:
         memory = metric(row["live"], "gauges", "guest.memory")
-        request = int(memory["last_request_id"])
-        assert 0 <= request - previous_id <= 1, ("unobserved CH fault round", previous_id, request)
         if memory["status"] == "ok":
             baseline = memory
         else:
             for field in ("covered_total_ns", "integral_total_byte_ns", "last_value_bytes"):
-                assert memory[field] == baseline[field], ("first CH failure changed known usage", field,
-                    previous_id, request, baseline[field], memory[field])
-        previous_id = request
+                assert memory[field] == baseline[field], "first CH failure changed known usage"
     baseline = metric(steady[0]["live"], "gauges", "guest.memory")
     for row in steady:
         memory = metric(row["live"], "gauges", "guest.memory")
@@ -895,11 +866,15 @@ def ch_case(work, ref, mode):
             pressure = subprocess.Popen([str(BIN / "sandbox-ctl"), "exec", "--sandbox-id", sb.name,
                 "--path-id", "instance", "--run-root", str(sb.runroot), "--", "/probe", "memory", "320", "18"],
                 stdout=output, stderr=subprocess.STDOUT)
-        observed, samples, counts = observe_ch_hold(sb, relay, before)
-        write_json(sb.dir / "ch-transition.json", observed)
+        assert relay.held.wait(timeout=15), "selected real CH reply was not reached"
+        samples, counts = [], []
+        for _ in range(12):
+            samples.append(sb.view())
+            counts.append(resources(sb))
+            time.sleep(1)
         write_json(sb.dir / "during.json", samples)
         write_json(sb.dir / "resources.json", counts)
-        validate_ch_missing(samples, metric(before["live"], "gauges", "guest.memory"), observed)
+        validate_ch_missing(samples, metric(before["live"], "gauges", "guest.memory"))
         held = [row for row in relay.requests if row.get("held")]
         assert len(held) == 1
         assert held[0]["method"] == ("PUT" if mode == "resize" else "GET")

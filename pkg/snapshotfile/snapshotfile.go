@@ -1,6 +1,6 @@
 // Package snapshotfile implements the strict memory Snapshot logical layout:
 //
-//	[sparse memory][ZIP(config.json, state.json, snapshot.cfg[, memory.dirty])]
+//	[sparse memory][ZIP(config.json, state.json, snapshot.cfg)]
 //
 // Physical tarstream, Manifest and Manifest Bundle carriers are resolved by
 // callers. This package derives the memory boundary solely from ZIP geometry.
@@ -8,7 +8,6 @@ package snapshotfile
 
 import (
 	"context"
-	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -42,8 +41,6 @@ const (
 	zipEpochDate           = 33
 )
 
-var ErrTailBudget = errors.New("snapshot ZIP tail budget exceeded")
-
 // Root owns one opened Snapshot. FullStream and Memory share a single close
 // owner. Memory preserves the carrier's authoritative Hole/Zero/Data runs and
 // ends exactly at ArchiveBase, so UFFD can never observe the ZIP tail.
@@ -53,9 +50,7 @@ type Root struct {
 	ConfigJSON     []byte
 	StateJSON      []byte
 	SnapshotConfig []byte
-	// MemoryDirty is the original encoded entry; nil means absent (all explicit dirty).
-	MemoryDirty []byte
-	ArchiveBase uint64
+	ArchiveBase    uint64
 
 	owner *streamOwner
 }
@@ -69,33 +64,11 @@ func (r *Root) Close() error {
 
 // BuildZIP returns the sole canonical Snapshot ZIP encoding.
 func BuildZIP(configJSON, stateJSON, snapshotConfig []byte) ([]byte, error) {
-	return BuildZIPWithDirty(configJSON, stateJSON, snapshotConfig, nil)
-}
-
-// BuildZIPWithDirty preserves entry presence and bytes. A present entry must
-// carry a valid encoding; BuildSourceWithDirty additionally checks coverage.
-func BuildZIPWithDirty(configJSON, stateJSON, snapshotConfig, dirty []byte) ([]byte, error) {
 	entries := []tailzip.Entry{{Name: ConfigJSONName, Body: configJSON}, {Name: StateJSONName, Body: stateJSON}, {Name: SnapshotCfgName, Body: snapshotConfig}}
-	if dirty != nil {
-		if len(dirty) < DirtyHeaderSize {
-			return nil, errors.New("memory.dirty: missing header")
-		}
-		if err := validateDirtyBits(dirty, binary.LittleEndian.Uint64(dirty[8:])); err != nil {
-			return nil, err
-		}
-		entries = append(entries, tailzip.Entry{Name: MemoryDirtyName, Body: dirty})
-	}
 	for _, entry := range entries {
 		if len(entry.Body) == 0 || len(entry.Body) > entryLimit(entry.Name) {
 			return nil, fmt.Errorf("snapshot ZIP entry %s size is outside limits", entry.Name)
 		}
-	}
-	total := uint64(eocdSize)
-	for _, entry := range entries {
-		total += uint64(localHeaderSize + centralHeaderSize + 2*len(entry.Name) + len(entry.Body))
-	}
-	if total > MaxTailBytes {
-		return nil, ErrTailBudget
 	}
 	return tailzip.EncodeCanonical(entries)
 }
@@ -103,18 +76,10 @@ func BuildZIPWithDirty(configJSON, stateJSON, snapshotConfig, dirty []byte) ([]b
 // BuildSource appends the canonical Snapshot ZIP while retaining memory's
 // authoritative sparse map.
 func BuildSource(memory sparse.Source, configJSON, stateJSON, snapshotConfig []byte) (sparse.Source, error) {
-	return BuildSourceWithDirty(memory, configJSON, stateJSON, snapshotConfig, nil)
-}
-
-// BuildSourceWithDirty retains memory states and validates the optional bitmap.
-func BuildSourceWithDirty(memory sparse.Source, configJSON, stateJSON, snapshotConfig, dirty []byte) (sparse.Source, error) {
 	if memory == nil || memory.Size() == 0 {
 		return nil, errors.New("snapshot build: non-empty memory source is required")
 	}
-	if err := ValidateDirty(memory, dirty); err != nil {
-		return nil, err
-	}
-	tail, err := BuildZIPWithDirty(configJSON, stateJSON, snapshotConfig, dirty)
+	tail, err := BuildZIP(configJSON, stateJSON, snapshotConfig)
 	if err != nil {
 		return nil, err
 	}
@@ -147,9 +112,6 @@ func Open(ctx context.Context, stream fetch.Stream) (*Root, error) {
 	if !json.Valid(bodies[StateJSONName]) {
 		return fail(errors.New("snapshot state.json is not valid JSON"))
 	}
-	if err := ValidateDirty(tailzip.Section{Source: stream, Length: base}, bodies[MemoryDirtyName]); err != nil {
-		return fail(err)
-	}
 	owner := &streamOwner{stream: stream}
 	return &Root{
 		FullStream:     &sectionStream{owner: owner, size: stream.Size()},
@@ -157,21 +119,13 @@ func Open(ctx context.Context, stream fetch.Stream) (*Root, error) {
 		ConfigJSON:     append([]byte(nil), bodies[ConfigJSONName]...),
 		StateJSON:      append([]byte(nil), bodies[StateJSONName]...),
 		SnapshotConfig: append([]byte(nil), bodies[SnapshotCfgName]...),
-		MemoryDirty:    append([]byte(nil), bodies[MemoryDirtyName]...),
 		ArchiveBase:    base, owner: owner,
 	}, nil
 }
 
 func parseArchive(ctx context.Context, stream fetch.Stream) (uint64, map[string][]byte, error) {
-	footer, err := tailzip.ReadFooter(ctx, tailReaderAt{ctx: ctx, stream: stream}, stream.Size())
-	if err != nil {
-		return 0, nil, err
-	}
-	names, err := archiveNames(footer.Count)
-	if err != nil {
-		return 0, nil, err
-	}
-	limits := map[string]int{ConfigJSONName: MaxConfigJSONBytes, StateJSONName: MaxStateJSONBytes, SnapshotCfgName: MaxSnapshotCfgBytes, MemoryDirtyName: MaxDirtyBytes}
+	names := []string{ConfigJSONName, StateJSONName, SnapshotCfgName}
+	limits := map[string]int{ConfigJSONName: MaxConfigJSONBytes, StateJSONName: MaxStateJSONBytes, SnapshotCfgName: MaxSnapshotCfgBytes}
 	base, bodies, err := tailzip.ReadCanonical(ctx, tailReaderAt{ctx: ctx, stream: stream}, stream.Size(), names, limits)
 	if err != nil {
 		return 0, nil, fmt.Errorf("snapshot ZIP: %w", err)
@@ -204,8 +158,6 @@ func entryLimit(name string) int {
 		return MaxConfigJSONBytes
 	case StateJSONName:
 		return MaxStateJSONBytes
-	case MemoryDirtyName:
-		return MaxDirtyBytes
 	default:
 		return MaxSnapshotCfgBytes
 	}
@@ -292,16 +244,4 @@ func (s *sectionStream) RunAt(offset, limit uint64) (sparse.Run, error) {
 }
 func (s *sectionStream) ReadAt(ctx context.Context, b []byte, offset uint64) (int, error) {
 	return (tailzip.Section{Source: s.owner.stream, Base: s.base, Length: s.size}).ReadAt(ctx, b, offset)
-}
-
-func archiveNames(count int) ([]string, error) {
-	names := []string{ConfigJSONName, StateJSONName, SnapshotCfgName}
-	switch count {
-	case 3:
-		return names, nil
-	case 4:
-		return append(names, MemoryDirtyName), nil
-	default:
-		return nil, errors.New("snapshot ZIP: expected three or four entries")
-	}
 }

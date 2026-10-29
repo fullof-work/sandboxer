@@ -21,14 +21,11 @@ func TestHandlerCloseJoinsReservedButNotEnqueuedTail(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer unix.Close(pipeFDs[1])
-	memfd, err := os.CreateTemp(t.TempDir(), "ram")
+	memfd, err := os.Open("/dev/null")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer memfd.Close()
-	if err := memfd.Truncate(2 * PageSize); err != nil {
-		t.Fatal(err)
-	}
 
 	addrMap := NewAddressMap(2 * PageSize)
 	if err := addrMap.RegisterVMA(ProcessCH, unitCHVA, 2*PageSize, 0); err != nil {

@@ -46,8 +46,6 @@ import (
 
 // RunOptions controls a single sandbox-ctl run invocation.
 type RunOptions struct {
-	memoryLogf               func(string, ...any)
-	captureMemory            func(context.Context) (*memory.CaptureView, error)
 	EnableCheckpoint         bool
 	checkpointPlan           *CheckpointDiskPlan
 	checkpointStorage        *artifact.ProcessStorage
@@ -1140,7 +1138,6 @@ func (q *allQuiescer) Resume() {
 // that owns the bundle holds references; the snapshot path consumes
 // them when a request arrives.
 type SnapshotHandler struct {
-	CaptureMemory         func(context.Context) (*memory.CaptureView, error)
 	checkpointMaintenance *diffstore.DirectoryMaintenance
 	EnableCheckpoint      bool
 	CheckpointDir         string // derived from the owning VM BaseDir
@@ -1233,8 +1230,7 @@ func (h *SnapshotHandler) handleContext(ctx context.Context, req ctl.Request, cg
 	}()
 	opts := RunOptions{
 		usageSampler: h.usageSampler, checkpointDir: h.CheckpointDir, EnableCheckpoint: h.EnableCheckpoint,
-		captureMemory: h.CaptureMemory,
-		Cfg:           h.Cfg, PortableConfig: h.PortableConfig, SourceBinding: h.SourceBinding, MemoryBinding: h.MemoryBinding,
+		Cfg: h.Cfg, PortableConfig: h.PortableConfig, SourceBinding: h.SourceBinding, MemoryBinding: h.MemoryBinding,
 		ManifestCfg: h.ManifestCfg, SandboxID: h.SandboxID,
 		Fetcher: h.Fetcher, BundleReader: h.BundleReader, BundleFetcher: h.BundleFetcher, RefLocations: h.RefLocations,
 		CustomerKeyFn: h.CustomerKeyFn, LocalCodec: h.LocalCodec, LocalRequired: h.LocalRequired,
@@ -1725,7 +1721,6 @@ func handleSnapshotRequest(
 		return ctl.Response{}, fmt.Errorf("snapshot: prospective C1: %w", err)
 	}
 
-	opts.memoryLogf = logf
 	history, err := prepareMemoryHistory(ctx, opts, mergeRef, uint64(mfd.Size()))
 	if err != nil {
 		return ctl.Response{}, fmt.Errorf("snapshot: memory history: %w", err)
@@ -1811,12 +1806,8 @@ func handleSnapshotRequest(
 	cfg := opts.Cfg
 	var historicalRef string
 	if history.historical != nil {
-		historicalSource, _, buildErr := snapshot.BuildCaptureSource(ctx, sink, history.memory, nil, history.configJSON, history.stateJSON, history.snapshotConfig, history.fullMemory, history.fullMemory, history.proofCandidates, logf)
-		if buildErr != nil {
-			return ctl.Response{}, buildErr
-		}
 		var writeErr error
-		historicalRef, _, writeErr = sink.AbsorbSnapshot(ctx, historicalSource)
+		historicalRef, _, writeErr = sink.AbsorbSnapshot(ctx, history.historical)
 		if closeErr := history.Close(); writeErr != nil || closeErr != nil {
 			return ctl.Response{}, errors.Join(writeErr, closeErr)
 		}
@@ -2048,8 +2039,6 @@ func handleSnapshotRequest(
 	// (replace the next-newest layer, not stack) for BOTH --output and --upload;
 	// E/C1 drops that direct parent to match. Cold/manifest parents stack.
 	src := snapshot.Sources{
-		CaptureMemory:         opts.captureMemory,
-		MemoryWorkingSet:      !mergeRef,
 		CheckpointID:          req.CheckpointID,
 		Context:               ctx,
 		SandboxID:             sandboxID,
@@ -2067,14 +2056,8 @@ func handleSnapshotRequest(
 		LocalRequired:         opts.LocalRequired,
 		MergeBaseOpener:       mergeBaseOpener,
 		MemoryMergeBaseOpener: memoryMergeBaseOpener,
-		MemoryFallbackBase:    history.fullMemory,
-		MemoryProofCandidates: history.proofCandidates,
 	}
 	src.ParentSandboxRef = captureParentSandboxRef
-	if !mergeMemory {
-		src.MemoryFallbackBase = nil
-		src.MemoryProofCandidates = nil
-	}
 	if mergeMemory {
 		src.MergeBaseSnapshot = memoryMergeBase
 	}

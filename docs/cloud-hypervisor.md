@@ -35,9 +35,9 @@ The platform has four requirements beyond the pinned upstream VMM behavior:
 The pinned upstream interface does not directly provide this combination. The
 second requirement is particularly important: the platform needs to own fault
 handling and delivery, not just supply data to an upstream external-listener
-model. This memory model requires logical release notification even for ranges that
-have never been resident: an unmaterialized page may inherit nonzero parent
-content. Only unnecessary inode punching is skipped (§3.4).
+model. This memory model also requires avoiding an `EVENT_REMOVE` storm when
+balloon release encounters ranges that have never been resident (patch 0004,
+§3.4).
 
 ### 1.2 Patch scope summary
 
@@ -172,8 +172,7 @@ Subject: **memory: external uffd handler via in-process create + SCM_RIGHTS hand
 
 Changed files: `memory_manager.rs` and `seccomp_filters.rs`.
 
-0003 originally used the MISSING-only exchange below. The current protocol is
-extended by 0013 as described after the example.
+Key points:
 
 - After mapping a region, `create_ram_region` performs the following when
   `uffd_socket` is configured:
@@ -237,11 +236,9 @@ retries cancelably outside the worker, permitting the event reader and CPU fault
 queues to progress; `ENOENT`/invalid registration fails the request. A genuine
 CPU MISSING fault on a Loaded page remains a separate reclaimed-page path.
 
-Current `va_report` v1 carries explicit `version=1`, `page_shift=12` and
-`file_offset`. Both x86 and ARM use MISSING registration and ordinary COPY;
-the ACK confirms adoption of the descriptor and coordinate map.
-The memfd offset passes through internal callbacks and is associated with the
-actual CH VA interval and owned UFFD descriptor. New registrations become usable only after successful adoption;
+`va_report` retains its wire format. Its computed memfd offset is passed through
+the internal callbacks and associated with the actual CH VA interval and owned
+UFFD descriptor. New registrations become usable only after successful adoption;
 failed adoption rolls back the staged map and leaves fd cleanup to the sender of
 the callback. Loads wait cancelably for registration readiness and split at
 region boundaries. UNMAP invalidates the affected registration interval; REMOVE
@@ -281,23 +278,67 @@ that deterministic ordering. Run both with the prepared source/artifact contract
 and the existing KVM pressure coverage, including the Linux 5.10 floor. These are
 validation requirements, not a claim that an unexecuted run passed.
 
-### 3.4 0004 — balloon hole probing (ordering superseded by 0013)
+### 3.4 0004 — skip hole-only runs during balloon release
 
-0004 introduced SEEK_DATA for file-backed RAM and allowed SYS_lseek in the
-balloon thread. Patch 0013 retains that probe but requires chVA MADV_DONTNEED
-even for an entirely sparse interval: an unmaterialized restore hole may still
-inherit nonzero parent content, so logical release must notify the handler.
+Subject: **virtio-devices: balloon — skip PUNCH_HOLE/MADV_DONTNEED on already-sparse
+user-managed ranges**.
 
-The current order is **chVA MADV_DONTNEED → SEEK_DATA → necessary PUNCH_HOLE**.
-The handler reads REMOVE and publishes R/Released while holding installMu.
-The kernel acknowledgement may precede user-space publication, but installation
-and CaptureView cannot pass that publication boundary. The probe avoids an
-unnecessary inode punch; it cannot suppress the logical release event.
-MADV or punch failures fail the operation, preserving any accumulated R/D.
-SEEK_DATA returning ENXIO means no Data remains; other SEEK errors conservatively
-proceed with PUNCH_HOLE. The
-handler reads events, records R/D and publishes Released under installMu, the
-same gate used by installers and CaptureView.
+Changed files: `virtio-devices/src/balloon.rs` and
+`virtio-devices/src/seccomp_filters.rs`.
+
+**Background**: balloon allocation in the configured guest does not request
+`__GFP_ZERO`, and the platform guest configuration does not enable `init_on_alloc`.
+The inflate path updates page metadata and PFN arrays rather than zeroing every
+returned page. The externally managed zone is not prefaulted. Offsets never
+previously touched by the guest can therefore still be holes in the memfd, with
+no inode page or PTE in either process. This does not mean every balloon page at
+cold start is necessarily a hole: the guest can have touched and released pages
+before handing them to the balloon.
+
+Without the probe, CH calls `release_memory_range` for each returned run:
+`fallocate(PUNCH_HOLE|KEEP_SIZE)` on the memfd plus `madvise(MADV_DONTNEED)` on chVA.
+In the documented uffd model, `MADV_DONTNEED` produces an `EVENT_REMOVE` even for an
+already empty range and waits for the external handler to consume it. Inflating
+across sparse `Capacity − InitialBudget` memory can thus create unnecessary
+serialized work and back-pressure the balloon thread. The chVA `MADV_DONTNEED`,
+not merely the memfd `fallocate`, is the source of this handshake, so avoiding it
+requires skipping both operations for an empty run.
+
+**Mechanism**:
+
+- For a region with a file offset, `release_memory_range` probes
+  `[file_off, file_off + len)` with `lseek(fd, file_off, SEEK_DATA)`:
+  - `ENXIO`, or a next-data offset at or beyond `file_off + len`, means the whole
+    run is a hole. Skip both `fallocate` and `madvise` and return `Ok(())`.
+  - Data within the run retains the ordinary `PUNCH_HOLE` plus
+    `MADV_DONTNEED` release of the complete run.
+  - Other `lseek` errors fall through to the ordinary release path; they are not
+    interpreted as proof that the range is empty.
+- The actual predicate is `region.file_offset().is_some()`, not the
+  `user_managed` flag. The probe can also apply to other file-backed regions.
+  Regions without a file offset retain the original path.
+- In the platform memfd use, CH uses mappings and explicitly positioned
+  `fallocate`, not reads/writes dependent on the shared file position. Moving the
+  position for the probe therefore does not change that data path.
+- **Seccomp**: the balloon thread adds `SYS_lseek` to its allowlist. `fallocate`
+  was already allowed and `madvise` comes from the virtio common set. Without this
+  addition, the first probe could terminate the thread with `SIGSYS`.
+
+**Correctness**: only a run found to contain no data is skipped. A resident run
+that actually requires reclaiming retains the release operations. For the
+untouched external-memory holes described above, the suppressed backendVA
+reclaim would itself be a no-op, so the final host-memory state is unchanged.
+
+**Effect and tradeoffs**: on the x86_64 4 KiB path, where `pbp` batching is bypassed,
+releasing an entirely sparse balloon interval without the probe can entail about
+`inflated bytes / 4 KiB` synchronous handler handshakes. The probe substitutes a
+local `lseek` for those unnecessary release operations. Pages still resident from
+previous guest activity are not skipped. Guest-exit unmapping and its events are
+separate from inflation. On this path, probing can still cost one `lseek` per
+page; it avoids the corresponding empty-range `madvise`, handler handshake, and
+shared-inode invalidation work. The hole fraction and convergence time depend on
+the workload and environment; this specification makes no universal 99% hole-rate
+or instantaneous-convergence claim.
 
 ### 3.5 0005 — persist the vsock host local-port cursor
 
@@ -449,64 +490,6 @@ provenance; cross-compilation alone does not exercise KVM resume. A successful
 small sample does not establish a failure rate or diagnose unrelated restore
 errors.
 
-### 3.10 0013–0014 — cumulative dirty memory
-
-Externally managed RAM enables MemoryManager-level KVM dirty logging during
-initialization. Existing software bits are accumulated first, without the VM
-migration hook that resets them. `GET /api/v1/vm.dirty-memory` returns version=1,
-page_shift=12, and each slot's GPA, size, memfd file_offset and cumulative u64
-bitmap. Every consumed source/slot is ORed into persistent state before reading
-the next or responding. A failed slot is made all dirty before returning its
-error. Patch 0014 validates the complete coordinate map before consuming any
-logs; changed registrations conservatively retain all known regions before
-returning an error. Lost responses and repeated collection never clear the accumulator.
-Go reads the complete bounded HTTP response, validates region coverage, overlap,
-offsets and unused bits, then converts into memfd coordinates. Raw net/vsock
-writable aliases and Go vhost DMA/status/used-ring writes mark their ranges
-before exposure, including partially failed writes.
-
-va_report v1 carries page_shift and file_offset; its ACK confirms registration
-adoption. Native 4 KiB x86 and ARM share the existing MISSING path. Data, Zero,
-parent Hole, tail and EnsureLoaded fills use ordinary COPY or ZEROPAGE, with
-zero-buffer COPY when shmem ZEROPAGE is unsupported. Filling restores the fixed
-baseline; writes are accumulated
-from KVM, CH and Go, and releases remain permanent candidates. No write-protect
-capability negotiation or fault path is required. KVM may conservatively report
-read-only x86 pages as dirty, so they can remain in a capture. MISSING fault
-write flags are not an exact guest-write signal and are not used to replace the
-KVM log. Unexpected WP or MINOR faults fail closed without overwriting live
-contents. Larger host pages are rejected.
-
-After pause, backend quiesce, CH snapshot writes and final log collection,
-CaptureView fixes M/D/R. UNMAP, registration gaps, broken event streams, or a
-Loaded page becoming Hole without release fail capture. Success, failure and
-merge_ref switches never reset D/R; existing lifecycle and exec/stdio barriers
-remain in force. See [Snapshot S and history](sandbox.md#snapshot-format).
-
-Patch 0016 adapts the HTTP portion of upstream's
-[glibc allocator fix](https://github.com/cloud-hypervisor/cloud-hypervisor/commit/660b18eaace7953721c8ecf371973fc6eb6e2f66).
-Freeing a large dirty-memory response can trigger arena trimming, whose lazy
-overcommit check reads `/proc/sys/vm/overcommit_memory`. This caused a reproduced
-6 GiB capture to terminate CH with SIGSYS before delivering the response.
-The backport keeps exact `O_RDONLY|O_CLOEXEC` flags; writable, creating and
-truncating opens remain trapped. It also includes upstream's
-[HTTP mremap allowance](https://github.com/cloud-hypervisor/cloud-hypervisor/commit/f05f0c249e69568dea3ef8e7208d63f6ef8922ea)
-for allocator growth. The latter is compatibility coverage, not the syscall
-observed in that capture failure. Child-process tests exercise actual filtered
-mapping growth, reads and rejected open modes; the existing 6 GiB Demo exercises
-the full capture path. The newer common-filter and SIGSYS-handler refactors are
-not prerequisites for this backport.
-
-The Host baseline remains Linux 5.10 with the existing MISSING_SHMEM support.
-Linux 6.6 in the proposal describes a validation host, not a new minimum.
-The unified native-log design accepts conservative x86 read-only candidates
-instead of requiring shmem write protection.
-When rebasing CH, reconcile its raw RX dirty marking and allocator fixes with
-0013 and 0016 instead of stacking duplicate implementations. In particular,
-upstream [RX completion marking](https://github.com/cloud-hypervisor/cloud-hypervisor/commit/3777ba8ded440cca2d953cd40e8b1ee43ae6c682)
-addresses the same raw-buffer gap; this cumulative checkpoint path also retains
-marks when a partially completed write returns an error.
-
 ## 4. Build workflow
 
 `sandboxer/native-deps` builds the artifact from the pinned v51.1 tarball,
@@ -599,7 +582,7 @@ behavior, including the patches:
 | `fd=` plus `uffd_socket=` | Not available | Create uffd, send it with metadata, and wait for ACK |
 | `/vm.snapshot` of a user-managed zone | Not applicable | Omit the zone from memory-ranges and skip the RAM dump |
 | `/vm.restore` of a user-managed zone | Not applicable | Skip fill; the mapping faults into the external handler when configured |
-| Balloon release of a hole-only file-backed run | Ordinary release path | Always `MADV_DONTNEED`, then probe; skip only unnecessary `PUNCH_HOLE` |
+| Balloon release of a hole-only file-backed run | Ordinary release path | Skip `PUNCH_HOLE` and `madvise`; resident runs retain ordinary release |
 | Balloon `deflate_on_oom=on` | Supported in v51.1 | Supported |
 | `vm.resize` `desired_balloon` | Supported | Used by the sandbox-local BalloonController |
 | virtio-mem `vm.resize` | Supported | Supported |
@@ -612,9 +595,8 @@ mmu_notifier/EPT and IPI-shootdown pressure and interfere with guest vsock progr
 The rationale and replacement feedback loop are described in the
 [guest kernel specification §5.5](https://github.com/kuasar-sandbox/guest-runtime/blob/main/docs/vmlinux.md#55-why-free_page_reporting-is-not-negotiated-and-the-role-of-virtio_mem). The sandbox-local BalloonController instead pushes inflate targets through
 `/vm.resize`, with at most one 64 MiB steady-shrink step for each fresh report.
-The current release path performs `MADV_DONTNEED` even for empty ranges covered
-by the cold-start target, then uses SEEK_DATA to avoid an unnecessary inode punch.
-Resident ranges also retain the required PUNCH_HOLE.
+Patch 0004 skips empty ranges covered by the cold-start target; runtime reclaim
+of resident pages still performs the complete release operations.
 `deflate_on_oom` is native to upstream v51.1 and needs no additional patch.
 
 ## 7. Known limitations
