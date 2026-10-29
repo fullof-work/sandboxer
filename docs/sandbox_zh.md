@@ -1184,6 +1184,184 @@ Snapshot ZIP 与 config 同样 strict、bounded、canonical。`config.json` 和 
 等价 publish/copy/rebase 原样保留条目存在性及 body；未验证 rewrite 或内容裁减保守
 使用全 dirty。内容或位图变化都会生成新 identity。
 
+<a id="legacy-ch-snapshot-design"></a>
+
+### 3.11 设计：使用旧 CH 二进制的快照
+
+**状态：拟议的兼容设计及验收要求，尚未交付支持。** 协议、准备屏障和资源条件见
+[CH 兼容设计](cloud-hypervisor_zh.md#legacy-ch-compatibility-design)。范围为新 sandboxer
+搭配现有 v51.1 + 0001–0012 CH，在两个原生架构上完成冷启动、捕获、原地 resume 和
+快照恢复。现代 v1/原生日志路径的固定 B、累计 D/R 和尺寸收益保持不变；只有明确
+识别出的旧生产者能力边界允许保守捕获。
+
+#### 兼容模式保存完整当前内存
+
+设 N 为 RAM 地址域，M 为最终物化页集合。所有 legacy 准备 ACK 完成后，物理 Hole
+不再承载尚未加载的非零基线。在既有 freeze 中（guest quiesce、CH pause、backend
+排空及 CH snapshot 写入后）固定 M，构造完整来源：
+
+```text
+L = Data(M 上当前 memfd 字节) + 显式 Zero(N 减 M)
+```
+
+L 不包含用于继承的 Hole。它的内容选择不依赖不完整的 CPU、CH、Go dirty 日志或
+释放通知；CH raw/部分写入、报错前已完成的写入、捕获失败和模式切换都不能因缺少
+D 位而被遗漏。不能为了填充当前 Hole 而读旧层叠 B，那会重新带回已丢弃内容。
+普通 ownership、事件流校验和既有失败恢复仍必须保留。读取和提交当前内存时仍
+冻结 VM，不引入后台快照或额外加速方案。
+
+旧模式下，merge_ref=true/默认和 false 均可将完整 L 写成新顶层。这是明确能力边界
+上的变化捕获退化，不允许现代路径始终全 dirty。false 仍保留完整当前工作集，
+额外 Zero 覆盖阻止父层内容复活。历史处理使用现有本地 dirty 候选并集、最终值选择
+和父视图证明；尊重历史 memory.dirty，缺失时将全部显式 Data/Zero 视为 dirty。
+legacy 本运行不能虚构 clean 标签。保持外部 ref 的身份、边界和顺序；不能因为 L
+遮住了当前父层字节就全局展开或删除外部引用。沿用既有历史裁剪/合并规则，不在本
+兼容变更中新增“删除所有父层”的优化。
+
+输出普通 V1 S，ZIP 只有原有三个条目，不写 memory.dirty；缺失恰好表示全部显式
+L 内容 dirty。snapshot.cfg 不新增运行模式或能力字段。后续恢复只依据所用 CH 的
+握手选择运行模式，不能依据制品生产者或缺失位图来选择。publish、rewrite、FileSink
+及加密 Bundle/ingest 必须保持 L 的完整逻辑内容和显式 Zero 覆盖。内容或引用变化
+按现有规则产生新身份，不能原地给旧输出重新贴标签。
+
+legacy 载体预算退化必须使用 **coverage=L、values=L**。现代 DataCoverage(M)
+的范围不足以压缩交替 Data/Zero 造成的碎片。legacy 的候选覆盖全域，可将 Zero
+升级为实际包含零的显式 Data，最坏输出 N 字节稠密内存 payload，以满足现有
+extent/index/ZIP 预算。绝不能把 Zero 变为 Hole，或改从父层取值。
+若全域表示仍不能满足限制或存储配额，则走既有失败恢复，不提交根制品。
+单独记录额外 Data、bitmap/ZIP 和完整载体成本。维持既有 64 MiB ZIP、1<<20
+extent、256 MiB index 上限，不提高格式限制。
+
+该 runtime 可以解释旧 S 所声明的完整逻辑内存，但不能重建旧生产者已经丢失的释放
+信息，也无法判断旧制品中的继承字节原本是否应为 Zero。不能声称添加或省略 dirty
+位图就修复了历史捕获的数据。
+
+<a id="legacy-ch-resource-design"></a>
+
+#### 明确的 legacy 恢复资源成本
+
+有界 scratch 不等于总驻留有界。仅检查 B 的可见 Data 小于 BudgetAtSnapshot 并不
+充分：准备过程可能把编码为 Data 的零页装入已经 balloon 的区域，随后 guest 首次
+访问又物化 N 的另一部分。旧 CH 无法为 host 标识这部分提前装入的额外内存。
+因此本设计保守地为**含 Data 的 legacy 恢复在整个生命周期内预留 Capacity**，
+但保持保存的 Guest Budget 和 balloon 目标。冷启动/可证明全零的 B 不需要这项
+预装，沿用原资源行为。这是明确的 legacy 宿主预留策略调整，不能声称资源行为不变。
+
+保持精确 Admit(BudgetAtSnapshot) 及初始 MemoryController 构造。识别 legacy 后、
+安装任何基线字节或 ACK 首个 region 前，在本地 mutation gate 下通过既有
+RequestBudget 事务取得 Capacity。可在**尚未安装任何字节**时逐次累计正的部分
+授权，遵守既有对齐、cooldown 和 startup/restore deadline；节点默认单次最多授权
+512 MiB，因此不能要求大 VM 一次 RPC 补足。每次确认的授权都更新同一权威 reservation
+基线。零/拒绝授权、畸形响应、响应丢失、取消或期限到达均终止启动并释放本次资源，
+不能允许部分准备或重新使用 lazy B。达到 Capacity 后停止，不新增 wire 协议、超时
+或无界零授权重试循环。
+
+动态、静态和无控制器模式必须经同一个内部准备事务；只改 ControllerHooks 会让
+staticReservation 保留旧值。禁用 node hook 时返回的算术成功不是 node 授权：静态/
+无控制器模式要求现有 host 策略下提供配置的 Capacity，只记录本地 floor，并明确
+处理正常分配失败。准备前固定 Capacity floor，并在运行、捕获、失败和
+重连期间保持。Guest TargetBudget、accepted/current balloon 状态及归一化仍分别
+保持原语义。每个实际 shrink RPC、本地 reservation 基线、StateSync、持久化/重建
+库存都必须遵守 floor。发送 shrink 请求前就必须钳制下限，响应丢失也不能使本地
+基线降低。这是只改变 reservation 的准备操作，不是 RequestPressureGrow 或 Guest
+balloon 命令；RPC 必须使用启动取消/deadline，不能只依赖长寿命 controller context。
+只改诊断输出不够。既有 node 库存会为 live startup lease
+预留 Capacity，StateSync 可承载实际 reservation；Settled/disconnect 不得提前返还。
+既有 startup-pool 指标最初按已 Admit 的 InitialBudget 计数，而 settled 前的 StateSync
+可能按当前 Capacity reservation 重建该值。须报告和测试重连前后的这一区别，不能
+声称 startup-pool 统计不变；预装前主 RAM 池必须已经按 Capacity 计费。
+
+该模式的 memory.high 不能低于已预留 RAM 上界加既有 overhead；要约束最终写入值，
+不能只改变既有比例计算的 Budget 入参。memory.max 仍为
+Capacity 加该 overhead。因此 legacy 恢复会在整个生命周期放弃按 host Budget
+收紧 memory.high 及节点 RAM 超卖的收益。不能禁用 balloon、修改 Guest 内容/目标、
+提高 memory.max 或绕过祖先限额。Host 无法授予所需预留时，明确报告所需/可用量并失败。
+只有 CH 已回收、UFFD/后端停止、所有自有 memfd/mmap 使用者释放 RAM 后，才能返还
+reservation。owner 崩溃或 node 重启后，仍存活 CH 必须继续计费或先被清理，才能返还
+资源；lease 锁消失本身不能证明 RAM 已释放。
+
+记录按页取整的可见 Data 并集作为预装上界，同时记录实际安装量、源缓存开销及
+cgroup/宿主总峰值。必须验证实际 UFFD 页计费，COPY 指向 CH VA 本身不是计费证明。
+源缓存及有界缓冲区保持各自既有 ownership/预算，不能藏在 guest-RAM 数字里。
+现代 CH 可能用更少的 reservation 懒恢复相同制品并更快 ready；不承诺旧生产者
+边界仍保留这些收益。任何省去 Capacity floor 的设计，都必须先完整证明物理驻留
+及已归还页的 ownership，不能把静默削弱 floor 当作常规实现选择。
+
+#### 兼容矩阵
+
+下表“新 sandboxer”指本设计未来的实现。新旧 CH 使用同一固定上游版本，且其他
+CPU/device state 兼容；这不是跨 CH 大版本或跨架构迁移承诺。
+
+| Runtime 与 CH | 输入 S | 必需结果 |
+| --- | --- | --- |
+| 新 sandboxer + 旧 CH | 冷启动全零基线 | 正确启动、捕获 L、resume 和恢复 |
+| 新 sandboxer + 旧 CH | 旧三条目 S，含本地/外部父层 | 准备完整层叠 Memory 后正确运行、捕获和恢复 |
+| 新 sandboxer + 旧 CH | 图中含新四条目 S，以及缺失/全零/混合 dirty 语义 | 恢复全部 Memory，含 clean Data；dirty 不参与恢复内容选择，但仍须校验 |
+| 新 sandboxer + 新 CH | 本设计生成的 legacy L | 使用现有懒恢复和累计捕获，不强制进入 legacy 模式 |
+| 新 sandboxer + 新 CH | 既有新旧 S | 现代契约及尺寸收益保持不变 |
+| 旧 sandboxer + 旧 CH | 整个可达 S 图均为三条目的 L | 旧 reader 可解析格式，但未修复其旧的懒加载释放缺陷 |
+| 旧 sandboxer + 旧 CH | 三条目 L 引用任何四条目 S 父层 | 不承诺 reader 兼容；父图预检仍可能拒绝 |
+| 旧 sandboxer + 新 CH | 任意 S | 不在范围内；旧无版本 ACK 仍被拒绝 |
+| 任意 runtime | 未知/部分协议、不支持的映射或不兼容 CH CPU/device state | 明确失败，不降级或捕获错误内容 |
+
+顶层完整 L 不允许旧 reader 跳过正常父图校验。二进制搭配、文件格式可读与运行期
+正确性是三个不同承诺；发布时必须说明实际通过了哪些组合。
+
+#### 实现边界
+
+1. 在 `pkg/uffd/vareport.go` 与 `pkg/sandbox/serveandwait.go` 接入不可变协议/捕获
+   模式，以及经核验的 legacy 映射 adoption。
+2. 在 `pkg/uffd` 分开区域准备与运行 readiness，完整 B owner 与永久 legacy
+   ZeroSource 分离，不新增 WP 队列。
+3. 在 `pkg/snapshot` 增加 legacy L 选择及全域预算退化，复用格式、历史、发布和
+   生命周期的既有 owner。
+4. 在 `pkg/resctl` 和既有恢复接线增加内部宿主预留下限事务，覆盖静态状态、shrink
+   和重连。现有 node wire 消息足够；实施前复核实际服务端语义，确需跨仓变更时说明依据。
+5. 增加可重建的旧/完整 CH 夹具及下列验收。不得删除现代丢响应/释放测试，也不能
+   将未来测试计为已经执行。
+
+#### 宣称支持前的必需验收
+
+从官方固定 tarball 和恰好 0001–0012 重建旧测试 CH，以完整编号补丁栈构建现代对照。
+分别记录提交、补丁列表、源码 tree、工具链和二进制哈希。不能因为远端已有可执行
+文件的名字或版本叫“old”就将其作为验收对象。WSL 能执行的测试优先在本机完成，
+缺少必要条件时只使用已授权原生 x86/ARM 主机；无需运行 WSL 内 Codex。
+本次文档变更尚未执行这些未来测试。
+
+| 领域 | 必需证据 |
+| --- | --- |
+| 旧正确性反例 | 不可变 B 中某页非零，旧懒恢复 runtime 中该页仍物理未加载；证明真实旧 CH 释放了该 PFN 且此前未读取它，再展示错误继承，或明确报告未能复现。capacity/balloon 总量不能证明具体页。此前不得运行全 RAM 观察器。 |
+| 准备后的替代路径 | 相同源及真实旧 CH 搭配新 runtime：执行前所有可见 Data 页已准备；释放并捕获后目标页为显式 Zero，完整恢复内存与正确参考一致。 |
+| 初始及运行期写入 | CPU、CH raw net/vsock、Go backend、初始化、部分错误和连续捕获均保存实际字节；旧模式不调用 dirty-memory。包括失败捕获后的成功重试。 |
+| 释放顺序 | 真实旧空 Hole 早退、PUNCH-before-MADV 窗口、部分释放失败、补零及重用；组件测试在操作间注入失败，并补充真实 sandbox 捕获/恢复。现代路径缺 R 的失败检查仍有效。 |
+| 协议与生命周期 | 旧/v1、部分字段、null/未知版本、混用 region 协议、分段帧、错误/缺失 FD、peer 身份发布竞争、maps 权限不足、ACK 丢失、早区 ACK 后后区构造失败/UNMAP（含配置零超时）、源损坏/超时/取消和部分 COPY；失败后不得发布 ready、泄漏 worker/FD 或复用半成品 memfd。v1 API 404/丢响应绝不切 legacy。 |
+| 地址及源几何 | 两个架构的单/多 region，x86 >3 GiB、ARM >3008 MiB，VMA 拆分/合并、报文乱序、非零 offset、别名/重叠/空隙/溢出拒绝，字节粒度 Data 和跨页层边界。 |
+| 模式及父图 | 两种 merge_ref、连续捕获及模式交替、单/多本地父层、clean 副本、无法证明父视图等价和外部 ref 顺序；覆盖上表每个受支持的新旧 CH/S 组合。 |
+| 载体及发布 | 位图缺失与全零、非法编码、三/四条目父图校验、FileSink、加密 Bundle/ingest、publish 和两种 rewrite；强制 Data/Zero 碎片超出测试预算，Zero-to-Data 退化后重开并比较全部逻辑字节。不能用父层读取补 L 的当前 Hole。 |
+| 资源 | Snapshot Budget 小于 Capacity、编码为 Data 的零页、balloon 区域中的非零继承页、Capacity 预留、超过 512 MiB 单步上限的部分授权、拒绝/丢响应预留、静态/无控制器模式、cache 与 memfd 页计费、遵守 floor 的 cgroup/shrink、重连/StateSync、owner/node 崩溃、取消及完整清理。有界缓冲区不能单独作为通过依据。 |
+| 原生集成 | WSL/x86/ARM 适用路径上真实 sandbox 捕获与恢复、可工作的负载/stdio 和完整逻辑内存等价；架构状态写入需要时使用独立完整内存恢复对照，不能仅比较 bitmap、只证明启动成功或使用无法解释的字节掩码。 |
+
+正确性测试必须在触发“未物化页”的反例**之后**才能观察完整当前字节，否则观察器
+会消除触发条件。性能测试则必须将全 RAM 观察器完全移出计时区间。
+比较旧 runtime/旧 CH 对照、新 runtime/旧 CH 兼容模式、新 runtime/新 CH，保持
+RAM 状态、父链、冷热缓存、编码/压缩、存储和 guest 负载一致。
+正确性失败的对照不能作为成功兼容的依据。
+
+分别报告请求完成、guest freeze 到 guest thaw 的停顿、CH pause 调用、日志采集/
+准备、内存与历史编码/写入/提交、CH resume、stdio 重接；新进程恢复还应报告源
+读取/预装、请求到 ready、首次成功应用操作耗时。现有 pause_ms 只测 CH pause
+调用、不含 dump；dump_ms 也不含部分 quiesce/重接。不能将任何一个称为完整停顿。
+记录重复次数、分布和 p50/p95；有足够样本（至少 100）才报告 p99。
+既有 smoke 通过不能替代前后延迟对比。
+
+dirty bitmap 已包含于 ZIP，退化的额外 Data 已包含于 Data，均不能重复相加。
+尺寸报告需分列内存 Data、显式 Zero、dirty bitmap、ZIP、其余载体开销、顶层和
+本地历史载体，以及按身份去重的可达本地总字节。区分普通兼容成本与强制稠密退化。
+另报告基线读取量、预装峰值/稳定 RAM，以及额外 reservation 持有时间。
+不承诺旧 CH 获得脏页尺寸收益、恢复加速或 pause 零回退。
+保留现代路径已有测试及尺寸结果；实现或修复引起的改动须重跑受影响验证，并经
+独立检视后才能描述为完整交付。
+
 ## 4. 资源模型
 
 ### 4.1 三种部署模式
@@ -2264,7 +2442,7 @@ Guest 诊断字段与 host `memory.current` 不决定 Budget；host `memory.curr
 
 短暂分配突发可能触发 Guest 应急 deflate，并在两份报告之间结束。如果随后 inflate 停在 accepted target 以下，controller 可在同一 epoch 内两份新鲜报告确认 target 和 actual 均未变化后，重新通知同一个 target。新鲜报告的 RequestedBudget 必须不超过 TargetBudget，且现有 reservation 仍须覆盖 TargetBudget。正常的有界新 target 和部分结算优先执行。未完成的 grow、restore normalization、pressure、已被取代的报告，以及任何 actual 或 target 变化，都会使重试候选失效。操作仍通过 mutation gate 与 snapshot/export 串行，并在写入前重新检查 CH 状态及报告资格。这次重试不申请额外 reservation，不降低 `memory.high`，也不返还 reservation；后续 actual 观测沿用正常结算路径。每次尝试都会消耗两份报告的确认，因此 reconcile ticker 不会反复 resize 停滞的 Guest。响应丢失后，仅凭 accepted target 未变不能确认该次通知送达，HTTP 成功也不能替代实际进展观测。
 
-源码见 [memory.go](../pkg/resctl/memory.go)、[memory_controller.go](../pkg/resctl/memory_controller.go) 和 [balloon.go](../pkg/resctl/balloon.go)。稀疏 `PUNCH_HOLE`/`MADV_DONTNEED` 与 hole-only skipping 仍由 [VMM patch 0004](cloud-hypervisor_zh.md#34-0004--balloon-release-跳过-user-managed-zone-的空洞-run) 定义。
+源码见 [memory.go](../pkg/resctl/memory.go)、[memory_controller.go](../pkg/resctl/memory_controller.go) 和 [balloon.go](../pkg/resctl/balloon.go)。稀疏 `PUNCH_HOLE`/`MADV_DONTNEED` 与 hole-only skipping 仍由 [VMM patch 0004](cloud-hypervisor_zh.md#balloon-release-hole-probe) 定义。
 
 ## 10. Resource protocol
 

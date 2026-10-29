@@ -281,6 +281,8 @@ that deterministic ordering. Run both with the prepared source/artifact contract
 and the existing KVM pressure coverage, including the Linux 5.10 floor. These are
 validation requirements, not a claim that an unexecuted run passed.
 
+<a id="balloon-release-hole-probe"></a>
+
 ### 3.4 0004 — balloon hole probing (ordering superseded by 0013)
 
 0004 introduced SEEK_DATA for file-backed RAM and allowed SYS_lseek in the
@@ -506,6 +508,145 @@ When rebasing CH, reconcile its raw RX dirty marking and allocator fixes with
 upstream [RX completion marking](https://github.com/cloud-hypervisor/cloud-hypervisor/commit/3777ba8ded440cca2d953cd40e8b1ee43ae6c682)
 addresses the same raw-buffer gap; this cumulative checkpoint path also retains
 marks when a partially completed write returns an error.
+
+<a id="legacy-ch-compatibility-design"></a>
+
+### 3.11 Design: compatibility with CH before patches 0013–0016
+
+**Status: design and acceptance requirements only; not implemented or validated.**
+The current implementation requires va_report v1 even when checkpoint is not
+requested. This section specifies a future new-sandboxer/old-CH pairing. Here
+“old CH” means the pinned v51.1 build with the existing 0001–0012 series; it does
+not mean unmodified upstream CH, which lacks the platform's memfd/UFFD plumbing.
+No additional CH patch, Host kernel upgrade, UFFD WP path or architecture-dependent
+logging mode is proposed. Guest, pause, exec/stdio, balloon and disk semantics stay
+intact; the explicit legacy host-reservation cost is specified in the
+[sandbox resource design](sandbox.md#legacy-ch-resource-design). The Host floor remains Linux 5.10 and the supported host page is 4 KiB.
+
+The existing source has a correctness gap relevant to this compatibility work:
+0004 returns early when a released range is already a memfd Hole. After a lazy
+restore, that Hole may inherit nonzero parent bytes; no REMOVE then distinguishes
+release from “not loaded yet”. A later fill or a capture that inherits the Hole
+can expose the old value. Cold zero baselines hide this distinction. This is a
+source-derived counterexample, not a claim that every old snapshot is corrupt or
+that an old-binary reproduction has already passed. Old CH also punches resident
+ranges before MADV_DONTNEED publishes release. Supporting it requires a runtime
+that does not depend on these notifications to recover nonzero inherited bytes.
+Merely dropping the version check, treating HTTP 404 as an empty dirty log, or
+marking resident pages all dirty is insufficient.
+
+#### One immutable capability decision per VM
+
+The first valid va_report selects one internal memory-capture mode for this
+process. It is not a new user flag or snapshot.cfg field. All regions must agree.
+
+| Report | Selected behavior | Reply |
+| --- | --- | --- |
+| Complete v1: version=1, page_shift=12, explicit file_offset, valid geometry | Existing cumulative native logs and lazy baseline | Existing versioned ACK after adoption |
+| Exact old report: all three new fields absent, valid old fields and FD | Compatibility with complete current memory and zero-only subsequent fills | Old unversioned ACK after region preparation |
+| Partial/new fields, explicit null, unknown version, wrong geometry or mixed modes | Reject and terminate incomplete startup | Error; no downgrade |
+
+Retain complete bounded frame/SCM_RIGHTS reception, exactly-one-FD validation,
+staged adoption, cleanup and cancellation. V1 dirty API timeout, HTTP 404, invalid
+encoding, missing region, response loss or slot failure remains a capture error;
+it never changes the process to compatibility mode. Cumulative retention and
+retry rules are unchanged. The old mode never calls the new dirty API.
+
+For the old protocol, derive the missing memfd offset from the actual mapping,
+not the region's arrival order or an assumed single ARM region. Wait for the
+existing spawn operation to publish its child identity, bind SO_PEERCRED to that
+CH child, then validate `/proc/<pid>/maps` against fstat of the owned RAM memfd.
+Every VMA covering the reported VA interval must be readable/writable shared RAM
+with matching device/inode and continuous file offsets. Allow VMA splits/merges;
+reject gaps, aliases with overlapping memfd ranges, overflow and out-of-bounds
+ranges. Preserve child identity while inspecting; PID reuse or an unexpected
+peer fails. Before readiness/capture, registered intervals must cover the entire
+capacity exactly once. Reading the owned child's mappings is an explicit legacy
+capability requirement; denial fails with a clear error, never a guessed offset.
+
+Limit this compatibility contract to the existing single `ram0` shared memfd,
+4 KiB geometry and prefault=false, no memory hotplug or virtio-mem. Validate the actual cold config
+and restored MemoryManager mapping table; capacity validation alone does not
+prove these conditions. Restored memory_ranges must be empty, and all RAM
+mappings must belong to the supported zone and cover its capacity without overlap.
+Both x86 above 3 GiB and ARM above 3008 MiB can have multiple guest regions; the
+memfd remains continuous across their guest-physical gaps.
+
+#### Region preparation before ACK
+
+Use the old CH's existing synchronous construction barrier: every RAM region is
+registered and reports its FD before MemoryManager construction can finish;
+CPU/device-manager creation and guest payload writes follow that construction.
+For each verified region, materialize its portion of the **complete layered
+restore Memory B**, including clean copies, before sending that region's ACK.
+Use ordinary UFFDIO_COPY into the registered CH mapping with bounded buffers and
+explicit memfd coordinates. Do not pwrite the whole memfd through sandbox-ctl's
+unaccounted host alias, and do not wait for unregistered later regions while CH
+is synchronously waiting for this ACK. This is eager preparation per region,
+not eager loading on the first runtime page fault.
+
+Compose complete 4 KiB pages from B, including byte-granular Data/Zero/Hole runs
+and layer boundaries. Every page with visible Data must be prepared; a page
+represented entirely by Zero/Hole may remain absent. Data-encoded zero pages
+are still prepared; there is no unverified zero-detection optimization. Cold B is zero and needs no
+capacity-sized preparation. Handle partial COPY explicitly. Existing contents
+must never be overwritten blindly: unexpected EEXIST requires proof of byte
+agreement with B or aborts preparation. No guest/CH/backend writer or speculative
+baseline loader may run ahead of its preparation barrier. The existing uffdReady closes after the first region and is **not** a complete
+preparation barrier. In legacy mode, earlier prepared regions may be ACKed so CH
+can construct the next one, but runtime UFFD workers and all Go/backend RAM
+access remain behind a separate whole-VM preparation gate. Register and prepare
+subsequent regions without waiting for that gate. Once all registered/prepared
+intervals cover the entire RAM capacity, start fill workers and publish RAM readiness before the final
+ACK. No zero-fill or speculative work may race an unprepared region. Keep modern
+startup sequencing unchanged; source I/O is outside install locks.
+
+The FD lifetime/control-event reader must operate from adoption onward, including
+while runtime fill workers are gated. Exactly one dispatcher reads each FD;
+opening runtime work must not add a competing reader. During preparation, RAM
+REMOVE, UNMAP, EOF or PAGEFAULT invalidates preparation and aborts startup. The
+supported constructor has no legitimate release or runtime fault at that point;
+recording Released and proceeding would lose previously prepared Data. Error
+publication and the final prepared/gate/ACK commit must be serialized, so an
+invalidated region cannot be ACKed. No event is queued for an early zero fill. In particular, if an early region was ACKed
+but a later construction fails, consume/invalidate UNMAP and cancel/close owned
+FDs so CH can unwind. Consume the event before teardown, cancel the operation,
+and wait for in-flight COPY under the existing ownership rules before closing
+its FD; do not race descriptor reuse. Do not wait for natural CH exit while it is synchronously
+waiting for an unconsumed event, or rely on a configured deadline that may be
+zero. No new pending-fault/retry queue or forced timeout is needed.
+
+After preparation, the handler's runtime source is permanently ZeroSource for
+this VM; fault, tail and backend EnsureLoaded paths must all obey it. Keep B and
+its owners alive separately for metadata/history as needed, but never use B for
+a subsequent fill. Final readiness requires complete prepared/registered coverage.
+A read error, digest failure, cancellation, deadline, lost ACK or adoption failure
+aborts launch, joins workers and disposes the private memfd; it cannot publish a
+partly restored VM or silently zero unread Data. Propagate the existing parent
+restore/launch and handshake deadlines into source reads and COPY; a socket
+deadline alone does not cancel a blocked preparation callback. No silent timeout
+extension is part of this design.
+
+The resulting invariant is: **after preparation, every physical memfd Hole is
+current logical zero, never deferred nonzero B**. Old CH's skipped empty-hole
+release and its PUNCH-before-MADV window therefore cannot resurrect parent bytes.
+In this mode only, a physically absent Loaded page does not require an observed
+R bit before zero filling or capture. Express that distinction explicitly; nil
+Dirty is not a supported mode selector. The v1 Loaded-to-Hole check remains strict.
+UNMAP, broken event streams, changed geometry, wrong ownership and other fatal
+errors remain fatal in both modes. Existing observed REMOVE handling still runs;
+legacy capture obtains values from the final frozen memfd, not from D/R history.
+
+Resource admission must complete before any preparation COPY. The explicit
+[legacy restore reservation floor](sandbox.md#legacy-ch-resource-design) can
+require Capacity for the VM lifetime; it does not change the Guest balloon target.
+
+Capture/format/history rules and the cross-version acceptance matrix are owned
+by [the snapshot compatibility design](sandbox.md#legacy-ch-snapshot-design).
+Log the selected mode once, the verified CH build identity, preparation bytes,
+reservation and phase durations through existing diagnostics. Do not infer
+capability from `--version`: both builds can report v51.1. An old sandboxer paired
+with the new CH is outside this change; its unversioned ACK is still insufficient.
 
 ## 4. Build workflow
 

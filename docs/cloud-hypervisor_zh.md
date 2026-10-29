@@ -239,6 +239,8 @@ guest 的 pinning/prefetch 可能填充候选页，因此 E2E 本身不能证明
 结合现有 KVM 内存压力覆盖执行两类测试，并验证 Linux 5.10 最低版本。
 这些是验证要求，不代表尚未执行的测试已经通过。
 
+<a id="balloon-release-hole-probe"></a>
+
 ### 3.4 0004 — balloon 空洞探测（当前顺序由 0013 修正）
 
 0004 引入 file-backed RAM 的 SEEK_DATA 探测及 balloon 线程 `SYS_lseek`
@@ -415,6 +417,114 @@ Host 基线仍为 Linux 5.10，使用既有 MISSING_SHMEM 支持。提案中的 
 未来升级 CH 时，应将其 raw RX dirty 标记和 allocator 修复与 0013、0016 对照，
 避免叠加重复实现。上游 [RX 完成后标记](https://github.com/cloud-hypervisor/cloud-hypervisor/commit/3777ba8ded440cca2d953cd40e8b1ee43ae6c682)
 修复相同的 raw buffer 覆盖缺口；当前累计 checkpoint 路径还保留部分写入后返回错误时的标记。
+
+<a id="legacy-ch-compatibility-design"></a>
+
+### 3.11 设计：兼容未包含 0013–0016 的 CH
+
+**状态：仅为设计及验收要求，尚未实现或验证。** 当前实现即使不请求 checkpoint
+也要求 va_report v1。本节规定后续“新 sandboxer 搭配旧 CH”的支持范围。
+“旧 CH”指固定 v51.1 加既有 0001–0012 补丁，不是缺少平台 memfd/UFFD 接线的
+原版上游 CH。本设计不新增 CH 补丁、Host 内核门槛、UFFD WP 路径或按架构选择的
+日志模式。Guest、pause、exec/stdio、balloon 和磁盘语义保持不变；
+[sandbox 资源设计](sandbox_zh.md#legacy-ch-resource-design)明确列出 legacy 宿主预留成本。
+Host 基线仍为 Linux 5.10，支持的宿主页粒度仍为 4 KiB。
+
+旧源码存在与兼容有关的正确性缺口：0004 在被释放区间已经是 memfd Hole 时
+提前返回。懒恢复后，这个 Hole 可能继承父层非零内容；缺少 REMOVE 就无法区分
+“释放”和“尚未加载”。随后填充或捕获时继续继承 Hole，可能重新暴露旧值。
+冷启动的全零基线会掩盖这一区别。这是从源码推导出的反例，不表示所有旧快照
+均已损坏，也不表示已经完成旧二进制复现。旧 CH 对驻留区间还会先 PUNCH、再以
+MADV_DONTNEED 发布释放。兼容 runtime 必须能够不依赖这些通知来区分非零继承内容。
+仅删除版本检查、把 HTTP 404 当空 dirty 日志或将驻留页全标 dirty 都不充分。
+
+#### 每个 VM 只选择一次能力模式
+
+首个合法 va_report 为本进程选择内部内存捕获模式。它不是新的用户开关，也不写入
+snapshot.cfg。所有 region 必须使用同一模式。
+
+| 报文 | 选择的行为 | 响应 |
+| --- | --- | --- |
+| 完整 v1：version=1、page_shift=12、显式 file_offset、合法几何 | 现有累计原生日志与懒加载基线 | adoption 后回复现有带版本 ACK |
+| 严格旧报文：三个新字段全部缺失，旧字段和 FD 合法 | 完整当前内存兼容模式，后续缺页只补零 | 区域准备完成后回复旧无版本 ACK |
+| 部分新字段、显式 null、未知版本、错误几何或混用模式 | 拒绝并终止未完成的启动 | 返回错误，不降级 |
+
+保留完整且有界的帧/SCM_RIGHTS 接收、恰好一个 FD 的校验、分阶段 adoption、清理与
+取消。v1 dirty API 超时、HTTP 404、非法编码、缺失 region、响应丢失或 slot 采集失败
+仍是捕获错误，绝不把本进程切为兼容模式；累计保留和重试规则不变。
+旧模式不调用新的 dirty API。
+
+旧协议缺少的 memfd offset 从实际映射推导，不能依赖报文到达顺序或假定 ARM 只有
+一个 region。等待既有 spawn 操作发布子进程身份，将 SO_PEERCRED 绑定到该 CH
+子进程，再以 RAM memfd 的 fstat 结果核对 `/proc/<pid>/maps`。
+覆盖上报 VA 区间的所有 VMA 必须为可读写共享 RAM，device/inode 相同、file offset
+连续。允许 VMA 拆分和合并；拒绝空隙、memfd 范围重叠的别名、溢出和越界。
+检查期间保持子进程身份有效；PID 复用或非预期 peer 均失败。
+在 ready/capture 前，已注册区间必须恰好覆盖全部 capacity。
+读取自有 CH 子进程映射是明确的 legacy 能力条件；权限不足时清晰报错，不猜 offset。
+
+兼容范围限于现有单 `ram0` 共享 memfd、4 KiB 几何、prefault=false，无内存热插拔或 virtio-mem。
+必须校验实际冷启动配置和恢复的 MemoryManager mapping table；只校验 capacity
+不能证明这些条件。恢复时 memory_ranges 必须为空，所有 RAM mapping 必须属于
+受支持 zone，并无重叠地覆盖其容量。x86 超过 3 GiB、ARM 超过 3008 MiB 时都可能
+拆成多个 guest region；memfd 在 guest 物理地址空隙两侧仍连续。
+
+#### 每个 region 在 ACK 前准备完成
+
+使用旧 CH 已有的同步构造屏障：每个 RAM region 完成注册并报告 FD 后，才可能继续
+MemoryManager 构造；CPU/device manager 的创建与 guest payload 写入在其后。
+针对每个已核验 region，在回复该 region 的 ACK 前，装入**完整层叠恢复 Memory B**
+对应的内容，包括 clean 副本。通过有界缓冲区、明确的 memfd 坐标，使用普通
+UFFDIO_COPY 写入已注册 CH 映射。不能由 sandbox-ctl 经未计入预期组的 host alias
+pwrite 整个 memfd；也不能在 CH 同步等待本次 ACK 时等待尚未注册的后续 region。
+这是逐 region 提前准备，不是等运行期首次缺页才加载。
+
+按 B 合成完整 4 KiB 页，正确跨越字节粒度 Data/Zero/Hole run 和层边界。
+任何包含可见 Data 的页都必须准备完成；完全由 Zero/Hole 表示的页可以保持未物化；编码为 Data 的零页仍然准备，
+不引入未经核验的零检测优化。
+冷启动 B 为零，无需填充整个 capacity。显式处理 COPY 的部分完成；不能盲目覆盖
+已有内容，非预期 EEXIST 必须证明其字节与 B 相等，否则终止准备。
+Guest、CH、后端 writer 和推测式基线加载均不得越过准备屏障；既有 uffdReady 在首个 region 后就关闭，**不能**充当完整准备屏障。
+legacy 模式可以 ACK 先前已准备 region，让 CH 继续构造下一区域，但运行期 UFFD
+worker 和所有 Go/backend RAM 访问必须等待单独的全 VM 准备 gate。后续 region
+的注册和预装自身不得等待该 gate。已注册/准备区间覆盖全部 RAM capacity 后，先启动填充 worker、
+发布 RAM readiness，再回复最后一个 ACK。补零或推测式工作不能与未准备区域竞争。
+现代路径启动顺序保持不变；源 I/O 不得在 install 锁内执行。
+
+FD 生命周期/控制事件 reader 必须从 adoption 起工作，包括填充 worker 尚被 gate
+阻挡的阶段。每个 FD 只能由一个 dispatcher 读取；开放运行工作不能新增竞争 reader。
+Preparing 阶段的 RAM REMOVE、UNMAP、EOF 或 PAGEFAULT 都必须使准备失效并中止
+启动；受支持构造流程此时没有合法释放或运行期缺页，若只记录 Released 后继续，
+可能丢失已经准备的 Data。错误发布与最终 prepared/gate/ACK 提交必须互斥，
+已失效区域不能 ACK，任何事件都不能排队等待提前补零。尤其是早期 region 已 ACK、后续构造
+失败时，要消费 UNMAP、使映射失效并取消/关闭自有 FD，让 CH 能展开清理。应先消费事件再 teardown、取消操作，并按既有 ownership
+等待在飞 COPY 结束后再关闭 FD，防止描述符复用竞争。
+不能在 CH 同步等待未消费事件时只等待其自然退出，也不能仅依赖可能配置为零的
+deadline。无需新增 pending-fault/重试队列或强制超时。
+
+准备完成后，该 VM 的运行期 handler source 永久为 ZeroSource；fault、tail 和
+后端 EnsureLoaded 都必须遵守。可为元数据/历史处理单独保留 B 及其 owner，但后续
+填充绝不再使用 B。最终 ready 要求全部区域完成准备和注册。
+读取、摘要校验、取消、deadline、ACK 丢失或 adoption 失败均中止启动、join worker
+并释放私有 memfd；不能发布只恢复了一部分的 VM，也不能把未读 Data 静默补零。
+既有父级 restore/launch 和握手 deadline 必须传入源读取及 COPY；只设 socket
+deadline 不能取消阻塞的准备回调。本设计不静默延长超时。
+
+由此建立不变量：**准备完成后，物理 memfd Hole 只能表示当前逻辑零，不能表示
+尚未加载的非零 B**。旧 CH 跳过空 Hole 释放、先 PUNCH 后 MADV 的窗口均不会再让
+父层内容复活。仅在该模式下，Loaded 页实际缺失时，补零与捕获不再要求已观察到 R 位。
+必须显式表达这一区别，不能以 nil Dirty 充当模式开关；v1 的 Loaded-to-Hole 检查仍
+严格保留。UNMAP、事件流损坏、几何变化、错误 ownership 和其他致命错误在两种模式
+都必须失败。已观察到的 REMOVE 仍正常处理；legacy 捕获读取冻结 memfd 的最终值，
+不依赖 D/R 历史来选择内容。
+
+任何准备 COPY 前必须完成资源准入。[legacy 恢复预留下限](sandbox_zh.md#legacy-ch-resource-design)
+可能要求在 VM 整个生命周期预留 Capacity，但不改变 Guest balloon 目标。
+
+捕获、格式、历史规则及跨版本验收矩阵由[快照兼容设计](sandbox_zh.md#legacy-ch-snapshot-design)
+维护。通过既有诊断记录一次所选模式、核验过的 CH 构建身份、预装字节、reservation
+和各阶段耗时。不能按 `--version` 判断能力：两套构建都可能显示 v51.1。
+旧 sandboxer 搭配新 CH 不在本次范围内，其无版本 ACK 仍不足以通过新 CH 握手。
 
 ## 4. 构建工作流
 

@@ -1316,6 +1316,233 @@ coverage. Equivalent publish/copy/rebase preserves entry presence and body.
 Unverified rewrite or reduction uses conservative all-dirty metadata. Changing
 content or the bitmap creates a new identity.
 
+<a id="legacy-ch-snapshot-design"></a>
+
+### 3.11 Design: snapshots with an older CH binary
+
+**Status: proposed compatibility design and acceptance requirements, not shipped
+support.** The protocol, preparation barrier and resource conditions are defined
+in [CH compatibility](cloud-hypervisor.md#legacy-ch-compatibility-design). Scope
+is a new sandboxer with the existing v51.1 + 0001–0012 CH, for cold start, capture,
+in-place resume and snapshot restore on both native architectures. The modern
+v1/native-log behavior and its fixed B, cumulative D/R and size gains stay intact.
+Only the explicitly detected old-producer boundary permits conservative capture.
+
+#### Complete current memory in compatibility mode
+
+Let N be the RAM address domain and M its final materialized pages. After all
+legacy preparation ACKs, no nonzero baseline remains deferred in a physical
+Hole. During the existing freeze (guest quiesce, CH pause, backend drain and CH
+snapshot writes), fix M and construct the complete source:
+
+```text
+L = Data(current memfd bytes on M) + explicit Zero(N minus M)
+```
+
+L contains no inheriting Hole. It is selected independently of incomplete CPU,
+CH or Go dirty logs and release notifications. Raw/partial CH writes, writes
+before an error, failed captures and mode switches cannot be omitted by a missing
+D bit. Do not obtain L by reading the old layered B to fill current holes: that
+would restore discarded data. Normal ownership/event-stream validation and the
+existing failure recovery remain required. Capture still freezes the VM while
+reading and committing its current bytes; this is not a new background snapshot
+or acceleration scheme.
+
+Both merge_ref=true/default and false may emit this complete L as the new top in
+the old mode. This is a named capability-boundary degradation from change-only
+capture, not permission to make the modern path all dirty. False still preserves
+the full current working set; extra Zero coverage prevents parent resurrection.
+Use the existing local-history candidate union, final-value selection and parent
+view proof. Respect historical memory.dirty, and treat its absence as all explicit
+Data/Zero dirty. The legacy run never invents clean labels for itself. Preserve
+external-ref identities, boundaries and order; do not globally flatten/drop
+external references just because L hides their current bytes. Existing history
+pruning/merge rules remain; a new “drop every parent” optimization is not part of
+this compatibility change.
+
+Write an ordinary V1 S with the three existing ZIP entries and no memory.dirty;
+absence correctly means all explicit L content is dirty. No runtime mode or
+capability field is added to snapshot.cfg. A future restore selects its runtime
+mode from its CH handshake, never from an artifact's producer or absent bitmap.
+Publish, rewrite, FileSink and encrypted Bundle/ingest preserve the complete
+logical L and its explicit Zero coverage. Content and reference changes produce
+normal new identities; an old output is never relabeled in place.
+
+Use **coverage=L and values=L** for a legacy carrier-budget fallback. The modern
+DataCoverage(M) restriction cannot compact alternating Data/Zero runs enough.
+The legacy full-domain candidate permits Zero to become explicit Data containing
+zero, up to a dense N-byte memory payload, to satisfy existing extent/index/ZIP
+budgets. It never permits Zero to become Hole or values to come from a parent.
+If even the full-domain representation cannot meet a limit or storage quota,
+fail through existing capture recovery without committing a root. Record the
+extra Data, bitmap/ZIP and complete carrier costs separately. Keep the existing
+64 MiB ZIP, 1<<20 extent and 256 MiB index limits; no format-limit increase is
+proposed.
+
+This runtime can interpret an old S's declared complete logical memory. It cannot
+reconstruct release information already omitted by an older producer, nor infer
+whether an inherited byte in an old artifact was originally a missing Zero.
+Do not claim to repair previously captured data by adding an absent dirty bitmap.
+
+<a id="legacy-ch-resource-design"></a>
+
+#### Explicit legacy restore resource cost
+
+Bounded scratch does not bound total resident RAM. Checking only that B's visible
+Data fits BudgetAtSnapshot is insufficient: preparation can install Data-encoded
+zeros in already ballooned pages, then later guest first touches can populate a
+different part of N. Old CH cannot identify that preloaded ballast for the host.
+The conservative design therefore reserves **Capacity for the lifetime of a
+legacy restore containing Data**, while preserving the captured Guest Budget and
+balloon target. Cold/known-zero B needs no such preload and keeps the existing
+resource behavior. This is an explicit legacy host-reservation policy change,
+not a claim that resource behavior is unchanged.
+
+Keep exact Admit(BudgetAtSnapshot) and initial MemoryController construction.
+After identifying legacy and before installing any baseline byte or ACKing its
+first region, acquire Capacity through the existing RequestBudget transaction
+under the local mutation gate. Positive partial grants can be accumulated while
+**zero bytes have been installed**, honoring existing alignment, cooldown and
+startup/restore deadlines; the node's default 512 MiB grant step makes a
+single-RPC requirement incorrect for large VMs. Each confirmed grant updates the
+same authoritative reservation baseline. Zero/denied grants, malformed replies,
+lost responses, cancellation or expiry abort startup and release its resources;
+they never permit partial preparation or a return to lazy B. Stop after reaching
+Capacity; do not invent a new wire protocol, new timeout or unbounded zero-grant
+retry loop.
+
+Use one internal preparation transaction for dynamic, static and unmanaged
+controllers; changing only ControllerHooks would leave staticReservation stale. A disabled
+node hook returning arithmetic success is not a node grant: static/unmanaged
+mode requires the configured Capacity to be available under its existing host
+policy, records a local floor, and keeps normal allocation failures explicit.
+Latch the Capacity floor before preparation and keep it through runtime,
+captures, failures and reconnects. Guest TargetBudget, accepted/current balloon
+state and normalization remain separate and unchanged. Every actual shrink RPC,
+local reservation baseline, StateSync and persisted/reconstructed inventory must
+honor the floor. Clamp before sending a shrink request; a lost reply must never
+install a lower local baseline. This is a reservation-only preparation operation,
+not RequestPressureGrow or a Guest balloon command, and its RPCs must use the
+startup cancellation/deadline rather than only the long-lived controller context.
+Changing diagnostics alone is insufficient. Existing node
+inventory reserves Capacity for a live startup lease, StateSync carries the
+actual reservation, and Settled/disconnect must not return it prematurely. The
+existing startup-pool metric initially counts admitted InitialBudget, whereas
+pre-settled StateSync can reconstruct it from the current Capacity reservation.
+Report and test that distinction across reconnects; do not claim the startup-pool
+statistics are unchanged. The main RAM pool must charge Capacity before preload.
+
+For this mode, memory.high must not be reduced below the reserved RAM upper
+bound plus existing overhead; constrain the final written value, not only the
+Budget argument to an existing ratio calculation. memory.max remains Capacity
+plus that overhead.
+Thus the legacy restore gives up host Budget-based memory.high tightening and
+node RAM overcommit for its lifetime. Do not disable ballooning, change the
+Guest's memory contents/target, raise memory.max or bypass ancestor limits.
+If the host cannot grant this reservation, fail with required/available amounts.
+The reservation is released only after CH is reaped, UFFD/backends have stopped,
+and all owned memfd/mmap users have released the RAM. Owner crashes and node
+restarts must retain/account for a still-live CH or clean it up before returning
+its reservation; a lost lease lock alone is not proof that RAM is gone.
+
+Record the page-rounded visible-Data union as the preparation bound, actual
+installed bytes, source-cache overhead and total cgroup/host peak. Verify actual
+UFFD page charging; the target CH VA alone is not proof of accounting. Source
+cache and bounded buffers retain their existing ownership/budgets and cannot be
+hidden inside a guest-RAM claim. A modern CH may restore the same image lazily
+with less reservation and faster readiness. No promise to preserve that benefit
+is made for the old producer boundary. Any design that avoids the Capacity floor
+must first supply a complete proof of physical residency and returned-page
+ownership; silently weakening the floor is not an implementation choice.
+
+#### Compatibility matrix
+
+“New sandboxer” below means the future implementation of this design. Old/new CH
+share the pinned upstream release and otherwise compatible CPU/device state;
+this is not a cross-major-CH or cross-architecture migration promise.
+
+| Runtime and CH | Input S | Required result |
+| --- | --- | --- |
+| New sandboxer + old CH | Cold zero baseline | Start, capture L, resume and restore correctly |
+| New sandboxer + old CH | Old three-entry S, including local/external parents | Prepare full layered Memory, then run/capture/restore correctly |
+| New sandboxer + old CH | New four-entry S with absent/zero/mixed dirty semantics in its graph | Restore all Memory, including clean Data; ignore dirty only for content selection, not validation |
+| New sandboxer + new CH | Legacy L produced by this design | Existing lazy restore and cumulative capture; no forced legacy mode |
+| New sandboxer + new CH | Existing old/new S | Existing modern contract and size benefits unchanged |
+| Old sandboxer + old CH | L whose complete reachable S graph is three-entry | Existing reader can parse the format; its old lazy-release defect is not repaired |
+| Old sandboxer + old CH | Three-entry L over any four-entry S parent | No reader-compatibility promise: parent preflight may reject it |
+| Old sandboxer + new CH | Any S | Outside scope; the old unversioned ACK is still rejected |
+| Any runtime | Unknown/partial protocol, unsupported mapping or incompatible CH CPU/device state | Explicit failure, no downgrade or corrupted capture |
+
+Full L on top does not let an old reader skip its normal parent-graph validation.
+Binary pairing, file-format readability and runtime correctness are three
+separate claims. A release must state which combinations actually passed.
+
+#### Implementation boundaries
+
+1. Add the immutable protocol/capture-mode decision and verified legacy mapping
+   adoption in `pkg/uffd/vareport.go` and `pkg/sandbox/serveandwait.go`.
+2. Separate region preparation from runtime readiness in `pkg/uffd`; keep the
+   full B owner separate from the permanent legacy ZeroSource. Add no WP queue.
+3. Add legacy L selection and its full-domain budget fallback in `pkg/snapshot`;
+   reuse format, history, publication and lifecycle owners.
+4. Add the internal host-reservation-floor transaction to `pkg/resctl` and its
+   existing restore integration, including static state, shrink and reconnect.
+   Existing node wire messages suffice; recheck their actual server semantics
+   before implementation, and justify any necessary cross-repository change.
+5. Add reproducible old/full-CH fixtures and the acceptance cases below. Do not
+   remove modern loss/release tests or count future tests as already executed.
+
+#### Required acceptance before claiming support
+
+Build the old test CH reproducibly from the official pinned tarball and precisely
+0001–0012; build the modern control with the full numbered series. Record commit,
+patch list, source-tree identity, toolchain and binary hash for each. Do not use a
+remote preexisting executable merely because its filename/version says “old”.
+Run locally in WSL where supported and use only the authorized native x86/ARM
+hosts for missing capabilities. No WSL Codex process is needed. This documentation
+change has not executed these future tests.
+
+| Area | Required evidence |
+| --- | --- |
+| Old correctness counterexample | Nonzero page in immutable B, still physically absent in the old lazy runtime; prove that actual old CH releases that PFN without reading it first, then demonstrate the incorrect inheritance or explicitly report inability to reproduce. Capacity/balloon totals alone do not identify the page. No full-RAM observer may run before this step. |
+| Prepared replacement | Same source and actual old CH with the new runtime: before execution, every visible Data page is prepared; after release and capture, the selected page is explicit Zero and the complete restored memory matches the correct reference. |
+| Initial and runtime writes | CPU, CH raw net/vsock, Go backend, initialization, partial errors and repeated captures preserve actual bytes without calling dirty-memory in old mode. Include failing captures followed by successful retry. |
+| Release ordering | Actual old empty-hole early return, PUNCH-before-MADV gap, partial release failure, refill and reuse; inject faults between operations in component tests and supplement them with real sandbox capture/restore. Modern missing-R failure checks remain enforced. |
+| Protocol and lifecycle | Old/v1, partial fields, null/unknown versions, mixed region reports, fragmented frames, wrong/missing FDs, peer identity race, denied maps access, lost ACK, early-region ACK followed by later construction failure/UNMAP with zero configured timeout, source corruption/timeout/cancellation and partial COPY; no ready publication, leaked worker/FD or reused partial memfd after failure. A v1 API 404/lost response must never select legacy. |
+| Addresses and source geometry | Single/multiple regions on both architectures, x86 >3 GiB and ARM >3008 MiB, split/merged VMAs, reordered reports, nonzero offsets, alias/overlap/gap/overflow rejection, byte-granular Data and page-spanning layer boundaries. |
+| Modes and parent graph | Both merge_ref settings, continuous capture and alternation, one/multiple local parents, clean copies, unproved parent equivalence and external-ref ordering. Test every supported old/new CH/S combination above. |
+| Carrier and publication | Missing versus all-zero bitmap, illegal encoding, three/four-entry graph validation, FileSink, encrypted Bundle/ingest, publish and both rewrite paths. Force fragmented Data/Zero past test budgets; reopen and compare every logical byte after Zero-to-Data fallback. No parent read may supply a current L hole. |
+| Resources | Snapshot Budget below Capacity, Data-encoded zeros, nonzero inherited pages in a ballooned range, Capacity reservation and partial grants above the 512 MiB step, denied/lost reservations, static/unmanaged modes, cache and memfd page charges, floor-preserving cgroup limits and shrink, reconnect/StateSync, owner/node crashes, cancellation and complete cleanup. Bounded buffers alone are not a passing result. |
+| Native integration | On WSL/x86/ARM applicable paths, real sandbox capture and restore, working workload/stdio and complete logical-memory equivalence. Use independently restored full-memory controls where architecture state writes require them; no bitmap-only, successful-start-only or unexplained byte-mask acceptance. |
+
+For correctness, observe the full current bytes only **after** exercising the
+unmaterialized-page counterexample; otherwise the observer removes its trigger.
+For performance, remove the full-RAM observer from the timed interval entirely.
+Compare old-runtime/old-CH control, new-runtime/old-CH compatibility and
+new-runtime/new-CH using identical RAM state, parent chain, cache condition,
+encoding/compression, storage and guest load. A control that fails correctness
+cannot establish a successful compatibility result.
+
+Report request completion, guest-freeze-to-guest-thaw downtime, CH pause call,
+log collection/preparation, memory/history encoding/write/commit, CH resume and
+stdio reattach separately; for a fresh restore also report source fetch/preload,
+request-to-ready and first successful application operation. Existing pause_ms
+measures only the CH pause call and excludes the dump; dump_ms excludes some
+quiesce/reattach work. Do not call either the full downtime. Record repetitions,
+distributions and p50/p95; report p99 only with enough samples (at least 100).
+Existing smoke success is not a before/after latency claim.
+
+Measure memory payload Data, explicit Zero, dirty bitmap, ZIP, remaining carrier
+overhead, top and local-history carriers, plus reachable local bytes deduplicated
+by identity. The dirty bitmap is already part of ZIP, and extra fallback Data is already part
+of Data; do not count either twice. Distinguish ordinary compatibility cost from
+forced dense fallback.
+Also report fetched baseline bytes, preparation peak/steady RAM and the duration
+of any extra reservation. No dirty-size improvement, faster resume or zero pause
+regression is promised for old CH. Preserve the modern path's existing tests and
+size results; repair-induced changes require affected checks and independent
+review before delivery is described as complete.
+
 ## 4. Resource model
 
 ### 4.1 Three deployment modes
@@ -2502,7 +2729,7 @@ Shrink requires a fresh, non-superseded report and known CH target/current. Each
 
 A short allocation burst can trigger Guest emergency deflation and finish between reports. If inflation then stops below the accepted target, the controller can re-notify that same target after two fresh reports in one epoch observe an unchanged target and actual value. Fresh requested Budget must fit within TargetBudget, and TargetBudget must remain covered by the existing reservation. Normal bounded target steps and partial settlement take priority. Pending growth, restore normalization, pressure, superseded reports, and any actual or target change invalidate the retry candidate. The mutation gate still serializes the operation with snapshot/export, and CH state and report eligibility are checked again immediately before the write. This retry neither requests additional reservation nor lowers `memory.high` or releases reservation; subsequent actual observations use the normal settlement path. Each attempt consumes its two-report confirmation, so the reconciliation ticker cannot repeatedly resize a stalled Guest. An unchanged accepted target cannot confirm delivery after a lost response, and HTTP success never substitutes for observed actual progress.
 
-See [memory.go](../pkg/resctl/memory.go), [memory_controller.go](../pkg/resctl/memory_controller.go) and [balloon.go](../pkg/resctl/balloon.go). Sparse `PUNCH_HOLE`/`MADV_DONTNEED` and hole-only skipping remain in [VMM patch 0004](cloud-hypervisor.md#34-0004--skip-hole-only-runs-during-balloon-release).
+See [memory.go](../pkg/resctl/memory.go), [memory_controller.go](../pkg/resctl/memory_controller.go) and [balloon.go](../pkg/resctl/balloon.go). Sparse `PUNCH_HOLE`/`MADV_DONTNEED` and hole-only skipping remain in [VMM patch 0004](cloud-hypervisor.md#balloon-release-hole-probe).
 
 ## 10. Resource protocol
 
