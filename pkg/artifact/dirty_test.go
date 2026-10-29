@@ -25,7 +25,10 @@ func TestDirtyPublishAndRewrite(t *testing.T) {
 			publisher := rewriteTarget(t, storage, t.TempDir())
 			_, ecfg := publishPortable(t, "")
 			eRef := rewriteSaveE(t, sink, ecfg, rewriteSparse(t, make([]byte, 8192)))
-			parent := rewriteSaveS(t, sink, &snapshot.Config{Version: 1, SandboxRef: eRef}, rewriteSparse(t, make([]byte, 8192)))
+			parentBytes := bytes.Repeat([]byte{0x37}, 8192)
+			currentBytes := append([]byte(nil), parentBytes...)
+			copy(currentBytes[4096:], bytes.Repeat([]byte{0x59}, 4096))
+			parent := rewriteSaveS(t, sink, &snapshot.Config{Version: 1, SandboxRef: eRef}, rewriteSparse(t, parentBytes))
 			cfg, err := snapshot.MarshalConfig(&snapshot.Config{Version: 1, SandboxRef: eRef, FromRefs: []string{parent}})
 			if err != nil {
 				t.Fatal(err)
@@ -34,7 +37,7 @@ func TestDirtyPublishAndRewrite(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			source, err := snapshotfile.BuildSourceWithDirty(rewriteSparse(t, make([]byte, 8192)), []byte("{}"), []byte("{}"), cfg, dirty)
+			source, err := snapshotfile.BuildSourceWithDirty(rewriteSparse(t, currentBytes), []byte("{}"), []byte("{}"), cfg, dirty)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -75,7 +78,7 @@ func TestDirtyPublishAndRewrite(t *testing.T) {
 				t.Fatal("changed/unproved baseline retained clean annotations")
 			}
 			body, err := readPublishSource(ctx, root.Memory)
-			if err != nil || !bytes.Equal(body, make([]byte, 8192)) {
+			if err != nil || !bytes.Equal(body, currentBytes) {
 				t.Fatalf("memory changed: %v", err)
 			}
 		})
