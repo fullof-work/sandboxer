@@ -482,12 +482,28 @@ Loaded page becoming Hole without release fail capture. Success, failure and
 merge_ref switches never reset D/R; existing lifecycle and exec/stdio barriers
 remain in force. See [Snapshot S and history](sandbox.md#snapshot-format).
 
-Patch 0016 permits the HTTP thread to perform read-only, close-on-exec opens and reads.
-Freeing a large dirty-memory response can trigger glibc arena trimming, whose lazy
-overcommit check reads `/proc/sys/vm/overcommit_memory`. Without these rules a 6 GiB
-capture can terminate CH with SIGSYS before the response is delivered. Writable,
-creating and truncating opens remain trapped; a child-process test exercises the
-installed filter, and the existing 6 GiB Demo covers the full capture path.
+Patch 0016 adapts the HTTP portion of upstream's
+[glibc allocator fix](https://github.com/cloud-hypervisor/cloud-hypervisor/commit/660b18eaace7953721c8ecf371973fc6eb6e2f66).
+Freeing a large dirty-memory response can trigger arena trimming, whose lazy
+overcommit check reads `/proc/sys/vm/overcommit_memory`. This caused a reproduced
+6 GiB capture to terminate CH with SIGSYS before delivering the response.
+The backport keeps exact `O_RDONLY|O_CLOEXEC` flags; writable, creating and
+truncating opens remain trapped. It also includes upstream's
+[HTTP mremap allowance](https://github.com/cloud-hypervisor/cloud-hypervisor/commit/f05f0c249e69568dea3ef8e7208d63f6ef8922ea)
+for allocator growth. The latter is compatibility coverage, not the syscall
+observed in that capture failure. Child-process tests exercise actual filtered
+mapping growth, reads and rejected open modes; the existing 6 GiB Demo exercises
+the full capture path. The newer common-filter and SIGSYS-handler refactors are
+not prerequisites for this backport.
+
+The Host baseline remains Linux 5.10. A kernel version number is not a proxy for
+shmem WP capability; Linux 6.6 in the proposal describes a validation host, not
+a new minimum. Keep the existing MISSING_SHMEM path available on the baseline.
+When rebasing CH, reconcile its raw RX dirty marking and allocator fixes with
+0013 and 0016 instead of stacking duplicate implementations. In particular,
+upstream [RX completion marking](https://github.com/cloud-hypervisor/cloud-hypervisor/commit/3777ba8ded440cca2d953cd40e8b1ee43ae6c682)
+addresses the same raw-buffer gap; this cumulative checkpoint path also retains
+marks when a partially completed write returns an error.
 
 ## 4. Build workflow
 

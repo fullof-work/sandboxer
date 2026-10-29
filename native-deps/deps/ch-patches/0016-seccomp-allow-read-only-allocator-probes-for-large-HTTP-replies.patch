@@ -1,20 +1,35 @@
-From 644177dcf04164f997cc1f2d68c505da2e65887b Mon Sep 17 00:00:00 2001
+From b87f36d78453d35ccbf1707a6f28e0adfd0def85 Mon Sep 17 00:00:00 2001
 From: Chen Xiaohui <graych@gmail.com>
 Date: Thu, 29 Oct 2026 03:12:13 +0800
-Subject: [PATCH] seccomp: allow read-only allocator probes for large HTTP
+Subject: [PATCH] seccomp: permit HTTP allocator syscalls for large dirty
  replies
 
+Adapt the HTTP portion of upstream Rob Bradford's glibc overcommit
+fix (660b18eaace7953721c8ecf371973fc6eb6e2f66), retaining exact
+O_RDONLY|O_CLOEXEC flags so creation and truncation remain trapped.
+The original HTTP-only fix is ec157d7eb9f5915512efcd0660a78b41be8bc87e.
+Local 6 GiB capture reproduces SIGSYS during glibc free/arena trimming.
+
+Include upstream f05f0c249e69568dea3ef8e7208d63f6ef8922ea's HTTP mremap
+allowance for allocator growth. This is a known upstream compatibility
+fix, not the syscall observed in the local EOF reproduction.
+
+Keep scope on HTTP; do not import the newer common-filter refactor.
+Exercise real BPF in children, including mapping growth, overcommit
+reads and rejected writable/creating/truncating opens.
 ---
- vmm/src/seccomp_filters.rs | 107 +++++++++++++++++++++++++++++++++++++
- 1 file changed, 107 insertions(+)
+ vmm/src/seccomp_filters.rs | 135 +++++++++++++++++++++++++++++++++++++
+ 1 file changed, 135 insertions(+)
 
 diff --git a/vmm/src/seccomp_filters.rs b/vmm/src/seccomp_filters.rs
-index 1b99dc9..37c69af 100644
+index 1b99dc9..8076a46 100644
 --- a/vmm/src/seccomp_filters.rs
 +++ b/vmm/src/seccomp_filters.rs
-@@ -885,7 +885,20 @@ fn http_api_thread_rules() -> Result<Vec<(i64, Vec<SeccompRule>)>, BackendError>
+@@ -884,8 +884,22 @@ fn http_api_thread_rules() -> Result<Vec<(i64, Vec<SeccompRule>)>, BackendError>
+         (libc::SYS_madvise, vec![]),
          (libc::SYS_mmap, vec![]),
          (libc::SYS_mprotect, vec![]),
++        (libc::SYS_mremap, vec![]),
          (libc::SYS_munmap, vec![]),
 +        // Freeing a large dirty-memory response can make glibc trim an arena.
 +        // Its lazy overcommit check reads /proc/sys/vm/overcommit_memory.
@@ -33,7 +48,7 @@ index 1b99dc9..37c69af 100644
          (libc::SYS_recvfrom, vec![]),
          (libc::SYS_recvmsg, vec![]),
          (libc::SYS_sched_yield, vec![]),
-@@ -996,3 +1009,97 @@ pub fn get_seccomp_filter(
+@@ -996,3 +1010,124 @@ pub fn get_seccomp_filter(
          .map_err(Error::Backend),
      }
  }
@@ -45,12 +60,12 @@ index 1b99dc9..37c69af 100644
 +    // Run the real filter in a child so a rejected syscall cannot kill the test
 +    // runner. The child uses only stack storage and raw syscalls after fork.
 +    fn http_open_probe(flags: i32) -> i32 {
-+        let filter = get_seccomp_filter(
-+            &SeccompAction::Trap,
-+            Thread::HttpApi,
-+            HypervisorType::Kvm,
-+        )
-+        .unwrap();
++        let filter =
++            get_seccomp_filter(&SeccompAction::Trap, Thread::HttpApi, HypervisorType::Kvm).unwrap();
++        // Resolve the host granularity before fork; the child only uses the value.
++        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
++        assert!(page_size > 0);
++        let page_size = page_size as usize;
 +        // SAFETY: No allocation or application locks are used by the child.
 +        let child = unsafe { libc::fork() };
 +        assert!(child >= 0);
@@ -69,6 +84,36 @@ index 1b99dc9..37c69af 100644
 +                unsafe { libc::syscall(libc::SYS_exit, 10) };
 +                unreachable!();
 +            }
++            if flags == (libc::O_RDONLY | libc::O_CLOEXEC) {
++                // Exercise the allocator's large-buffer growth under the same
++                // production filter, without depending on glibc size heuristics.
++                // SAFETY: This child owns both the mapping and its replacement.
++                unsafe {
++                    let old = libc::mmap(
++                        std::ptr::null_mut(),
++                        page_size,
++                        libc::PROT_READ | libc::PROT_WRITE,
++                        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
++                        -1,
++                        0,
++                    );
++                    if old == libc::MAP_FAILED {
++                        libc::syscall(libc::SYS_exit, 13);
++                        unreachable!();
++                    }
++                    old.cast::<u8>().write(0x5a);
++                    let grown = libc::mremap(old, page_size, 2 * page_size, libc::MREMAP_MAYMOVE);
++                    if grown == libc::MAP_FAILED {
++                        libc::syscall(libc::SYS_exit, 14);
++                        unreachable!();
++                    }
++                    if grown.cast::<u8>().read() != 0x5a || libc::munmap(grown, 2 * page_size) != 0
++                    {
++                        libc::syscall(libc::SYS_exit, 15);
++                        unreachable!();
++                    }
++                }
++            }
 +            let path = if flags == (libc::O_RDONLY | libc::O_CLOEXEC) {
 +                c"/proc/sys/vm/overcommit_memory"
 +            } else {
@@ -78,13 +123,7 @@ index 1b99dc9..37c69af 100644
 +            let mut byte = [0u8; 1];
 +            // SAFETY: Paths are NUL-terminated and the read buffer is writable.
 +            let status = unsafe {
-+                let fd = libc::syscall(
-+                    libc::SYS_openat,
-+                    libc::AT_FDCWD,
-+                    path.as_ptr(),
-+                    flags,
-+                    0,
-+                );
++                let fd = libc::syscall(libc::SYS_openat, libc::AT_FDCWD, path.as_ptr(), flags, 0);
 +                if fd < 0 {
 +                    11
 +                } else {
@@ -126,7 +165,10 @@ index 1b99dc9..37c69af 100644
 +            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_TRUNC,
 +        ] {
 +            let status = http_open_probe(flags);
-+            assert!(libc::WIFSIGNALED(status), "flags={flags:#x} status={status}");
++            assert!(
++                libc::WIFSIGNALED(status),
++                "flags={flags:#x} status={status}"
++            );
 +            assert_eq!(libc::WTERMSIG(status), libc::SIGSYS);
 +        }
 +    }

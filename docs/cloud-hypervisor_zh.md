@@ -399,11 +399,21 @@ UNMAP、registration 缺口、事件流损坏、Loaded 无 release 却变 Hole �
 报错。D/R 不因捕获成功、失败或 merge_ref 切换清空；生命周期和 exec/stdio 屏障
 仍沿用既有流程。S 编码及历史裁剪见 [sandbox.md 中文版](sandbox_zh.md#snapshot-format)。
 
-0016 允许 HTTP 线程以只读、close-on-exec 标志打开并读取文件。释放较大的
-dirty-memory 响应可能触发 glibc arena 裁剪，其延迟初始化的 overcommit 检查会读取
-`/proc/sys/vm/overcommit_memory`；缺少这些规则时，6 GiB 捕获可能在交付响应前
-因 SIGSYS 终止 CH。可写、创建和截断模式仍被拦截；子进程测试验证实际安装的过滤器，
-既有 6 GiB Demo 覆盖完整捕获路径。
+0016 适配上游 [glibc allocator 修复](https://github.com/cloud-hypervisor/cloud-hypervisor/commit/660b18eaace7953721c8ecf371973fc6eb6e2f66)
+中 HTTP 线程所需的部分。释放较大的 dirty-memory 响应可能触发 arena 裁剪，其
+延迟初始化的 overcommit 检查会读取 `/proc/sys/vm/overcommit_memory`。已复现的
+6 GiB 捕获因此在交付响应前触发 SIGSYS，导致 CH 终止。回移保留精确的
+`O_RDONLY|O_CLOEXEC` 标志；可写、创建和截断模式仍被拦截。同时纳入上游
+[HTTP mremap 许可](https://github.com/cloud-hypervisor/cloud-hypervisor/commit/f05f0c249e69568dea3ef8e7208d63f6ef8922ea)
+以支持 allocator 扩容；后者是兼容性覆盖，不是该捕获故障中实际观察到的系统调用。
+子进程测试验证实际过滤器下的映射扩容、读取及禁止的打开模式，既有 6 GiB Demo
+验证完整捕获路径。上游较新的公共过滤器和 SIGSYS handler 重构并非本回移的前提。
+
+Host 基线仍为 Linux 5.10。不能用内核版本号替代实际 shmem WP 能力；提案中的
+Linux 6.6 指验证主机，不是新的最低要求。基线上保留既有 MISSING_SHMEM 路径。
+未来升级 CH 时，应将其 raw RX dirty 标记和 allocator 修复与 0013、0016 对照，
+避免叠加重复实现。上游 [RX 完成后标记](https://github.com/cloud-hypervisor/cloud-hypervisor/commit/3777ba8ded440cca2d953cd40e8b1ee43ae6c682)
+修复相同的 raw buffer 覆盖缺口；当前累计 checkpoint 路径还保留部分写入后返回错误时的标记。
 
 ## 4. 构建工作流
 
