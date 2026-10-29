@@ -45,8 +45,8 @@ Patch 0004 may skip redundant inode punching, never the required REMOVE (§3.4).
 
 Each patch owns a complete intent, its corrections and its tests. Old numbers in
 this table refer to the original twelve-patch series restored by #377. This
-eleven-patch maintenance series does not include #374's new dirty tracking,
-cumulative API, capability handshake or snapshot format changes.
+first eleven patches retain the #379 maintenance scope. Patch 0012 owns the
+complete cumulative memory log; UFFD adoption retains the original ACK.
 
 | Patch | Purpose and scope | Origin | Future maintenance and removal condition |
 | --- | --- | --- | --- |
@@ -61,6 +61,7 @@ cumulative API, capability handshake or snapshot format changes.
 | 0009 | Complete ARM SVE/FPSIMD/FP-control snapshot state | Old 0008–0011 combined | SVE is already upstream; submit only the remaining FPCR/FPSR correction and native tests. Retire backported portions when the selected release covers each part. |
 | 0010 | Restore clock, then devices, then vCPUs | Old 0012 | Temporary upstream backport. Remove when the pinned release includes the fix and restore-order validation passes. |
 | 0011 | Restricted HTTP allocator reads and mapping growth, with real BPF tests | Upstream seccomp fixes adapted to v51.1 | Temporary upstream backport. Remove after equivalent permissions and positive/negative filter tests pass on the selected release. |
+| 0012 | Lifetime CPU/CH dirty ledger, raw writers, initialization, cumulative API and tests | Dirty-only parts of withdrawn #375, adapted to #379 | Maintain the fixed-baseline API locally while discussing an upstream interface. Align raw writers with upstream 3777ba8d; retire equivalent portions only after source and integration verification. |
 
 The upstream audit is pinned to
 [`0674238bb`](https://github.com/cloud-hypervisor/cloud-hypervisor/commit/0674238bb09082dfe55a4d3215eebf35ee0f5bb1)
@@ -539,6 +540,58 @@ cargo test --locked -p vmm --no-default-features --features kvm --lib seccomp_fi
 This is an allocator compatibility backport, with no new dirty-memory API or
 response format. `mremap` is an upstream compatibility fix, not evidence that it
 was the syscall in every previously observed API EOF.
+
+### 3.12 0012 — cumulative checkpoint memory changes
+
+External RAM enables KVM logging during memory initialization and preserves
+software seed writes before any reset. CPU/KVM, CH AtomicBitmap and raw writers
+(net RX, vsock buffers and snapshot reset/event/used-ring writes) contribute to
+one lifetime accumulator. Validated writable ranges are marked before lending
+raw pointers, conservatively covering partial writes and failure. Upstream
+[3777ba8d](https://github.com/cloud-hypervisor/cloud-hypervisor/commit/3777ba8ded440cca2d953cd40e8b1ee43ae6c682)
+fixes net readv coverage in newer code; this v51.1 adaptation also retains
+candidates when the operation fails. It does not import unrelated net refactors.
+
+`GET /api/v1/vm.dirty-memory` returns version 1, page_shift 12 and slot/GPA/size/
+file_offset/bitmap records. Every consumed source is transferred to the lifetime
+accumulator before another source or slot is read. A failed slot becomes wholly
+dirty before returning an error; registration changes retain all known ranges.
+Lost HTTP responses and retries never clear the accumulator. Migration start,
+read and stop hooks cannot consume or disable checkpoint-owned logging: external
+checkpoint RAM rejects live migration before destination I/O or failure cleanup.
+
+`va_report` keeps its existing fields and FD, adding only optional `file_offset`.
+ACK remains `{"type":"ack"}`; it confirms adoption, not logging capability.
+There is no version ACK, WP negotiation, eager memory preparation or new kernel
+baseline. New CH initializes its ledger independently. The host checks capability
+with the first actual capture request: a complete valid response selects native
+logging; a complete 404 selects working-set compatibility. Other errors fail the
+capture. The result is fixed for that CH process; native logging never downgrades
+after an error. API data geometry/version validation remains mandatory.
+
+The compatibility baseline is v51.1 plus #379's 0001–0011, without 0012. It uses
+the same lazy source and release-safe Data/Zero/Hole capture, with every explicit
+working-set byte conservatively dirty. Frozen pre-#379 0004 binaries still have
+the independently repaired release bug; 404 does not prove that fix is present.
+The withdrawn #375 version-ACK protocol is not a supported interface target.
+Restore validates the single ram0 shared, non-prefaulted, 4 KiB mapping, ordered
+contiguous memfd offsets and empty CH memory-ranges before starting CH. This
+retains the legacy offset-less report contract across GPA gaps on both CPUs.
+
+Keep all future corrections to this ledger and its tests in 0012. Release order
+belongs to 0004; HTTP allocator permissions belong to 0011. Generic raw-write
+corrections should follow upstream; the lifetime API remains project-maintained
+pending upstream interface agreement. Audit through upstream d1719ac8 found only
+unrelated migration timeout additions since ad5f3eea; CH stays pinned to v51.1.
+
+Validation includes native KVM slot-failure/retry and migration-owner rejection,
+raw net/vsock writers, initialization, and the sandbox `snapshot.dirty-memory`
+case's full-RAM comparisons, same-state size accounting and response loss. The
+`snapshot.ch-compat` case uses a test-only CH built from the formal first eleven
+patches via the existing native build recipe. On both native CI architectures it
+checks legacy cold capture and four-entry native snapshots restored by that CH,
+including one-time capability discovery, release and reuse. The helper records
+its applied source tree, patch hashes and binary hash; it is not a product VMM.
 
 ## 4. Build workflow
 

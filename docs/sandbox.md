@@ -190,7 +190,7 @@ Snapshot tokens without E, must be discarded and reissued from complete S/E reco
 when artifacts are unavailable; it never reads S to discover E.
 
 
-`--drop-caches` belongs only to memory snapshot and defaults to false. `--merge-ref` selects current-plus-one-history working-set capture (`false`) or current-plus-local-history absorption (`true`). Both stop at the current checkpoint ownership boundary. Disk compaction is independent; see [checkpoint history](sandbox.md#checkpoint-history).
+`--drop-caches` belongs only to memory snapshot and defaults to false. `--merge-ref` selects a full current working set with trimmed local history (`false`) or cumulative changes plus local history (`true`, default). Both stop at the current checkpoint ownership boundary. Disk compaction is independent; see [checkpoint history](sandbox.md#checkpoint-history).
 
 A local `snapshot` needs either `--sandbox-id` or `--path-id`. When both are supplied, PathID only selects `RunRoot/PathID/ctl.sock`; no identity consistency check is performed. `--output` may reside on the BaseRoot filesystem, for example `BuildBaseDir/checkpoint`. The running process cleans its own RunDir/owned diffs and does not treat output as a runtime directory to delete.
 
@@ -1933,14 +1933,42 @@ reset on capture success/failure. Zero remains opaque through local merge,
 tarstream, Bundle/ingest, publication and restore. No full-RAM materialization,
 new ZIP entry or cumulative dirty log is required. See [release fix #378](https://github.com/kuasar-sandbox/sandboxer/issues/378).
 
-`merge_ref=false` records the current resident working set and required explicit release zeros separately. Starting with
-`S1 -> S0`, the next capture streams a new immutable historical Snapshot
-`S1′ = S1(memory) over S0(memory)` and writes `S2(current working set) -> S1′`.
-Further local captures repeat this composition: at most one owned local memory
-lower remains beneath the newest S. `merge_ref=true` absorbs the current resident
-memory and the entire eligible local prefix; switching false → true → false has
-the same bound. Restore still accepts old multi-layer inputs. Only the newest S
-supplies execution state and `sandbox_ref`; historical S contributes memory only.
+With cumulative CH logging, default `merge_ref=true` captures changes since
+the instance's fixed runtime baseline B, then absorbs the eligible local history.
+`merge_ref=false` keeps the complete current working set plus necessary explicit
+Zero, and compacts local history into a separate H. One local parent follows the
+same trimming rule as several parents. Capture success, failure and mode changes
+never reset CPU/CH/Go/release records or advance B. Compatibility without the new
+CH API keeps the full current working set in both modes; historical trimming
+still uses metadata already present in parent layers.
+
+S optionally appends `memory.dirty` after config.json, state.json and snapshot.cfg.
+The cfg version stays 1. The entry contains a 16-byte little-endian header
+(encoding_version=1, page_shift=12, memory_size), then one low-bit-first bit per
+4 KiB page. Absent means all explicit Data/Zero dirty; an existing all-zero bitmap
+means none dirty. New readers accept three/four entries; old readers are promised
+only their original three-entry graphs. Restore always reads full Memory.
+
+History uses the union of effective dirty candidates, but obtains final values
+from the original complete newest-first layered Memory. A layer's clean labels
+are used only when its declared ordered parent view equals the actual suffix;
+otherwise all its explicit content is retained. Current Data and Zero override
+history; Hole inherits. Only the newest S supplies execution state and sandbox_ref.
+Only physical-ref changes preserve the bitmap verbatim. Changed memory or an
+unproved rebase, including rewrite --skip-verify, recomputes labels or becomes
+all dirty; content/metadata changes create a new S identity.
+
+Before output, enforce the existing 64 MiB ZIP tail, carrier extent and index
+budgets. A new bitmap alone exceeding the ZIP budget can fall back to a three-entry
+all-dirty capture; ordinary publish must preserve existing metadata. Sparse-map
+overflow retains extra Data only within the old per-artifact coverage, reading
+final values from the full current view. Necessary Zero never becomes Hole.
+Fallbacks report their reason and extra Data; unchanged budgets still apply.
+Size evidence must include payload, bitmap/header/ZIP overhead, top/H storage and
+identity-deduplicated reachable local artifacts under identical codec/parent/state.
+The native path uses MISSING plus KVM/CH/Go logs on both architectures, with
+conservative x86 read-materialization reporting. The Host Linux 5.10 baseline is
+unchanged. See [CH capability and compatibility](cloud-hypervisor.md#312-0012--cumulative-checkpoint-memory-changes).
 
 The prefix belongs to the current sandbox's canonical `BaseDir/checkpoint`.
 Selection uses complete source bindings and physical Bundle membership before

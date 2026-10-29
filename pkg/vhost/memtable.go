@@ -36,6 +36,7 @@ type MemTable struct {
 	regions []MemRegion
 	// EnsureLoaded must be bound before serving, including cold start.
 	EnsureLoaded func(context.Context, uint64, uint64) error
+	MarkDirty    func(uint64, uint64) error
 }
 
 // SetRegions replaces the memory table atomically. The previous regions'
@@ -54,15 +55,24 @@ func (m *MemTable) SetRegions(regs []MemRegion) {
 // the underlying mmap (which only happens at SET_MEM_TABLE — well outside
 // any in-flight request).
 func (m *MemTable) TranslateGPA(ctx context.Context, gpa, length uint64) ([]byte, error) {
-	return m.translate(ctx, gpa, length, false)
+	return m.translate(ctx, gpa, length, false, false)
 }
 
 // TranslateUVA translates ring addresses in the master's address space.
 func (m *MemTable) TranslateUVA(ctx context.Context, uva, length uint64) ([]byte, error) {
-	return m.translate(ctx, uva, length, true)
+	return m.translate(ctx, uva, length, true, false)
 }
 
-func (m *MemTable) translate(ctx context.Context, addr, length uint64, uva bool) ([]byte, error) {
+// WritableGPA validates and loads memory, then records the translated memfd
+// range before returning a mutable alias, including on later short/failed I/O.
+func (m *MemTable) WritableGPA(ctx context.Context, gpa, length uint64) ([]byte, error) {
+	return m.translate(ctx, gpa, length, false, true)
+}
+func (m *MemTable) WritableUVA(ctx context.Context, uva, length uint64) ([]byte, error) {
+	return m.translate(ctx, uva, length, true, true)
+}
+
+func (m *MemTable) translate(ctx context.Context, addr, length uint64, uva, writable bool) ([]byte, error) {
 	fail := func(err error) ([]byte, error) { return nil, readretry.Terminal(err) }
 	if err := ctx.Err(); err != nil {
 		return fail(err)
@@ -95,13 +105,18 @@ func (m *MemTable) translate(ctx context.Context, addr, length uint64, uva bool)
 		if err := ctx.Err(); err != nil {
 			return fail(err)
 		}
+		if writable && m.MarkDirty != nil {
+			if err := m.MarkDirty(r.MmapOffset+off, length); err != nil {
+				return fail(err)
+			}
+		}
 		return r.mmapBytes[off : off+length], nil
 	}
 	return fail(fmt.Errorf("vhost: address 0x%x len %d not in any region", addr, length))
 }
 
 func (m *MemTable) TranslateGPAsingleByte(ctx context.Context, gpa uint64) (*byte, error) {
-	b, err := m.TranslateGPA(ctx, gpa, 1)
+	b, err := m.WritableGPA(ctx, gpa, 1)
 	if err != nil {
 		return nil, err
 	}

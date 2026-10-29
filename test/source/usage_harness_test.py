@@ -791,6 +791,65 @@ class SourceFaultFilesystemRecoveryBoundaryTests(unittest.TestCase):
                     self.run_case(Path(directory), fault=fault)
 
 
+class CHHoldObservationTests(unittest.TestCase):
+    """A delayed real hold must not hide healthy rounds or mask failed updates."""
+
+    def run_hold(self, fault=None):
+        state = SimpleNamespace(now=0.0)
+        clock = SimpleNamespace(monotonic=lambda: state.now,
+                                sleep=lambda value: setattr(state, "now", state.now + value))
+
+        def view():
+            tick = int(state.now + 1e-7)
+            healthy_ticks = min(tick, 3)
+            memory = dict(name="guest.memory", last_request_id=str(100 + tick),
+                          status="ok" if tick < 4 else "missing",
+                          covered_total_ns=str(100 + healthy_ticks * 1_000_000_000),
+                          integral_total_byte_ns=str(200 + healthy_ticks * 64_000_000_000),
+                          last_value_bytes="64")
+            if fault == "failed_update" and tick >= 4:
+                memory["covered_total_ns"] = str(int(memory["covered_total_ns"]) + 1)
+            if fault == "gap" and tick >= 3:
+                memory["last_request_id"] = str(101 + tick)
+            others = [dict(name=name, status="ok", covered_total_ns=str(tick * 1_000_000_000))
+                      for name in ("filesystem.root", "ch.rss_anon", "ch.rss_file",
+                                   "sandbox_ctl.rss_anon", "sandbox_ctl.rss_file")]
+            epoch = "new" if fault == "epoch" and tick >= 3 else "run"
+            return dict(live=dict(run_epoch=epoch, gauges=[memory, *others]))
+
+        before = view()
+        sb = SimpleNamespace(view=view)
+        relay = SimpleNamespace(held=SimpleNamespace(is_set=lambda: state.now >= 4))
+        with patch.object(usage_sources, "time", clock), \
+             patch.object(usage_sources, "resources", return_value={"fds": 5}):
+            observed, samples, counts = usage_sources.observe_ch_hold(sb, relay, before)
+        usage_sources.validate_ch_missing(samples, usage.metric(before["live"], "gauges", "guest.memory"), observed)
+        return before, observed, samples, counts
+
+    def test_delayed_hold_preserves_every_healthy_and_failed_round(self):
+        before, observed, samples, counts = self.run_hold()
+        self.assertEqual(len(samples), 12)
+        self.assertEqual(len(counts), 12)
+        ids = {int(usage.metric(row["live"], "gauges", "guest.memory")["last_request_id"]) for row in observed}
+        self.assertTrue(set(range(100, 116)).issubset(ids))
+        # The original post-wait-only observations lack the healthy predecessor;
+        # they must fail as insufficient evidence, not silently re-anchor.
+        with self.assertRaisesRegex(AssertionError, "unobserved CH fault round"):
+            usage_sources.validate_ch_missing(samples, usage.metric(before["live"], "gauges", "guest.memory"))
+
+    def test_first_failed_round_still_cannot_change_known_usage(self):
+        with self.assertRaisesRegex(AssertionError, "first CH failure changed known usage"):
+            self.run_hold("failed_update")
+
+    def test_missing_round_cannot_be_hidden_by_equal_values(self):
+        with self.assertRaisesRegex(AssertionError, "unobserved CH fault round"):
+            self.run_hold("gap")
+
+    def test_epoch_change_is_not_a_new_baseline(self):
+        with self.assertRaisesRegex(AssertionError, "CH hold observation epoch changed"):
+            self.run_hold("epoch")
+
+
 class CHRecoveryObservationTests(unittest.TestCase):
     """Drive the shipped ch_case with a virtual clock, never a VM or subprocess."""
 
@@ -812,7 +871,7 @@ class CHRecoveryObservationTests(unittest.TestCase):
 
         relay = SimpleNamespace(
             requests=requests, errors=[], arm=lambda *args, **kwargs: None,
-            held=SimpleNamespace(wait=lambda timeout: True),
+            held=SimpleNamespace(is_set=lambda: state.held),
             release=SimpleNamespace(set=release, is_set=lambda: state.release_at is not None))
         case_dir = work / ("ch-" + mode)
         case_dir.mkdir()

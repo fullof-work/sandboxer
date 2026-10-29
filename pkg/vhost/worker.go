@@ -167,7 +167,7 @@ func (s *Server) readAvailRing(q *virtq) (availSnapshot, error) {
 
 // publishUsed appends one entry to the used ring and bumps used.idx.
 func (s *Server) publishUsed(q *virtq, descIdx uint16, length uint32) error {
-	usedHeader, err := s.memTable.TranslateUVA(q.readContext(), q.usedAddr, 4)
+	usedHeader, err := s.memTable.WritableUVA(q.readContext(), q.usedAddr, 4)
 	if err != nil {
 		return err
 	}
@@ -178,7 +178,7 @@ func (s *Server) publishUsed(q *virtq, descIdx uint16, length uint32) error {
 		return readretry.Terminal(fmt.Errorf("vhost: used address overflow"))
 	}
 	entryAddr := q.usedAddr + entryOffset
-	entry, err := s.memTable.TranslateUVA(q.readContext(), entryAddr, 8)
+	entry, err := s.memTable.WritableUVA(q.readContext(), entryAddr, 8)
 	if err != nil {
 		return err
 	}
@@ -281,7 +281,11 @@ func (s *Server) appendSeg(q *virtq, c *chain, d vringDesc) error {
 	if d.Len == 0 {
 		return nil
 	}
-	hva, err := s.memTable.TranslateGPA(q.readContext(), d.Addr, uint64(d.Len))
+	translate := s.memTable.TranslateGPA
+	if d.Flags&descFlagWrite != 0 {
+		translate = s.memTable.WritableGPA
+	}
+	hva, err := translate(q.readContext(), d.Addr, uint64(d.Len))
 	if err != nil {
 		return err
 	}

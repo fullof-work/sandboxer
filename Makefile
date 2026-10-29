@@ -8,7 +8,7 @@
 
 SHELL := /bin/bash
 
-.PHONY: all build sandbox-ctl sandbox-init cloud-hypervisor native-deps test vet bench e2e-usage-probe e2e-cgroup-fork-probe e2e-artifact-ref e2e-launch-recovery test-e2e-scripts release test-release clean help
+.PHONY: all build sandbox-ctl sandbox-init cloud-hypervisor native-deps test vet bench e2e-usage-probe e2e-cgroup-fork-probe e2e-artifact-ref e2e-launch-recovery e2e-dirty-memory test-e2e-scripts release test-release clean help
 
 # ---------------------------------------------------------------------------
 # Architecture selection (identical block across all kuasar-sandbox repos)
@@ -117,6 +117,12 @@ e2e-launch-recovery:
 	GOWORK=off GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO) build $(GO_BUILD_FLAGS) \
 		-o "$(E2E_FIXTURE_DIR)/launch-recovery" ./test/fixtures/launchrecovery
 
+e2e-dirty-memory:
+	@mkdir -p "$(E2E_FIXTURE_DIR)"
+	GOWORK=off GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO) build $(GO_BUILD_FLAGS) -o "$(E2E_FIXTURE_DIR)/dirty-memory-guest" ./test/fixtures/dirtymemory
+	GOWORK=off GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO) build $(GO_BUILD_FLAGS) -o "$(E2E_FIXTURE_DIR)/memorycompare" ./test/fixtures/memorycompare
+	GOWORK=off GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO) build $(GO_BUILD_FLAGS) -o "$(E2E_FIXTURE_DIR)/memorybaseline" ./test/fixtures/memorybaseline
+
 # The cgroup-control E2E must fork before libc or a language runtime starts in
 # order to detect Start->cgroup.procs races. Build that tiny libc-free probe in
 # the source-build stage; product E2E only consumes the prepared binary.
@@ -128,6 +134,7 @@ e2e-cgroup-fork-probe:
 	python3 -c 'import struct,sys; h=open(sys.argv[1],"rb").read(64); assert h[:7]==b"\x7fELF\x02\x01\x01" and struct.unpack_from("<H",h,18)[0]=={"x86_64":62,"aarch64":183}[sys.argv[2]], "cgroup probe compiler produced the wrong target architecture"' "$(E2E_FIXTURE_DIR)/cgroup-fork-probe" "$(TARGET_ARCH)"
 
 test-e2e-scripts:
+	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_e2e_dirty_memory.py
 	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_e2e_path_id.py
 	PYTHONDONTWRITEBYTECODE=1 python3 test/source/cgroup_fork_probe_test.py
 	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-environment-go-privilege.py

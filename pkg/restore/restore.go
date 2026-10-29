@@ -316,6 +316,9 @@ func Run(ctx context.Context, opts Options) (code int, retErr error) {
 	if err != nil {
 		return -1, fmt.Errorf("snapshot CH capacity: %w", err)
 	}
+	if err := validateMemoryMapping(snapshotRoot.ConfigJSON, snapshotRoot.StateJSON, snapCap); err != nil {
+		return -1, err
+	}
 	declaredCap, err := snapCfg.CapacityMemoryBytes()
 	if err != nil {
 		return -1, fmt.Errorf("referenced Sandbox capacity: %w", err)
