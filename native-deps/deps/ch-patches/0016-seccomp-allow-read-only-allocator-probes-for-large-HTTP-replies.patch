@@ -1,15 +1,15 @@
-From bfde82ff50f82839ea3b2168241af321a9aae097 Mon Sep 17 00:00:00 2001
+From 644177dcf04164f997cc1f2d68c505da2e65887b Mon Sep 17 00:00:00 2001
 From: Chen Xiaohui <graych@gmail.com>
 Date: Thu, 29 Oct 2026 03:12:13 +0800
 Subject: [PATCH] seccomp: allow read-only allocator probes for large HTTP
  replies
 
 ---
- vmm/src/seccomp_filters.rs | 97 ++++++++++++++++++++++++++++++++++++++
- 1 file changed, 97 insertions(+)
+ vmm/src/seccomp_filters.rs | 107 +++++++++++++++++++++++++++++++++++++
+ 1 file changed, 107 insertions(+)
 
 diff --git a/vmm/src/seccomp_filters.rs b/vmm/src/seccomp_filters.rs
-index 1b99dc9..500ba89 100644
+index 1b99dc9..37c69af 100644
 --- a/vmm/src/seccomp_filters.rs
 +++ b/vmm/src/seccomp_filters.rs
 @@ -885,7 +885,20 @@ fn http_api_thread_rules() -> Result<Vec<(i64, Vec<SeccompRule>)>, BackendError>
@@ -33,7 +33,7 @@ index 1b99dc9..500ba89 100644
          (libc::SYS_recvfrom, vec![]),
          (libc::SYS_recvmsg, vec![]),
          (libc::SYS_sched_yield, vec![]),
-@@ -996,3 +1009,87 @@ pub fn get_seccomp_filter(
+@@ -996,3 +1009,97 @@ pub fn get_seccomp_filter(
          .map_err(Error::Backend),
      }
  }
@@ -60,7 +60,10 @@ index 1b99dc9..500ba89 100644
 +                rlim_max: 0,
 +            };
 +            // SAFETY: The child owns its resource limit and filter.
-+            unsafe { libc::setrlimit(libc::RLIMIT_CORE, &limit) };
++            if unsafe { libc::setrlimit(libc::RLIMIT_CORE, &limit) } != 0 {
++                // SAFETY: Do not run a trapping probe unless core dumps are disabled.
++                unsafe { libc::_exit(9) };
++            }
 +            if seccompiler::apply_filter(&filter).is_err() {
 +                // SAFETY: Terminate only this child without running destructors.
 +                unsafe { libc::syscall(libc::SYS_exit, 10) };
@@ -99,8 +102,15 @@ index 1b99dc9..500ba89 100644
 +            unreachable!();
 +        }
 +        let mut status = 0;
-+        // SAFETY: Wait only for the child created above, writing to stack storage.
-+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
++        loop {
++            // SAFETY: Wait only for our child, writing to stack storage.
++            let waited = unsafe { libc::waitpid(child, &mut status, 0) };
++            if waited < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
++                continue;
++            }
++            assert_eq!(waited, child);
++            break;
++        }
 +        status
 +    }
 +
