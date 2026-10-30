@@ -456,7 +456,10 @@ restartApp(backoff):                                  // app 原地重启,launch
   // host 的 run 链路不断,持续收到新实例输出
 
 app_exit_then_reboot(status):
-  标记 bridge 停机，先让输出 pump 读自然 EOF 并有界排空，再关闭剩余 app fd；可完成时发 stream EOF
+  标记 bridge 停机，让输出 pump 读自然 EOF 并发送 stream EOF
+  stream EOF 后，在同一连接发送 MUX_CLOSE 并等待 MUX_CLOSE_ACK
+  排空、ACK 和 transport close 共用一个 2 s 预算；到期强制停机
+  排空后关闭剩余 app fd
   short-conn dial host:5000 → write app_exited{code, term_signal} → wait ack(timeout) → close
   reboot(LINUX_REBOOT_CMD_POWER_OFF)   # ack 拿不到也照常 reboot;POWER_OFF → CH 干净退 0
 ```
@@ -469,6 +472,11 @@ app_exit_then_reboot(status):
 generation drain 只确认 app→host 输出，不对 stdin 建 barrier；正常排空时各 stream 保序且代际切换不发 EOF，
 但 2 s 强制关闭兜底可能丢弃残留输出，应用代际间隔中的 stdin 也可能被丢弃。停机若追上刚安装的新代,pump 仍先消费该已存在代,
 但不会再等待未来代。
+
+终态停机时，transport 写入成功本身不证明 host 在 POWER_OFF 前已收到输出。
+同一 MUX 上的 ACK 将先前全部 DATA/EOF 帧的 host 接收排在 reboot 之前；host bridge
+cleanup 再排空已接收缓冲。这不保证输出 sink 的 fsync，transport 失败或强制停机超时
+仍可能丢弃剩余输出。
 
 `reboot(POWER_OFF)`(而非 `RESTART`):一次性沙箱模型下应用退出即沙箱结束,
 CH 应随之干净退出。`RESTART` 会触发 CH 的"原地重启"流程,试图重连 vhost-user-blk

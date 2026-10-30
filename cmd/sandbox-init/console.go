@@ -559,27 +559,67 @@ func (b *consoleBridge) closeLiveMUX() {
 	b.holder.invalidate(sess)
 }
 
-// appExited marks the bridge shut at sandbox shutdown (reboot), then waits
-// (bounded) for the app→host pumps to consume the natural EOF from the exited
-// app and flush their streams. The read ends must remain open while they drain;
-// closing them first can discard bytes still buffered in stdout/stderr or the
-// PTY. An in-place restart uses rewireApp instead and keeps the session open.
+// appExited drains the exited app and confirms receipt by the host MUX before
+// power-off. Successful transport writes alone do not establish delivery: CH
+// can exit while those bytes are still queued in the guest's vsock transport.
+// The pipe drain and MUX_CLOSE acknowledgement share one bounded deadline.
+// An in-place restart uses rewireApp instead and keeps the session open.
 func (b *consoleBridge) appExited() {
+	b.appExitedWithTimeout(2 * time.Second)
+}
+
+func (b *consoleBridge) appExitedWithTimeout(timeout time.Duration) {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
 	b.appMu.Lock()
 	b.closeAppLocked() // wake pumps in waitNextFd → CloseWrite + return
 	b.appMu.Unlock()
 
 	done := make(chan struct{})
 	go func() { b.wg.Wait(); close(done) }()
+	drained := false
+	timedOut := false
 	select {
 	case <-done:
-	case <-time.After(2 * time.Second):
+		drained = true
+	case <-timer.C:
+		timedOut = true
 		// host wedged / no session — give up; we reboot anyway.
+		logf("shutdown: app output did not drain within %s; forcing close", timeout)
+	}
+	sess := b.holder.peek()
+	if drained && sess != nil {
+		// All DATA and EOF frames precede MUX_CLOSE on the same connection.
+		// Its ACK proves that the host reader has received those frames, so
+		// the host bridge can drain its buffers even after CH is powered off.
+		acked := make(chan error, 1)
+		go func() { acked <- sess.InitMuxClose() }()
+		select {
+		case err := <-acked:
+			if err != nil {
+				logf("shutdown: app output MUX close: %v", err)
+			}
+		case <-timer.C:
+			timedOut = true
+			logf("shutdown: app output MUX acknowledgement timed out within %s; forcing close", timeout)
+		}
 	}
 	b.appMu.Lock()
 	b.closeEndsLocked()
 	b.appMu.Unlock()
 	b.holder.shutdown()
+	if sess != nil {
+		// Also release any pump blocked on peer credit after a drain timeout.
+		// A vsock Close may linger; it must not extend the shutdown budget.
+		closed := make(chan struct{})
+		go func() { _ = sess.Close(); close(closed) }()
+		if !timedOut {
+			select {
+			case <-closed:
+			case <-timer.C:
+			}
+		}
+	}
 }
 
 // --- pumps ----------------------------------------------------------

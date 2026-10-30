@@ -73,13 +73,19 @@ launch:
 EOF
 
 LOG="$OUT/diff-template.log"
+STDOUT="$OUT/diff-template.stdout"
+: >"$STDOUT" # --stdout-to appends; never accept a marker from a prior run.
 timeout -k 10s 90 "$BIN/sandbox-ctl" run \
     --config "$WORK/sandbox.yaml" \
     --ch-binary "$BIN/cloud-hypervisor" \
     --run-root "$WORK/run" \
-    --base-root "$WORK/base" >"$LOG" 2>&1
+    --base-root "$WORK/base" \
+    --stdout-to "$STDOUT" >"$LOG" 2>&1
 
-grep -qE '^PYBOOT-OK [0-9]+$' "$LOG" || {
+# App output is a byte stream independent of the kernel console and component
+# diagnostics. Do not require line framing across their concurrent writers.
+grep -qE '^PYBOOT-OK [0-9]+$' "$STDOUT" || {
+    cat "$STDOUT" >&2 || true
     tail -60 "$LOG" >&2 || true
     e2e_fail "app did not run on template-seeded auto-default diff"
 }
