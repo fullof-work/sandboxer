@@ -205,5 +205,78 @@ class StartupFailureDiagnosticsTests(unittest.TestCase):
             self.assertIsNone(summary)
 
 
+class RestoreFailureDiagnosticsTests(unittest.TestCase):
+    def summary(self, log, probe):
+        result = subprocess.run([
+            'python3', '-B', str(ROOT / 'test/e2e/lib/restore_dio_diagnostics.py'),
+            str(log), str(probe), 'running', '0'], env={**ENV, 'BIN': str(ROOT / 'bin')},
+            capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn('private-secret', result.stdout + result.stderr)
+        return json.loads(result.stdout.removeprefix('snapshot restore failure: '))
+
+    def test_distinguishes_framing_from_incomplete_work_and_redacts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log, probe = (Path(directory) / name for name in ('restore.log', 'probe.json'))
+            log.write_text('private-secret\n' * 10000 + 'prefix DIO-COMPLETE\n'
+                           'TICK 42\n[sandbox-ctl] CH exited code=7\n')
+            probe.write_text(json.dumps({'trigger_present': True, 'state': {
+                'phase': 'complete', 'cold_control_mismatches': 0, 'mismatches': [0] * 16,
+                'warm_mismatches': [0] * 16, 'corrupt_regions': 0, 'secret': 'private-secret'}}))
+            summary = self.summary(log, probe)
+            self.assertEqual(summary['DIO-COMPLETE'], {'occurrences': 1, 'exact_lines': 0})
+            self.assertEqual(summary['last_ticks'], [42])
+            self.assertEqual(summary['ch_exit_codes'], [7])
+            self.assertEqual(summary['scanned_tail_bytes'], 65536)
+            self.assertTrue(summary['tail_truncated'])
+            self.assertEqual(summary['guest_state']['phase'], 'complete')
+            self.assertTrue(summary['guest_state']['trigger_present'])
+            self.assertNotIn('secret', summary['guest_state'])
+
+    def test_unsafe_missing_or_oversized_probe_does_not_block_or_leak(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            secret = root / 'secret'; secret.write_text('private-secret')
+            link = root / 'link'; link.symlink_to(secret)
+            fifo = root / 'fifo'; os.mkfifo(fifo)
+            oversized = root / 'oversized'; oversized.write_bytes(b'x' * 8193)
+            for path in (link, fifo, root / 'missing', oversized):
+                with self.subTest(path=path.name):
+                    summary = self.summary(path, path)
+                    self.assertTrue(summary['guest_state_unavailable'])
+            bad = root / 'bad.json'
+            bad.write_text(json.dumps({'trigger_present': 'private-secret', 'state': {
+                'phase': 'private-secret', 'mismatches': ['private-secret'] * 16}}))
+            self.assertEqual(self.summary(secret, bad)['guest_state'], {})
+
+    def test_failed_probe_is_bounded_and_original_failure_survives(self):
+        helper = function((CASES / 'snapshot.restore.sh').read_text(), 'restore_failure_diagnostics')
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            binary = work / 'sandbox-ctl'
+            binary.write_text('#!/bin/bash\nexec sleep 30\n')
+            binary.chmod(0o755)
+            (work / 'restore.log').write_text('TICK 23\n')
+            setup = r'''
+WORK=$TEST_WORK; OUT=$WORK; BIN=$WORK; LOG2=$WORK/restore.log; SID2=restore
+sleep 30 &
+SBPID2=$!
+trap 'kill "$SBPID2" 2>/dev/null || :; wait "$SBPID2" 2>/dev/null || :' EXIT
+set +e
+'''
+            result = subprocess.run(['bash', '-euo', 'pipefail', '-c',
+                                     helper + '\n' + setup + '\nrestore_failure_diagnostics || true\nexit 17'],
+                                    env={**ENV, 'TEST_WORK': directory, 'BIN': directory,
+                                         'SANDBOXER_LIB': str(ROOT / 'test/e2e/lib')},
+                                    capture_output=True, text=True, timeout=8)
+            self.assertEqual(result.returncode, 17, result.stdout + result.stderr)
+            row = next(line for line in result.stderr.splitlines()
+                       if line.startswith('snapshot restore failure: '))
+            summary = json.loads(row.removeprefix('snapshot restore failure: '))
+            self.assertEqual(summary['probe_status'], 124)
+            self.assertEqual(summary['last_ticks'], [23])
+            self.assertTrue(summary['guest_state_unavailable'])
+
+
 if __name__ == "__main__":
     unittest.main()

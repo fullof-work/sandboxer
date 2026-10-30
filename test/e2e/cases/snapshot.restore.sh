@@ -16,7 +16,7 @@ source "$SANDBOXER_LIB/tarstream.sh"
 
 require_root
 require_kvm
-for command in cp docker ip mkfs.ext4 python3 sha256sum truncate; do
+for command in cp docker ip mkfs.ext4 python3 sha256sum timeout truncate; do
     require_command "$command"
 done
 for binary in sandbox-ctl flatten-ctl cloud-hypervisor; do
@@ -39,6 +39,9 @@ cleanup() {
     local status=$?
     set +e
     readiness_stop_watchdog
+    if [ "$status" -ne 0 ] && [ -n "${LOG2:-}" ]; then
+        restore_failure_diagnostics || true
+    fi
     for pid in "$SBPID1" "$SBPID2"; do
         [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && kill -TERM "$pid" 2>/dev/null
     done
@@ -51,6 +54,27 @@ cleanup() {
     exit "$status"
 }
 trap cleanup EXIT
+
+# Read-only diagnostics run only after a failed assertion. Keep the original
+# failure and budgets intact; a stalled guest must not stall cleanup. Never dump
+# arbitrary application/kernel text into CI logs.
+restore_failure_diagnostics() {
+    local returncode=running probe_status=not_attempted
+    if [ -n "$SBPID2" ] && kill -0 "$SBPID2" 2>/dev/null; then
+        timeout --kill-after=1 5 "$BIN/sandbox-ctl" exec \
+            --sandbox-id "$SID2" --run-root "$WORK/runtime" -- python3 -c '
+import json, os
+with open("/tmp/dio-state.json") as source:
+    state = json.load(source)
+print(json.dumps({"trigger_present": os.path.exists("/tmp/dio-trigger"), "state": state}))
+' >"$OUT/dio-failure.json" 2>"$OUT/dio-failure-exec.log"
+        probe_status=$?
+    elif [ -n "$SBPID2" ]; then
+        if wait "$SBPID2"; then returncode=0; else returncode=$?; fi
+    fi
+    python3 -B "$SANDBOXER_LIB/restore_dio_diagnostics.py" \
+        "$LOG2" "$OUT/dio-failure.json" "$returncode" "$probe_status" >&2
+}
 
 startup_failure() {
     local log=$1 pid=$2 phase=$3 started=$4 returncode=running
