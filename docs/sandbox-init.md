@@ -557,8 +557,10 @@ restartApp(backoff):
   // host run connection survives and receives the new instance's output
 
 app_exit_then_reboot(status):
-  mark bridge shutdown, let output pumps consume natural EOF and flush (bounded)
-  close remaining app ends after the drain; emit stream EOF where possible
+  mark bridge shutdown, let output pumps consume natural EOF and emit stream EOFs
+  after stream EOFs, send MUX_CLOSE and wait for MUX_CLOSE_ACK on the same connection
+  drain, ACK and transport close share one 2 s budget; force shutdown on expiry
+  close remaining app ends after the drain
   short-conn dial host:5000 -> app_exited{code, term_signal} -> wait ack(timeout) -> close
   reboot(LINUX_REBOOT_CMD_POWER_OFF)
   # Reboot even without ack; POWER_OFF lets CH exit cleanly with status 0.
@@ -579,6 +581,12 @@ stream EOF, subject to the bounded forced-close fallback. Input arriving while
 the app is between generations can be dropped. If shutdown catches a newly
 installed generation, pumps consume that existing generation but do not wait
 for a future one.
+
+For terminal shutdown, successful transport writes alone do not prove that the
+host received output before POWER_OFF. The same-MUX ACK orders host receipt of
+all preceding DATA/EOF frames before reboot; host bridge cleanup then drains
+its buffered output. This is not a sink fsync guarantee, and a transport failure
+or forced shutdown timeout can still discard remaining output.
 
 The terminal path uses **POWER_OFF, not RESTART**. When policy says the sandbox
 has ended, CH should exit cleanly. RESTART would invoke CH's in-place VM reboot
